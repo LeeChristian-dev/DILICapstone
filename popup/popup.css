@@ -1,0 +1,11 @@
+body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  padding: 16px;
+  width: 280px;
+}
+
+.popup-container h1 {
+  margin: 0 0 8px 0;
+  font-size: 20px;
+}

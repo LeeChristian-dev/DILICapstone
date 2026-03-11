@@ -1,0 +1,19 @@
+/* Warning styles */
+
+.warning-container {
+  background-color: #fff3cd;
+  border: 1px solid #ffc107;
+  padding: 15px;
+  border-radius: 4px;
+  font-family: Arial, sans-serif;
+}
+
+.warning-container h2 {
+  margin: 0 0 10px 0;
+  color: #856404;
+}
+
+.warning-container p {
+  margin: 0;
+  color: #856404;
+}
