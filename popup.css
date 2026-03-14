@@ -1,0 +1,86 @@
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  background: #f7f9fc;
+  color: #1f2937;
+  font: 13px/1.35 "Segoe UI", Tahoma, sans-serif;
+}
+
+.popup-root {
+  width: 360px;
+  max-height: 560px;
+  overflow: auto;
+  padding: 12px;
+  box-sizing: border-box;
+}
+
+.popup-header h1 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.popup-header p {
+  margin: 2px 0 0;
+  color: #4b5563;
+}
+
+.popup-card {
+  margin-top: 10px;
+  border: 1px solid #dbe4ef;
+  background: #ffffff;
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.popup-card h2 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.metric-list,
+.activity-list,
+.flow-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.metric-list li,
+.activity-list li,
+.flow-list li {
+  margin-bottom: 4px;
+}
+
+.popup-actions {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+button {
+  border: 1px solid #c3d2e6;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #1f2937;
+  padding: 8px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #f3f7fd;
+}
+
+button.danger {
+  border-color: #ef9a9a;
+  color: #8b1f1f;
+}
+
+.message {
+  min-height: 18px;
+  margin: 8px 0 0;
+  color: #334155;
+}

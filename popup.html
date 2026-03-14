@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DILI Monitor</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup-root">
+      <header class="popup-header">
+        <h1>DILI</h1>
+        <p>Detecting Illegal Link Injections</p>
+      </header>
+
+      <section class="popup-card">
+        <h2>Status</h2>
+        <ul id="status-list" class="metric-list"></ul>
+      </section>
+
+      <section class="popup-card">
+        <h2>Flow</h2>
+        <ol class="flow-list">
+          <li>Scan Facebook posts</li>
+          <li>Detect embedded links</li>
+          <li>Hash URL baseline</li>
+          <li>Monitor post edits</li>
+          <li>Run GSB and URLhaus checks</li>
+          <li>Compute Safety Score</li>
+        </ol>
+      </section>
+
+      <section class="popup-card">
+        <h2>Recent Activity</h2>
+        <ul id="activity-list" class="activity-list"></ul>
+      </section>
+
+      <section class="popup-actions">
+        <button id="rescan-btn" type="button">Re-scan Current Tab</button>
+        <button id="export-btn" type="button">Export CSV</button>
+        <button id="clear-btn" type="button" class="danger">Clear Session Logs</button>
+      </section>
+
+      <p id="message" class="message"></p>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
