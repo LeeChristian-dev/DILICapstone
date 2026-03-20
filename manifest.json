@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "DILI - Detecting Illegal Link Injections",
   "description": "Monitors Facebook posts for hyperlink insertions and edits, fingerprints URLs, and shows inline risk classifications.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "action": {
     "default_title": "DILI Monitor",
     "default_popup": "popup.html"

@@ -13,7 +13,8 @@ const clearButton = document.getElementById("clear-btn");
 const rescanButton = document.getElementById("rescan-btn");
 
 init().catch((error) => {
-  setMessage(`Failed to initialize popup: ${error.message || "unknown error"}`);
+  console.warn("[DILI] Popup initialization failed", error);
+  setMessage("Popup could not be fully initialized.");
 });
 
 async function init() {
@@ -37,7 +38,7 @@ function bindActions() {
       console.debug("[DILI] CSV export completed.");
     } catch (error) {
       console.warn("[DILI] CSV export failed", error);
-      setMessage(`CSV export failed: ${error.message || "unknown error"}`);
+      setMessage("CSV export could not be completed.");
     }
   });
 
@@ -48,7 +49,8 @@ function bindActions() {
       console.debug("[DILI] Popup requested log clear.");
       await refreshPopupData();
     } catch (error) {
-      setMessage(`Failed to clear logs: ${error.message || "unknown error"}`);
+      console.warn("[DILI] Clear logs failed", error);
+      setMessage("Could not clear logs right now.");
     }
   });
 
@@ -58,7 +60,8 @@ function bindActions() {
       setMessage(response?.result?.message || "Re-scan command sent.");
       await refreshPopupData();
     } catch (error) {
-      setMessage(`Re-scan failed: ${error.message || "unknown error"}`);
+      console.warn("[DILI] Re-scan failed", error);
+      setMessage("Re-scan could not be completed.");
     }
   });
 }
@@ -84,8 +87,8 @@ function renderStatus(summary) {
     `Flagged posts (session): ${summary.flaggedPostsInSession || 0}`,
     `Stored analyses: ${summary.totalStoredAnalyses || 0}`,
     `GSB configured: ${providerStatus.gsbConfigured ? "Yes" : "No"}`,
-    `URLhaus configured: ${providerStatus.urlhausConfigured ? "Yes" : "No (unexpected)"}`,
-    `URLhaus auth token: ${providerStatus.urlhausAuthConfigured ? "Provided" : "Not provided (public mode)"}`
+    `URLhaus configured: ${providerStatus.urlhausConfigured ? "Yes" : "No"}`,
+    `URLhaus auth key: ${providerStatus.urlhausAuthConfigured ? "Provided" : "Missing"}`
   ];
 
   statusList.innerHTML = items.map((text) => `<li>${escapeHtml(text)}</li>`).join("");

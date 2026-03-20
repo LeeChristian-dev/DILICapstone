@@ -1,26 +1,37 @@
 (function initializeDili() {
+  const DEBUG_SHOW_NO_LINK_UI = false;
+
   const MESSAGE_TYPES = {
     ANALYZE_LINK: "DILI_ANALYZE_LINK",
     REANALYZE_LINK: "DILI_REANALYZE_LINK",
     GET_POST_STATE: "DILI_GET_POST_STATE",
     SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
-    RESCAN_NOW: "DILI_RESCAN_NOW"
+    RESCAN_NOW: "DILI_RESCAN_NOW",
+    POST_ANALYSIS_UPDATE: "DILI_POST_ANALYSIS_UPDATE"
   };
 
   const POST_SELECTORS = [
     'div[role="article"]',
-    'article',
+    "article",
     '[data-pagelet*="FeedUnit"]',
-    '[aria-posinset]'
+    "[aria-posinset]"
   ];
 
-  const pendingPosts = new Set();
+  const visibleQueue = new Set();
+  const deferredQueue = new Set();
   const postIdCache = new WeakMap();
   const postSignatureCache = new WeakMap();
-  const observedPostIds = new Map();
-  let flushTimer = null;
-  let rescanTimer = null;
+  const postRenderSignature = new WeakMap();
+  const postIdToElement = new Map();
+  const postRiskMeta = new Map();
+  const observedAnchors = new WeakSet();
+
   let observer = null;
+  let intersectionObserver = null;
+  let flushTimer = null;
+  let mutationDebounceTimer = null;
+  let runtimeBound = false;
+  let globalUiBound = false;
 
   start().catch((error) => {
     console.warn("[DILI] Failed to initialize content script", error);
@@ -31,24 +42,66 @@
       return;
     }
 
-    console.debug("[DILI] Content script initialized.");
     bindRuntimeListeners();
+    bindGlobalUiActions();
+    setupIntersectionObserver();
     initialScan();
     observeFeed();
     window.addEventListener("scroll", scheduleVisibleRescan, { passive: true });
+    window.addEventListener("resize", scheduleVisibleRescan, { passive: true });
+    console.debug("[DILI] Content script initialized.");
   }
 
   function bindRuntimeListeners() {
+    if (runtimeBound) {
+      return;
+    }
+
+    runtimeBound = true;
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      if (message?.type !== MESSAGE_TYPES.RESCAN_NOW) {
+      if (message?.type === MESSAGE_TYPES.RESCAN_NOW) {
+        forceRescan()
+          .then(() => sendResponse({ ok: true }))
+          .catch(() => sendResponse({ ok: false, error: "Re-scan failed." }));
+        return true;
+      }
+
+      if (message?.type === MESSAGE_TYPES.POST_ANALYSIS_UPDATE && message.postId && message.analysis) {
+        applyAnalysisUpdate(message.postId, message.analysis);
+        sendResponse({ ok: true });
         return false;
       }
 
-      forceRescan()
-        .then(() => sendResponse({ ok: true }))
-        .catch((error) => sendResponse({ ok: false, error: error.message || "Re-scan failed." }));
+      return false;
+    });
+  }
 
-      return true;
+  function bindGlobalUiActions() {
+    if (globalUiBound) {
+      return;
+    }
+
+    globalUiBound = true;
+
+    document.addEventListener("click", handleInterceptedLinkClick, true);
+    document.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+
+      const detailsButton = target.closest("[data-dili-action='details']");
+      if (detailsButton instanceof HTMLElement) {
+        event.preventDefault();
+        openDetailsModal(detailsButton.dataset.postId || "");
+        return;
+      }
+
+      const reportButton = target.closest("[data-dili-action='report']");
+      if (reportButton instanceof HTMLElement) {
+        event.preventDefault();
+        openReportModal(reportButton.dataset.postId || "");
+      }
     });
   }
 
@@ -69,18 +122,47 @@
     scheduleFlush();
   }
 
-  function scheduleVisibleRescan() {
-    if (rescanTimer !== null) {
+  function setupIntersectionObserver() {
+    if (!("IntersectionObserver" in window)) {
       return;
     }
 
-    rescanTimer = window.setTimeout(() => {
-      rescanTimer = null;
+    intersectionObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting || !(entry.target instanceof Element)) {
+            continue;
+          }
+
+          if (deferredQueue.has(entry.target)) {
+            deferredQueue.delete(entry.target);
+            visibleQueue.add(entry.target);
+            scheduleFlush();
+          }
+        }
+      },
+      {
+        root: null,
+        rootMargin: "350px 0px 350px 0px",
+        threshold: [0, 0.01]
+      }
+    );
+  }
+
+  function scheduleVisibleRescan() {
+    if (mutationDebounceTimer !== null) {
+      return;
+    }
+
+    mutationDebounceTimer = window.setTimeout(() => {
+      mutationDebounceTimer = null;
       for (const post of collectCandidatePosts(document)) {
-        enqueuePost(post);
+        if (isNearViewport(post)) {
+          enqueuePost(post, "visible");
+        }
       }
       scheduleFlush();
-    }, 300);
+    }, 220);
   }
 
   function observeFeed() {
@@ -92,30 +174,39 @@
           continue;
         }
 
-        const targets = [mutation.target, ...mutation.addedNodes];
-        for (const target of targets) {
-          if (!(target instanceof Element)) {
+        const candidates = [mutation.target, ...mutation.addedNodes];
+        for (const node of candidates) {
+          if (!(node instanceof Element)) {
             continue;
           }
 
-          const nearestPost = findPostContainer(target);
-          if (nearestPost) {
-            affectedPosts.add(nearestPost);
+          const nearest = findPostContainer(node);
+          if (nearest) {
+            affectedPosts.add(nearest);
           }
 
-          for (const nestedPost of collectCandidatePosts(target)) {
-            affectedPosts.add(nestedPost);
+          for (const nested of collectCandidatePosts(node)) {
+            affectedPosts.add(nested);
           }
         }
+      }
+
+      if (affectedPosts.size === 0) {
+        return;
       }
 
       for (const post of affectedPosts) {
         enqueuePost(post);
       }
 
-      if (affectedPosts.size > 0) {
-        scheduleFlush();
+      if (mutationDebounceTimer !== null) {
+        return;
       }
+
+      mutationDebounceTimer = window.setTimeout(() => {
+        mutationDebounceTimer = null;
+        scheduleFlush();
+      }, 180);
     });
 
     observer.observe(document.body || document.documentElement, {
@@ -123,7 +214,7 @@
       subtree: true,
       characterData: true,
       attributes: true,
-      attributeFilter: ["href", "data-ft", "aria-label"]
+      attributeFilter: ["href", "data-ft", "aria-label", "aria-labelledby"]
     });
   }
 
@@ -133,27 +224,27 @@
       return false;
     }
 
-    return Boolean(target.closest(".dili-badge, .dili-panel, .dili-details"));
+    return Boolean(target.closest(".dili-panel, .dili-modal, .dili-backdrop"));
   }
 
   function collectCandidatePosts(root) {
     const candidates = new Set();
-    const searchRoot = root instanceof Document ? root : root;
+    const searchRoot = root instanceof Document || root instanceof Element ? root : null;
 
-    if (searchRoot instanceof Element) {
-      const directContainer = findPostContainer(searchRoot);
-      if (directContainer) {
-        candidates.add(directContainer);
-      }
+    if (!searchRoot) {
+      return candidates;
     }
 
-    if (!(searchRoot instanceof Document || searchRoot instanceof Element)) {
-      return candidates;
+    if (searchRoot instanceof Element) {
+      const direct = findPostContainer(searchRoot);
+      if (direct) {
+        candidates.add(direct);
+      }
     }
 
     for (const selector of POST_SELECTORS) {
       for (const element of searchRoot.querySelectorAll(selector)) {
-        if (element instanceof Element && isProbablyVisible(element)) {
+        if (element instanceof Element) {
           candidates.add(element);
         }
       }
@@ -162,12 +253,24 @@
     return candidates;
   }
 
-  function enqueuePost(post) {
-    if (!(post instanceof Element)) {
+  function enqueuePost(post, priority = "auto") {
+    if (!(post instanceof Element) || !post.isConnected) {
       return;
     }
 
-    pendingPosts.add(post);
+    if (intersectionObserver) {
+      intersectionObserver.observe(post);
+    }
+
+    if (priority === "visible" || (priority === "auto" && isNearViewport(post))) {
+      deferredQueue.delete(post);
+      visibleQueue.add(post);
+      return;
+    }
+
+    if (!visibleQueue.has(post)) {
+      deferredQueue.add(post);
+    }
   }
 
   function scheduleFlush() {
@@ -176,22 +279,52 @@
     }
 
     flushTimer = window.setTimeout(async () => {
-      const batch = [...pendingPosts];
-      pendingPosts.clear();
       flushTimer = null;
+      await flushQueue();
+    }, 90);
+  }
 
-      for (const post of batch) {
-        await processPost(post);
+  async function flushQueue() {
+    const visibleBatch = popBatch(visibleQueue, 12);
+    const deferredBatch = visibleBatch.length === 0 ? popBatch(deferredQueue, 4) : [];
+    const batch = visibleBatch.length > 0 ? visibleBatch : deferredBatch;
+
+    if (batch.length === 0) {
+      return;
+    }
+
+    console.debug(`[DILI] Processing visible=${visibleBatch.length} deferred=${deferredBatch.length}`);
+
+    for (const post of batch) {
+      await processPost(post);
+    }
+
+    if (visibleQueue.size > 0 || deferredQueue.size > 0) {
+      scheduleFlush();
+    }
+  }
+
+  function popBatch(queue, limit) {
+    const items = [];
+    for (const item of queue) {
+      queue.delete(item);
+      items.push(item);
+      if (items.length >= limit) {
+        break;
       }
-    }, 250);
+    }
+
+    return items;
   }
 
   async function processPost(post) {
-    if (!post.isConnected || !isProbablyVisible(post)) {
+    if (!post.isConnected) {
       return;
     }
 
     const postId = getStablePostId(post);
+    postIdToElement.set(postId, post);
+
     const linkInfo = extractRelevantLink(post);
     const signature = buildPostSignature(linkInfo);
 
@@ -200,20 +333,27 @@
     }
 
     postSignatureCache.set(post, signature);
-    observedPostIds.set(postId, {
-      signature,
-      lastSeen: Date.now()
-    });
 
     if (!linkInfo) {
       await setNoLinkState(post, postId);
       return;
     }
 
+    bindAnchorHints(linkInfo.element, postId);
+    renderBadge(post, {
+      postId,
+      label: "Scanning",
+      safetyScore: null,
+      state: "scanning",
+      sentence: "Checking this link now.",
+      reasons: []
+    });
+
     const currentState = await sendRuntimeMessage({
       type: MESSAGE_TYPES.GET_POST_STATE,
       postId
     });
+
     const messageType = currentState?.baseline?.urlHash ? MESSAGE_TYPES.REANALYZE_LINK : MESSAGE_TYPES.ANALYZE_LINK;
     const response = await sendRuntimeMessage({
       type: messageType,
@@ -224,154 +364,512 @@
 
     if (!response?.analysis) {
       renderBadge(post, {
-        label: "Analysis unavailable",
+        postId,
+        label: "Analysis Unavailable",
         safetyScore: null,
-        state: "monitored",
-        details: [response?.error || "Background analysis did not return data."]
+        state: "analysis_failed",
+        sentence: "This link could not be fully checked.",
+        reasons: ["Some checks could not be completed."]
       });
       return;
     }
 
-    renderBadge(post, mapAnalysisToViewModel(response.analysis));
+    applyAnalysisUpdate(postId, response.analysis);
   }
 
   async function setNoLinkState(post, postId) {
-    const response = await sendRuntimeMessage({
+    await sendRuntimeMessage({
       type: MESSAGE_TYPES.SET_NO_LINK_STATE,
       postId
     });
 
+    postRiskMeta.delete(postId);
+
+    if (!DEBUG_SHOW_NO_LINK_UI) {
+      removeBadge(post);
+      return;
+    }
+
     renderBadge(post, {
-      label: "No hyperlink detected",
+      postId,
+      label: "No Link",
       safetyScore: null,
-      state: response?.baseline?.state || "no_link",
-      badgeTone: "no-link-detected",
-      details: ["This post is being monitored for future HTTP or HTTPS link insertions."]
+      state: "no_link",
+      sentence: "No external HTTP or HTTPS link detected.",
+      reasons: []
+    });
+  }
+
+  function applyAnalysisUpdate(postId, analysis) {
+    const post = postIdToElement.get(postId);
+    if (!post || !post.isConnected) {
+      return;
+    }
+
+    const viewModel = mapAnalysisToViewModel(analysis);
+    const stateChanged = postRiskMeta.get(postId)?.state !== viewModel.state;
+    postRiskMeta.set(postId, {
+      postId,
+      normalizedUrl: analysis.normalizedUrl || "",
+      domain: safeHostname(analysis.normalizedUrl),
+      state: viewModel.state,
+      classification: analysis.classification || "Unknown",
+      score: analysis.safetyScore,
+      reasons: viewModel.reasons,
+      sentence: viewModel.sentence
+    });
+
+    if (stateChanged) {
+      console.debug(`[DILI] state transition ${postId}: ${viewModel.state}`);
+    }
+
+    renderBadge(post, {
+      postId,
+      label: viewModel.label,
+      safetyScore: viewModel.safetyScore,
+      state: viewModel.state,
+      sentence: viewModel.sentence,
+      reasons: viewModel.reasons,
+      showActions: viewModel.state === "suspicious" || viewModel.state === "high_risk"
     });
   }
 
   function extractRelevantLink(post) {
-    const anchors = [...post.querySelectorAll("a[href]")].filter((anchor) => !anchor.closest(".dili-badge, .dili-panel"));
-    const candidates = anchors
-      .map((anchor) => ({
+    const anchors = [...post.querySelectorAll("a[href]")].filter((anchor) => !anchor.closest(".dili-panel, .dili-modal"));
+
+    for (const anchor of anchors) {
+      const rawHref = anchor.getAttribute("href");
+      const parsed = safeParseUrl(rawHref, location.href);
+      if (!parsed) {
+        if (rawHref) {
+          console.debug("[DILI] rejected invalid href", rawHref);
+        }
+        continue;
+      }
+
+      const unwrapped = unwrapFacebookOutbound(parsed);
+      if (!unwrapped) {
+        continue;
+      }
+
+      if (isInternalFacebookLink(unwrapped)) {
+        continue;
+      }
+
+      return {
         element: anchor,
-        url: anchor.href,
+        url: unwrapped.toString(),
         displayText: (anchor.textContent || anchor.getAttribute("aria-label") || "").trim()
-      }))
-      .filter((anchor) => isEligibleLink(anchor.url));
+      };
+    }
 
-    return candidates[0] || null;
+    return null;
   }
 
-  function isEligibleLink(rawUrl) {
-    try {
-      const url = new URL(rawUrl, location.href);
-      if (!["http:", "https:"].includes(url.protocol)) {
-        return false;
-      }
-
-      if (url.hash && url.pathname === location.pathname && url.search === location.search) {
-        return false;
-      }
-
-      if (/fb\.me$/i.test(url.hostname)) {
-        return false;
-      }
-
-      if (/facebook\.com$/i.test(url.hostname)) {
-        return isFacebookOutboundWrapper(url);
-      }
-
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  function renderBadge(post, viewModel) {
-    const mountPoint = getBadgeMountPoint(post);
-    let badge = post.querySelector(".dili-panel[data-dili-owned='true']");
-    if (!badge) {
-      badge = document.createElement("div");
-      badge.className = "dili-panel";
-      badge.dataset.diliOwned = "true";
-    }
-
-    if (badge.parentElement !== mountPoint) {
-      if (shouldInsertBeforeActionBar(mountPoint, post)) {
-        mountPoint.parentElement.insertBefore(badge, mountPoint);
-      } else {
-        mountPoint.appendChild(badge);
-      }
-    }
-
-    const scoreText = Number.isFinite(viewModel.safetyScore) ? String(viewModel.safetyScore) : "--";
-    const safeState = sanitizeClassToken(viewModel.state || "monitored");
-    const badgeTone = sanitizeClassToken(viewModel.badgeTone || safeState);
-    const summaryText = `${viewModel.label} | Safety Score ${scoreText}`;
-    const compactSummary = viewModel.safetyScore === null ? viewModel.label : `${viewModel.label} • ${scoreText}`;
-    const detailItems = (viewModel.details || [])
-      .map((detail) => `<li>${escapeHtml(detail)}</li>`)
-      .join("");
-
-    badge.className = `dili-panel dili-state-${safeState}`;
-    badge.innerHTML = `
-      <div class="dili-badge">
-        <span class="dili-pill dili-pill-${badgeTone}">${escapeHtml(compactSummary)}</span>
-        <span class="dili-score" aria-hidden="true">DILI</span>
-      </div>
-      <details class="dili-details">
-        <summary>${escapeHtml(summaryText)}</summary>
-        <ul class="dili-detail-list">${detailItems || "<li>No detailed indicators recorded.</li>"}</ul>
-      </details>
-    `;
-  }
-
-  function mapAnalysisToViewModel(analysis) {
-    const details = [];
-
-    for (const item of analysis.deductions || []) {
-      if (item.triggered) {
-        details.push(`${item.label} (-${item.deduction})`);
-      }
-    }
-
-    for (const note of analysis.redirectAnalysis?.notes || []) {
-      details.push(note);
-    }
-
-    const gsb = findProviderResult(analysis.providerResults, "gsb");
-    const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
-
-    if (!gsb?.configured) {
-      details.push("Google Safe Browsing lookup was not configured.");
-    }
-
-    if (!urlhaus?.checked) {
-      details.push("URLhaus lookup could not be completed.");
-    } else if (urlhaus?.details?.authConfigured === false) {
-      details.push("URLhaus was checked in public mode without auth token.");
-    }
-
-    if (details.length === 0) {
-      details.push("No score deductions were triggered by the current heuristic set.");
-    }
-
-    return {
-      label: analysis.classification || "Unknown",
-      safetyScore: analysis.safetyScore,
-      state: analysis.state,
-      badgeTone: analysis.classification || analysis.state,
-      details
-    };
-  }
-
-  function findProviderResult(results, providerName) {
-    if (!Array.isArray(results)) {
+  function safeParseUrl(rawHref, baseUrl) {
+    const raw = String(rawHref || "").trim();
+    if (!raw || raw === "#") {
       return null;
     }
 
-    return results.find((item) => item.provider === providerName) || null;
+    const lowered = raw.toLowerCase();
+    if (lowered.startsWith("javascript:") || lowered.startsWith("mailto:") || lowered.startsWith("tel:")) {
+      return null;
+    }
+
+    try {
+      const parsed = new URL(raw, baseUrl || location.href);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        return null;
+      }
+
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function unwrapFacebookOutbound(url) {
+    const host = url.hostname.toLowerCase();
+    if (!["l.facebook.com", "lm.facebook.com", "m.facebook.com"].includes(host)) {
+      return url;
+    }
+
+    const nested = url.searchParams.get("u") || url.searchParams.get("url");
+    if (!nested) {
+      return url;
+    }
+
+    try {
+      const decoded = decodeURIComponent(nested);
+      const parsed = safeParseUrl(decoded, url.toString());
+      return parsed || url;
+    } catch {
+      return url;
+    }
+  }
+
+  function isInternalFacebookLink(url) {
+    const host = String(url.hostname || "").toLowerCase();
+    return host.endsWith("facebook.com") || host.endsWith("fb.me");
+  }
+
+  function bindAnchorHints(anchor, postId) {
+    if (!(anchor instanceof Element) || observedAnchors.has(anchor)) {
+      return;
+    }
+
+    observedAnchors.add(anchor);
+    anchor.dataset.diliPostId = postId;
+  }
+
+  function renderBadge(post, viewModel) {
+    const safeState = sanitizeClassToken(viewModel.state || "safe");
+    const scoreText = Number.isFinite(viewModel.safetyScore) ? String(viewModel.safetyScore) : "--";
+    const compactSummary = viewModel.safetyScore === null ? viewModel.label : `${viewModel.label} • ${scoreText}`;
+    const renderSignature = [
+      safeState,
+      viewModel.label,
+      scoreText,
+      viewModel.sentence || "",
+      (viewModel.reasons || []).join("|"),
+      String(Boolean(viewModel.showActions))
+    ].join("::");
+
+    if (postRenderSignature.get(post) === renderSignature) {
+      console.debug("[DILI] UI update skipped because state unchanged.");
+      return;
+    }
+
+    postRenderSignature.set(post, renderSignature);
+
+    const mountPoint = getBadgeMountPoint(post);
+    if (!mountPoint) {
+      return;
+    }
+
+    let panel = post.querySelector(".dili-panel[data-dili-owned='true']");
+    if (!panel) {
+      panel = document.createElement("div");
+      panel.className = "dili-panel";
+      panel.dataset.diliOwned = "true";
+    }
+
+    if (panel.parentElement !== mountPoint) {
+      mountPoint.prepend(panel);
+    }
+
+    const reasonLabel = escapeHtml((viewModel.reasons || [])[0] || "No strong risk indicators were found.");
+    const actionsHtml = viewModel.showActions
+      ? `
+        <div class="dili-actions">
+          <button type="button" data-dili-action="report" data-post-id="${escapeHtml(viewModel.postId || "")}">Report Post</button>
+          <button type="button" data-dili-action="details" data-post-id="${escapeHtml(viewModel.postId || "")}" title="Why this link was flagged">Details</button>
+        </div>
+      `
+      : "";
+
+    panel.className = `dili-panel dili-state-${safeState}`;
+    panel.innerHTML = `
+      <div class="dili-row">
+        <span class="dili-pill">${escapeHtml(compactSummary)}</span>
+      </div>
+      <p class="dili-sentence">${escapeHtml(viewModel.sentence || "")}</p>
+      <p class="dili-reason" hidden>${reasonLabel}</p>
+      ${actionsHtml}
+    `;
+  }
+
+  function removeBadge(post) {
+    const panel = post.querySelector(".dili-panel[data-dili-owned='true']");
+    if (panel) {
+      panel.remove();
+    }
+  }
+
+  function mapAnalysisToViewModel(analysis) {
+    const score = Number.isFinite(analysis?.safetyScore) ? analysis.safetyScore : null;
+    const normalizedState = normalizeState(analysis?.state, analysis?.classification, score);
+    const reasons = sanitizeReasons(analysis?.reasons);
+
+    let label = "Safe";
+    let sentence = "No strong risk indicators were detected.";
+
+    if (normalizedState === "scanning") {
+      label = "Scanning";
+      sentence = "Checking this link now.";
+    } else if (normalizedState === "analysis_partial") {
+      label = analysis?.classification || "Partial Check";
+      sentence = "Some checks could not be completed, but available signals were reviewed.";
+    } else if (normalizedState === "analysis_failed") {
+      label = "Check Limited";
+      sentence = "This link could not be fully checked.";
+    } else if (normalizedState === "suspicious") {
+      label = "Suspicious";
+      sentence = "This link may redirect through a shortened or suspicious destination.";
+    } else if (normalizedState === "high_risk") {
+      label = "High Risk";
+      sentence = "This link appears to have changed or may be unsafe.";
+    }
+
+    return {
+      postId: analysis?.postId || "",
+      label,
+      safetyScore: score,
+      state: normalizedState,
+      reasons,
+      sentence
+    };
+  }
+
+  function normalizeState(state, classification, score) {
+    const source = String(state || "").toLowerCase();
+    if (["no_link", "scanning", "safe", "suspicious", "high_risk", "analysis_partial", "analysis_failed"].includes(source)) {
+      return source;
+    }
+
+    if (classification === "High Risk") {
+      return "high_risk";
+    }
+
+    if (classification === "Suspicious") {
+      return "suspicious";
+    }
+
+    if (Number.isFinite(score)) {
+      if (score < 50) {
+        return "high_risk";
+      }
+
+      if (score < 80) {
+        return "suspicious";
+      }
+
+      return "safe";
+    }
+
+    return "analysis_partial";
+  }
+
+  function sanitizeReasons(reasons) {
+    if (!Array.isArray(reasons) || reasons.length === 0) {
+      return ["Some checks could not be completed."];
+    }
+
+    return reasons
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+      .slice(0, 4);
+  }
+
+  function openDetailsModal(postId) {
+    const meta = postRiskMeta.get(postId);
+    if (!meta) {
+      return;
+    }
+
+    const body = `
+      <h3>Why this link was flagged</h3>
+      <ul>
+        ${(meta.reasons || []).slice(0, 4).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}
+      </ul>
+      <div class="dili-modal-actions">
+        <button type="button" data-dili-close-modal="true">Close</button>
+      </div>
+    `;
+
+    showModal({
+      mode: "details",
+      body
+    });
+  }
+
+  function openReportModal(postId) {
+    const meta = postRiskMeta.get(postId);
+    if (!meta) {
+      return;
+    }
+
+    const body = `
+      <h3>Report this post</h3>
+      <p>If this post appears suspicious, you may report it through Facebook.</p>
+      <ol>
+        <li>Click the three dots (⋯) on the post</li>
+        <li>Select Report post</li>
+        <li>Choose Scam or Fraud or False Information</li>
+        <li>Submit the report</li>
+      </ol>
+      <div class="dili-modal-actions">
+        <button type="button" data-dili-copy-evidence="${escapeHtml(postId)}">Copy Evidence</button>
+        <button type="button" data-dili-close-modal="true">Close</button>
+      </div>
+      <p class="dili-copy-feedback" aria-live="polite"></p>
+    `;
+
+    showModal({
+      mode: "report",
+      body,
+      onAfterRender(modalRoot) {
+        const copyButton = modalRoot.querySelector("[data-dili-copy-evidence]");
+        const feedback = modalRoot.querySelector(".dili-copy-feedback");
+        if (!(copyButton instanceof HTMLButtonElement) || !(feedback instanceof HTMLElement)) {
+          return;
+        }
+
+        copyButton.addEventListener("click", async () => {
+          const summary = buildEvidenceSummary(meta);
+          try {
+            await navigator.clipboard.writeText(summary);
+            feedback.textContent = "Evidence copied.";
+          } catch {
+            feedback.textContent = "Could not copy evidence in this browser context.";
+          }
+        });
+      }
+    });
+  }
+
+  function buildEvidenceSummary(meta) {
+    const stamp = new Date().toISOString();
+    return [
+      "DILI Report Summary",
+      `Safety Score: ${Number.isFinite(meta.score) ? meta.score : "--"}`,
+      `Classification: ${meta.classification || "Unknown"}`,
+      `URL: ${meta.normalizedUrl || "Unknown"}`,
+      `Reason(s): ${(meta.reasons || []).join("; ")}`,
+      `Timestamp: ${stamp}`
+    ].join("\n");
+  }
+
+  function handleInterceptedLinkClick(event) {
+    const target = event.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+
+    const anchor = target.closest("a[href]");
+    if (!(anchor instanceof HTMLAnchorElement)) {
+      return;
+    }
+
+    if (anchor.closest(".dili-modal, .dili-panel")) {
+      return;
+    }
+
+    const post = findPostContainer(anchor);
+    if (!post) {
+      return;
+    }
+
+    const postId = getStablePostId(post);
+    const meta = postRiskMeta.get(postId);
+    if (!meta || !["suspicious", "high_risk"].includes(meta.state)) {
+      return;
+    }
+
+    const parsed = safeParseUrl(anchor.getAttribute("href"), location.href);
+    if (!parsed) {
+      return;
+    }
+
+    const destination = unwrapFacebookOutbound(parsed);
+    if (!destination || isInternalFacebookLink(destination)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const toneClass = meta.state === "high_risk" ? "danger" : "warning";
+    const heading = meta.state === "high_risk" ? "⚠ High Risk Link Detected" : "Suspicious Link Detected";
+    const warning = meta.state === "high_risk"
+      ? "This link may redirect to an unsafe or misleading website."
+      : "This link may lead to a misleading destination.";
+
+    const body = `
+      <h3>${escapeHtml(heading)}</h3>
+      <p><strong>Destination:</strong> ${escapeHtml(destination.hostname)}</p>
+      <p><strong>Safety Score:</strong> ${Number.isFinite(meta.score) ? meta.score : "--"}</p>
+      <p>${escapeHtml(warning)}</p>
+      <ul>
+        ${(meta.reasons || []).slice(0, 3).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}
+      </ul>
+      <div class="dili-modal-actions">
+        <button type="button" data-dili-close-modal="true" class="primary">Go Back</button>
+        <button type="button" data-dili-proceed-url="${escapeHtml(destination.toString())}">Proceed Anyway</button>
+        <button type="button" data-dili-action="report" data-post-id="${escapeHtml(postId)}">Report Post</button>
+      </div>
+    `;
+
+    showModal({
+      mode: "warning",
+      toneClass,
+      body,
+      onAfterRender(modalRoot) {
+        const proceed = modalRoot.querySelector("[data-dili-proceed-url]");
+        if (proceed instanceof HTMLButtonElement) {
+          proceed.addEventListener("click", () => {
+            const nextUrl = proceed.dataset.diliProceedUrl || "";
+            if (nextUrl) {
+              closeModal();
+              location.assign(nextUrl);
+            }
+          });
+        }
+
+        const report = modalRoot.querySelector("[data-dili-action='report']");
+        if (report instanceof HTMLButtonElement) {
+          report.addEventListener("click", () => {
+            const nextPostId = report.dataset.postId || postId;
+            openReportModal(nextPostId);
+          });
+        }
+      }
+    });
+  }
+
+  function showModal({ mode, toneClass = "", body, onAfterRender }) {
+    closeModal();
+
+    const backdrop = document.createElement("div");
+    backdrop.className = "dili-backdrop";
+    backdrop.dataset.diliModal = mode;
+
+    const modal = document.createElement("div");
+    modal.className = `dili-modal ${toneClass}`.trim();
+    modal.innerHTML = body;
+    backdrop.appendChild(modal);
+
+    backdrop.addEventListener("click", (event) => {
+      if (event.target === backdrop) {
+        closeModal();
+      }
+    });
+
+    modal.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+
+      const closeButton = target.closest("[data-dili-close-modal='true']");
+      if (closeButton) {
+        event.preventDefault();
+        closeModal();
+      }
+    });
+
+    document.body.appendChild(backdrop);
+    if (typeof onAfterRender === "function") {
+      onAfterRender(modal);
+    }
+  }
+
+  function closeModal() {
+    const existing = document.querySelector(".dili-backdrop");
+    if (existing) {
+      existing.remove();
+    }
   }
 
   function getStablePostId(post) {
@@ -442,10 +940,7 @@
     ];
 
     for (const selector of contentSelectors) {
-      const matches = [...post.querySelectorAll(selector)].filter((element) => {
-        return element instanceof Element && !element.closest(".dili-panel");
-      });
-
+      const matches = [...post.querySelectorAll(selector)].filter((element) => element instanceof Element && !element.closest(".dili-panel"));
       const bestMatch = matches.find((element) => isUsefulMountNode(element, post));
       if (bestMatch) {
         return bestMatch;
@@ -454,11 +949,10 @@
 
     const actionBar = findActionBar(post);
     if (actionBar) {
-      return actionBar;
+      return actionBar.parentElement || actionBar;
     }
 
-    const firstBlock = [...post.children].find((child) => child instanceof Element && !child.classList.contains("dili-panel"));
-    return firstBlock || post;
+    return post;
   }
 
   function findActionBar(post) {
@@ -479,10 +973,6 @@
     return null;
   }
 
-  function shouldInsertBeforeActionBar(mountPoint, post) {
-    return mountPoint instanceof Element && mountPoint === findActionBar(post) && mountPoint.parentElement instanceof Element;
-  }
-
   function isUsefulMountNode(element, post) {
     if (!(element instanceof Element) || !post.contains(element)) {
       return false;
@@ -492,19 +982,21 @@
     return text.length > 0 && text.length < 4000;
   }
 
-  function isProbablyVisible(element) {
+  function isNearViewport(element) {
     if (!(element instanceof Element)) {
       return false;
     }
 
     const rect = element.getBoundingClientRect();
     const style = window.getComputedStyle(element);
-
-    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0 && rect.bottom >= -300 && rect.top <= window.innerHeight * 2;
-  }
-
-  function isFacebookOutboundWrapper(url) {
-    return ["l.facebook.com", "lm.facebook.com"].includes(url.hostname.toLowerCase()) && Boolean(url.searchParams.get("u") || url.searchParams.get("url"));
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      rect.width > 0 &&
+      rect.height > 0 &&
+      rect.bottom >= -400 &&
+      rect.top <= window.innerHeight + 600
+    );
   }
 
   async function sendRuntimeMessage(message) {
@@ -518,8 +1010,16 @@
       console.warn("[DILI] Message dispatch failed", error);
       return {
         ok: false,
-        error: error.message || "Runtime messaging failed."
+        error: "Background communication failed."
       };
+    }
+  }
+
+  function safeHostname(rawUrl) {
+    try {
+      return new URL(rawUrl).hostname.toLowerCase();
+    } catch {
+      return "";
     }
   }
 
@@ -535,17 +1035,17 @@
   }
 
   function sanitizeClassToken(value) {
-    return String(value || "monitored")
+    return String(value || "safe")
       .toLowerCase()
       .replace(/[^a-z0-9_-]+/g, "-");
   }
 
   function escapeHtml(value) {
-    return String(value)
+    return String(value || "")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
+      .replace(/\"/g, "&quot;")
       .replace(/'/g, "&#39;");
   }
 })();

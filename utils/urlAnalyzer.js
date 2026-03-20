@@ -53,6 +53,37 @@ const FACEBOOK_REDIRECT_HOSTS = new Set([
   "m.facebook.com"
 ]);
 
+const REJECTED_PROTOCOLS = new Set(["javascript:", "mailto:", "tel:"]);
+
+/**
+ * Parse and validate a URL without throwing.
+ * @param {string} rawHref
+ * @param {string} [baseUrl]
+ * @returns {URL | null}
+ */
+export function safeParseUrl(rawHref, baseUrl = "") {
+  const raw = String(rawHref || "").trim();
+  if (!raw || raw === "#") {
+    return null;
+  }
+
+  const lowered = raw.toLowerCase();
+  if (REJECTED_PROTOCOLS.has(lowered) || lowered.startsWith("javascript:") || lowered.startsWith("mailto:") || lowered.startsWith("tel:")) {
+    return null;
+  }
+
+  try {
+    const parsed = baseUrl ? new URL(raw, baseUrl) : new URL(raw);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return null;
+    }
+
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Normalize a URL for stable hashing and comparisons.
  * @param {string} rawUrl
@@ -63,9 +94,16 @@ export function normalizeUrl(rawUrl) {
     throw new Error("Missing URL.");
   }
 
-  const firstPass = new URL(rawUrl, location.origin);
+  const firstPass = safeParseUrl(rawUrl, "https://facebook.com");
+  if (!firstPass) {
+    throw new Error("Invalid URL.");
+  }
+
   const unwrapped = unwrapFacebookRedirect(firstPass);
-  const url = new URL(unwrapped);
+  const url = safeParseUrl(unwrapped, firstPass.toString());
+  if (!url) {
+    throw new Error("Invalid URL.");
+  }
 
   url.hash = "";
   url.protocol = url.protocol.toLowerCase();

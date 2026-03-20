@@ -1,140 +1,153 @@
 # DILI - Detecting Illegal Link Injections
 
-DILI is a Manifest V3 Chrome extension for Facebook link monitoring. It fingerprints URLs, stores per-post baselines, detects link edits and insertions, runs external threat-intelligence checks, computes a Safety Score, and renders inline post badges.
+DILI is a Manifest V3 Chrome extension for Facebook link monitoring. It fingerprints detected URLs, stores per-post baselines, detects post-link changes after edits, runs local and external checks, computes a Safety Score, and displays compact inline classifications.
 
-## What Is New In This Revision
+## Stable Update Focus
 
-- Google Safe Browsing integration (real request flow when key is configured)
-- URLhaus integration (public lookup endpoint with optional auth token support)
-- Popup dashboard (`popup.html`, `popup.js`, `popup.css`)
-- CSV export for analysis log records
-- Storage-backed analysis history for demo sessions
+This revision keeps the existing architecture and working integrations while improving startup speed, scan consistency, and end-user clarity.
 
-## File Structure
+## Staged Analysis Pipeline
 
-```text
-manifest.json
-content.js
-background.js
-riskEngine.js
-styles.css
-popup.html
-popup.js
-popup.css
-config.example.js
-config.local.js
-.gitignore
-README.md
-utils/
-  hash.js
-  redirectAnalyzer.js
-  storage.js
-  urlAnalyzer.js
-icons/
-storage/
-```
+DILI now uses a staged pipeline for faster first feedback:
 
-## Setup Configuration (GSB + URLhaus)
+1. Stage 1 (Immediate detection)
 
-1. Open `config.example.js` for the key template.
-2. Use `config.local.js` for local values.
-3. Paste your real values in `config.local.js`:
+- Detect Facebook post containers
+- Extract first significant external link safely
+- Skip invalid/internal/non-HTTP(S) links
 
-- `GSB_API_KEY`
-- `URLHAUS_API_KEY` (optional)
-- `URLHAUS_AUTH_TOKEN` (optional)
+2. Stage 2 (Fast local analysis)
 
-Notes:
+- Normalize URL
+- Generate URL hash baseline
+- Detect URL shorteners
+- Detect suspicious TLD and obfuscation indicators
+- Apply local safety scoring
+- Return quick preliminary state
 
-- `config.local.js` is ignored by git (`.gitignore`) and should not be committed with real secrets.
-- If `config.local.js` is missing, extension fallback behavior is safe:
-- GSB returns `configured: false`, `checked: false`, `flagged: false`
-- URLhaus still attempts public-mode lookup when available
+3. Stage 3 (Deferred external checks)
 
-## Safety Score Model
+- Google Safe Browsing
+- URLhaus
+- Optional redirect probing (best effort)
+- UI updates asynchronously when final checks complete
 
-DILI now computes a Safety Score instead of additive risk:
+## Startup and Scan Performance
 
-- Start at `100`
-- Deduct weighted points for suspicious indicators
-- Clamp final score to `0..100`
+Performance behavior is optimized for feed responsiveness:
 
-Classification:
+- Visible-post prioritization (IntersectionObserver + near-viewport queue)
+- Deferred queue for offscreen posts
+- Debounced MutationObserver processing
+- Batched post processing instead of full-feed rescans
+- Duplicate-work avoidance with signature checks
+- Session TTL caching for finalized URL analysis
 
-- `80-100`: Safe
-- `50-79`: Suspicious
-- `0-49`: High Risk
+## User-Facing State Model
 
-## Popup Dashboard
+Internal states:
 
-Click the extension toolbar icon to open the popup.
+- no_link
+- scanning
+- safe
+- suspicious
+- high_risk
+- analysis_partial
+- analysis_failed
 
-The popup shows:
+Behavior:
 
-- Supported tab status (Facebook vs unsupported)
-- Session analyzed post count
-- Session flagged post count
-- Provider configuration status (GSB + URLhaus)
-- Recent analysis activity
-- Action buttons:
-- Export CSV
-- Clear Session Logs
-- Re-scan Current Tab
+- no_link: hidden by default (unless debug mode is enabled)
+- safe: subtle compact UI
+- suspicious/high_risk: visible compact warning card with action row
+- analysis_partial: gentle message that some checks were limited
+- analysis_failed: rare, soft failure wording
 
-The popup reads available stored or session data only; it does not force full page analysis unless you click re-scan.
+Raw technical errors are kept in console logs only.
 
-## CSV Export
+## Inline UI and Actions
 
-Export runs from the popup and downloads a file named like:
+For suspicious/high-risk posts:
 
-`dili-analysis-export-YYYY-MM-DD-HH-mm-ss.csv`
+- left accent border
+- compact badge format (for example: Suspicious • 61)
+- one short explanation line
+- action row:
+  - Report Post
+  - Details
 
-Each row includes:
+Tooltip/details now focus only on why the link was flagged (human-readable reasons).
 
-- `timestamp`
-- `postId`
-- `url`
-- `domain`
-- `urlHash`
-- `safetyScore`
-- `classification`
-- `gsbConfigured`
-- `gsbFlagged`
-- `urlhausConfigured`
-- `urlhausFlagged`
-- `redirectCount`
-- `usedShortener`
-- `suspiciousTld`
-- `obfuscationDetected`
-- `displayedDomainMismatch`
-- `integrityMismatch`
-- `state`
+## Middleman Warning Popup
 
-## Provider Caveats
+Click interception applies only to suspicious/high-risk links.
 
-- Google Safe Browsing requires an API key and is subject to quota and provider policies.
-- URLhaus is malware-oriented telemetry, not purely phishing classification.
-- External lookups can fail due to network, CORS, quota, or endpoint changes. DILI logs failures and continues with local heuristics.
+- Safe links navigate normally.
+- Suspicious/high-risk links show a warning modal before navigation.
+- High-risk links show stronger visual urgency.
 
-## Loading Unpacked Extension
+Warning modal includes:
 
-1. Open `chrome://extensions`
+- destination domain
+- Safety Score
+- short warning text
+- 1-3 human-readable reasons
+- actions: Go Back, Proceed Anyway, Report Post
+
+## Reporting UX
+
+Report Post opens a dedicated guidance modal:
+
+- how to report suspicious posts on Facebook
+- Copy Evidence button using navigator.clipboard.writeText()
+- short copied summary:
+  - score
+  - classification
+  - URL
+  - reasons
+  - timestamp
+
+## Provider and Config Behavior
+
+Background service worker remains the source of truth for provider status.
+
+- GSB uses GSB_API_KEY when available
+- URLhaus supports optional credentials
+- Missing config.local.js or missing keys degrades gracefully
+- External provider and redirect checks are best effort
+
+Optional URLhaus keys supported in config.local.js:
+
+- URLHAUS_AUTH_KEY
+- URLHAUS_AUTH_TOKEN
+- URLHAUS_API_KEY
+
+## CSV Export and Popup
+
+Popup remains available and keeps:
+
+- status summary
+- recent activity
+- re-scan action
+- CSV export
+- log clearing
+
+CSV export format is preserved for existing reporting flow.
+
+## Loading the Extension
+
+1. Open chrome://extensions
 2. Enable Developer mode
 3. Click Load unpacked
-4. Select this folder
-5. Open Facebook to trigger content scanning
+4. Select this project folder
+5. Open Facebook to start monitoring
 
-## Current Limitations
+## Known Limitations
 
-- Facebook DOM changes frequently. Selectors in `content.js` may require periodic tuning.
-- MVP currently scores only the first significant external hyperlink in each post.
-- Redirect analysis remains best-effort and cannot guarantee complete redirect-chain visibility in all cases.
-- Service worker lifecycle affects session counters in popup; historical logs remain in storage.
+- Facebook DOM structure changes frequently; selectors in content.js may still require manual tuning.
+- Redirect analysis is environment-limited in browsers and may be partial.
+- DILI currently evaluates the first significant external link per post.
 
-## Manual Follow-Up Required
+## Configuration Template
 
-- Add real PNG icon files:
-- `icons/icon16.png`
-- `icons/icon48.png`
-- `icons/icon128.png`
-- Paste your real provider credentials into `config.local.js`.
+Use config.example.js as a template for config.local.js and keep local secrets out of version control.

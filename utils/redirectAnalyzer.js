@@ -15,11 +15,13 @@ const REDIRECT_PARAM_NAMES = [
 ];
 
 /**
- * Analyze obvious redirect patterns in a URL and optionally attempt a safe HEAD request.
+ * Analyze obvious redirect patterns and optionally attempt non-blocking network probing.
  * @param {string} rawUrl
+ * @param {{ allowNetworkProbe?: boolean }} [options]
  * @returns {Promise<{ redirectCount: number, chain: string[], resolvedUrl: string, resolutionMethod: string, notes: string[], fetchAttempted: boolean, fetchAllowed: boolean }>}
  */
-export async function analyzeRedirects(rawUrl) {
+export async function analyzeRedirects(rawUrl, options = {}) {
+  const allowNetworkProbe = options.allowNetworkProbe !== false;
   const notes = [];
   const chain = [];
   const visited = new Set();
@@ -42,10 +44,18 @@ export async function analyzeRedirects(rawUrl) {
     currentUrl = nextUrl;
   }
 
-  const fetchResolution = await attemptHeadResolution(chain[chain.length - 1] || rawUrl);
+  const fetchResolution = allowNetworkProbe
+    ? await attemptHeadResolution(chain[chain.length - 1] || rawUrl)
+    : {
+        fetchAllowed: false,
+        fetchAttempted: false,
+        success: false,
+        method: "heuristic-only",
+        note: "Redirect analysis was limited in the browser environment."
+      };
 
   if (!fetchResolution.fetchAllowed) {
-    notes.push("Network redirect resolution was skipped because cross-origin access is not guaranteed in this environment.");
+    notes.push("Redirect analysis was limited in the browser environment.");
   } else if (!fetchResolution.success) {
     notes.push(fetchResolution.note);
   } else if (fetchResolution.finalUrl && fetchResolution.finalUrl !== currentUrl) {
@@ -143,7 +153,7 @@ async function attemptHeadResolution(rawUrl) {
       fetchAttempted: true,
       success: false,
       method: "head-follow",
-      note: `Redirect probing failed: ${error.message || "unknown error"}.`
+      note: "Some external checks were unavailable."
     };
   }
 }
