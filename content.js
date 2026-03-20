@@ -9,16 +9,18 @@ function injectTestRiskLabel() {
     const label = document.createElement("div");
     label.className = "dili-post-risk-label dili-suspicious";
     label.innerHTML = `
-      <div class="dili-risk-badge">
-        <span class="dili-risk-dot"></span>
-        <span class="dili-risk-text">Suspicious Link Detected</span>
-      </div>
-      <div class="dili-risk-subtext">
-        This post may contain an edited or unsafe hyperlink.
-      </div>
+      <span class="dili-risk-icon">⚠</span>
+      <span class="dili-risk-text">Suspicious Link Detected!</span>
     `;
 
-    post.prepend(label);
+    const linkPreview =
+      post.querySelector('a[href]')?.closest("div");
+
+    if (linkPreview) {
+      linkPreview.insertAdjacentElement("afterend", label);
+    } else {
+      post.appendChild(label);
+    }
 
     if (index >= 2) return;
   });

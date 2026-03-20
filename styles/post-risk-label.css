@@ -1,65 +1,44 @@
 .dili-post-risk-label {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 10px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  font-family: Arial, sans-serif;
-  font-size: 13px;
-  line-height: 1.4;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
-  border: 1px solid transparent;
-}
-
-.dili-risk-badge {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  font-weight: 700;
+  gap: 4px;
+  padding: 2px 6px;
+  margin-top: 4px;
+  border-radius: 2px;
+  font-family: Arial, sans-serif;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
+  text-transform: uppercase;
+  width: fit-content;
+  max-width: 220px;
+  box-shadow: none;
+  border: none;
 }
 
-.dili-risk-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  display: inline-block;
+.dili-risk-icon {
+  font-size: 11px;
+  line-height: 1;
 }
 
-.dili-risk-subtext {
-  font-size: 12px;
-  opacity: 0.9;
+.dili-risk-text {
+  white-space: nowrap;
 }
 
 /* Safe */
 .dili-safe {
-  background: #e8f7ee;
-  border-color: #8fd1a8;
-  color: #166534;
-}
-
-.dili-safe .dili-risk-dot {
-  background: #16a34a;
+  background: #d9f7e8;
+  color: #18794e;
 }
 
 /* Suspicious */
 .dili-suspicious {
-  background: #fff7e6;
-  border-color: #f3c46b;
-  color: #92400e;
-}
-
-.dili-suspicious .dili-risk-dot {
-  background: #f59e0b;
+  background: #ffd6d6;
+  color: #c1121f;
 }
 
 /* Dangerous */
 .dili-dangerous {
-  background: #fdecec;
-  border-color: #ee8f8f;
-  color: #991b1b;
-}
-
-.dili-dangerous .dili-risk-dot {
-  background: #dc2626;
+  background: #ffb3b3;
+  color: #a40000;
 }
