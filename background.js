@@ -1,7 +1,8 @@
+import { GSB_API_KEY, URLHAUS_AUTH_KEY } from "./config.local.js";
 import { calculateSafetyScore, classifySafetyScore } from "./riskEngine.js";
 import { sha256Hex } from "./utils/hash.js";
 import { analyzeRedirects } from "./utils/redirectAnalyzer.js";
-import { analyzeUrlFeatures, normalizeUrl } from "./utils/urlAnalyzer.js";
+import { analyzeUrlFeatures, detectDomainMismatch, normalizeUrl } from "./utils/urlAnalyzer.js";
 import {
   appendAnalysisRecord,
   checkDomainPreviouslyFlagged,
@@ -13,12 +14,15 @@ import {
   updatePostAnalysis
 } from "./utils/storage.js";
 
+const CONFIG_FILE_NAME = "config.local.js";
+
 const MESSAGE_TYPES = {
   ANALYZE_LINK: "DILI_ANALYZE_LINK",
   REANALYZE_LINK: "DILI_REANALYZE_LINK",
   GET_POST_STATE: "DILI_GET_POST_STATE",
   SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
   GET_POPUP_SUMMARY: "DILI_GET_POPUP_SUMMARY",
+  GET_PROVIDER_HEALTH: "DILI_GET_PROVIDER_HEALTH",
   GET_ANALYSIS_RECORDS: "DILI_GET_ANALYSIS_RECORDS",
   CLEAR_ANALYSIS_RECORDS: "DILI_CLEAR_ANALYSIS_RECORDS",
   RESCAN_CURRENT_TAB: "DILI_RESCAN_CURRENT_TAB",
@@ -29,7 +33,13 @@ const sessionInfo = {
   startedAt: Date.now()
 };
 
-let cachedConfigPromise = null;
+const providerHealth = createInitialProviderHealth();
+const runtimeConfig = createRuntimeConfig();
+const CURRENT_ANALYSIS_SCHEMA_VERSION = 2;
+const URL_ANALYSIS_CACHE_TTL_MS = 10 * 60 * 1000;
+const urlAnalysisCache = new Map();
+
+applyConfigDiagnostics(runtimeConfig);
 
 chrome.runtime.onInstalled.addListener(() => {
   logDebug("Background service worker installed.");
@@ -91,6 +101,13 @@ async function handleMessage(message) {
         summary: await buildPopupSummary(message?.tabUrl || "")
       };
 
+    case MESSAGE_TYPES.GET_PROVIDER_HEALTH:
+      await getRuntimeConfig();
+      return {
+        type: MESSAGE_TYPES.GET_PROVIDER_HEALTH,
+        providerHealth: getProviderHealthSnapshot()
+      };
+
     case MESSAGE_TYPES.GET_ANALYSIS_RECORDS:
       return {
         type: MESSAGE_TYPES.GET_ANALYSIS_RECORDS,
@@ -131,61 +148,69 @@ async function setNoLinkState(message) {
 }
 
 async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis }) {
-  const normalizedUrl = normalizeUrl(rawUrl);
-  const currentHash = await sha256Hex(normalizedUrl);
+  const urlFeatures = analyzeUrlFeatures({
+    rawUrl
+  });
+  const normalizedUrl = urlFeatures.normalizedUrl;
   const existingBaseline = await getBaseline(postId);
+  const compatibleBaseline = getCompatibleBaseline(existingBaseline);
 
-  if (
-    isReanalysis &&
-    existingBaseline?.urlHash &&
-    existingBaseline.urlHash === currentHash &&
-    existingBaseline.classification
-  ) {
-    const unchangedRecord = await updatePostAnalysis(postId, {
-      state: "monitored",
-      lastChecked: Date.now()
-    });
-
-    logDebug(`Edit detection for ${postId}: hash unchanged, baseline reused.`);
-
-    return {
-      ...unchangedRecord,
-      normalizedUrl,
-      urlHash: currentHash,
-      analysisMode: "reused-baseline",
-      reusedClassification: true
-    };
+  if (existingBaseline && !compatibleBaseline) {
+    logDebug(`Legacy baseline detected for ${postId}; integrity comparison skipped for this scan.`);
   }
 
-  const urlFeatures = analyzeUrlFeatures({
-    rawUrl: normalizedUrl,
-    displayedText
-  });
-  const redirectAnalysis = await analyzeRedirects(normalizedUrl);
-  const domain = safeHostname(normalizedUrl);
+  const reusableUrlAnalysis = await getReusableUrlAnalysis(rawUrl, urlFeatures);
+  const analysisUrl = reusableUrlAnalysis.analysisUrl;
+  const redirectAnalysis = reusableUrlAnalysis.redirectAnalysis;
+  const providerResults = reusableUrlAnalysis.providerResults;
+  const domain = reusableUrlAnalysis.domain || safeHostname(analysisUrl || normalizedUrl);
+  const currentHash = await sha256Hex(buildStableUrlHashInput({
+    analysisUrl,
+    normalizedUrl
+  }));
+  const textComparison = detectDomainMismatch(displayedText || "", analysisUrl);
   const domainPreviouslyFlagged = await checkDomainPreviouslyFlagged(domain);
-  const providerResults = await runThreatIntelligenceChecks(normalizedUrl);
   const gsbResult = providerResults.find((item) => item.provider === "gsb") || createDefaultProviderResult("gsb");
   const urlhausResult = providerResults.find((item) => item.provider === "urlhaus") || createDefaultProviderResult("urlhaus");
-
-  const features = {
-    googleSafeBrowsingFlagged: gsbResult.flagged,
-    urlhausFlagged: urlhausResult.flagged,
+  const postContextFeatures = {
     domainPreviouslyFlagged,
-    redirectCount: redirectAnalysis.redirectCount,
-    shortenedUrl: urlFeatures.shortenedUrl,
-    obfuscatedUrl: urlFeatures.obfuscatedUrl,
-    suspiciousTld: urlFeatures.suspiciousTld,
-    textMismatch: urlFeatures.textMismatch,
-    integrityHashMismatch: Boolean(isReanalysis && existingBaseline?.urlHash && existingBaseline.urlHash !== currentHash)
+    textMismatch: textComparison.mismatch,
+    integrityHashMismatch: Boolean(isReanalysis && hasCompatibleIntegrityMismatch(compatibleBaseline, {
+      currentHash,
+      analysisUrl,
+      normalizedUrl
+    }))
   };
-
+  const enrichedUrlFeatures = {
+    ...reusableUrlAnalysis.urlFeatureAnalysis,
+    finalAnalysisUrl: analysisUrl,
+    finalDomain: domain,
+    displayDomain: textComparison.displayDomain,
+    actualDomain: textComparison.actualDomain,
+    displayTextLooksLikeDomain: textComparison.displayTextLooksLikeDomain,
+    genericDisplayText: textComparison.genericText,
+    textMismatch: postContextFeatures.textMismatch,
+    wrapperToExternalDestination: Boolean(reusableUrlAnalysis.urlFeatureAnalysis.wrapperToExternalDestination || redirectAnalysis.wrapperToExternalDestination)
+  };
+  const urlLevelFeatures = {
+    ...reusableUrlAnalysis.urlLevelFeatures,
+    wrapperToExternalDestination: enrichedUrlFeatures.wrapperToExternalDestination
+  };
+  const features = {
+    ...urlLevelFeatures,
+    ...postContextFeatures
+  };
+  const urlLevelScoring = calculateSafetyScore(urlLevelFeatures);
+  const urlLevelClassification = classifySafetyScore(urlLevelScoring.score);
   const scoring = calculateSafetyScore(features);
   const classification = classifySafetyScore(scoring.score);
   const nextState = features.integrityHashMismatch ? "changed" : "monitored";
   const record = {
     postId,
+    analysisSchemaVersion: CURRENT_ANALYSIS_SCHEMA_VERSION,
     normalizedUrl,
+    analysisUrl,
+    rawUrl,
     urlHash: currentHash,
     classification,
     safetyScore: scoring.score,
@@ -193,7 +218,7 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis
     deductions: scoring.deductions,
     providerResults,
     redirectAnalysis,
-    urlFeatureAnalysis: urlFeatures,
+    urlFeatureAnalysis: enrichedUrlFeatures,
     lastChecked: Date.now(),
     state: nextState
   };
@@ -202,14 +227,16 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis
     ? await updatePostAnalysis(postId, record)
     : await setBaseline(postId, record);
 
-  if (classification === "High Risk" || gsbResult.flagged || urlhausResult.flagged) {
+  if (urlLevelClassification === "High Risk" || gsbResult.flagged || urlhausResult.flagged) {
     await markDomainFlagged(domain);
   }
 
   await appendAnalysisRecord({
     timestamp: Date.now(),
     postId,
-    url: normalizedUrl,
+    analysisSchemaVersion: CURRENT_ANALYSIS_SCHEMA_VERSION,
+    url: analysisUrl,
+    originalUrl: normalizedUrl,
     domain,
     urlHash: currentHash,
     safetyScore: scoring.score,
@@ -223,14 +250,271 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis
     logDebug(`Edit detection for ${postId}: integrity hash changed.`);
   }
 
+  logDebug(`URL analysis reused=${reusableUrlAnalysis.cacheHit} analysisUrl=${analysisUrl}`);
   logDebug(`Provider checks: gsb=${gsbResult.flagged} urlhaus=${urlhausResult.flagged}`);
   logDebug(`Scoring result for ${postId}: safety=${scoring.score} classification=${classification}`);
 
   return {
     ...storedRecord,
-    analysisMode: isReanalysis ? "reanalyzed" : "baseline-created",
+    analysisMode: isReanalysis ? (compatibleBaseline ? "reanalyzed" : "legacy-baseline-refresh") : "baseline-created",
     reusedClassification: false
   };
+}
+
+function resolveAnalysisUrl(urlFeatures, redirectAnalysis) {
+  const candidates = [
+    redirectAnalysis?.resolvedUrl,
+    urlFeatures?.unwrappedUrl,
+    urlFeatures?.normalizedUrl
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+
+    try {
+      return normalizeUrl(candidate);
+    } catch {
+      continue;
+    }
+  }
+
+  throw new Error("Unable to resolve a stable analysis URL.");
+}
+
+function getCompatibleBaseline(existingBaseline) {
+  if (!existingBaseline || Number(existingBaseline.analysisSchemaVersion || 0) !== CURRENT_ANALYSIS_SCHEMA_VERSION) {
+    return null;
+  }
+
+  return existingBaseline;
+}
+
+function hasCompatibleIntegrityMismatch(existingBaseline, currentAnalysis) {
+  if (!existingBaseline?.urlHash) {
+    return false;
+  }
+
+  const baselineTarget = buildStableUrlHashInput({
+    analysisUrl: existingBaseline.analysisUrl,
+    normalizedUrl: existingBaseline.normalizedUrl
+  });
+  const currentTarget = buildStableUrlHashInput(currentAnalysis);
+
+  if (baselineTarget && currentTarget && baselineTarget === currentTarget) {
+    return false;
+  }
+
+  return existingBaseline.urlHash !== currentAnalysis.currentHash;
+}
+
+function buildStableUrlHashInput({ analysisUrl, normalizedUrl }) {
+  const candidates = [analysisUrl, normalizedUrl];
+
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+
+    try {
+      return normalizeUrl(candidate);
+    } catch {
+      continue;
+    }
+  }
+
+  return String(analysisUrl || normalizedUrl || "").trim();
+}
+
+async function getReusableUrlAnalysis(rawUrl, urlFeatures) {
+  pruneUrlAnalysisCache();
+
+  const initialCacheKeys = buildUrlAnalysisCacheKeys(urlFeatures);
+  for (const cacheKey of initialCacheKeys) {
+    const cachedEntry = getUrlAnalysisCacheEntry(cacheKey);
+    if (!cachedEntry) {
+      continue;
+    }
+
+    logDebug(`URL analysis cache hit: ${cacheKey}`);
+    logDebug(`Reused cached redirect/provider analysis for ${cachedEntry.analysisUrl}`);
+
+    const aliasKeys = buildUrlAnalysisCacheKeys(urlFeatures, cachedEntry.analysisUrl);
+    setUrlAnalysisCacheEntry(aliasKeys, stripUrlAnalysisCacheMetadata(cachedEntry), cachedEntry.cachedAt);
+
+    return {
+      ...cachedEntry,
+      cacheHit: true,
+      cacheKey
+    };
+  }
+
+  const cacheMissKey = initialCacheKeys[0] || normalizeCacheKey(rawUrl) || "unknown-url";
+  logDebug(`URL analysis cache miss: ${cacheMissKey}`);
+
+  const redirectAnalysis = await analyzeRedirects(rawUrl);
+  const analysisUrl = resolveAnalysisUrl(urlFeatures, redirectAnalysis);
+  const domain = safeHostname(analysisUrl || urlFeatures.normalizedUrl);
+  const providerResults = await runThreatIntelligenceChecks(analysisUrl);
+  const stableUrlFeatureAnalysis = {
+    ...urlFeatures,
+    finalAnalysisUrl: analysisUrl,
+    finalDomain: domain,
+    wrapperToExternalDestination: Boolean(urlFeatures.wrapperToExternalDestination || redirectAnalysis.wrapperToExternalDestination)
+  };
+  const urlLevelFeatures = buildUrlLevelFeatures({
+    redirectAnalysis,
+    providerResults,
+    urlFeatureAnalysis: stableUrlFeatureAnalysis
+  });
+  const cacheEntry = {
+    analysisUrl,
+    domain,
+    redirectAnalysis,
+    providerResults,
+    urlFeatureAnalysis: stableUrlFeatureAnalysis,
+    urlLevelFeatures
+  };
+
+  setUrlAnalysisCacheEntry(buildUrlAnalysisCacheKeys(urlFeatures, analysisUrl), cacheEntry);
+
+  return {
+    ...getUrlAnalysisCacheEntry(analysisUrl),
+    cacheHit: false,
+    cacheKey: analysisUrl
+  };
+}
+
+function buildUrlLevelFeatures({ redirectAnalysis, providerResults, urlFeatureAnalysis }) {
+  const gsbResult = providerResults.find((item) => item.provider === "gsb") || createDefaultProviderResult("gsb");
+  const urlhausResult = providerResults.find((item) => item.provider === "urlhaus") || createDefaultProviderResult("urlhaus");
+
+  return {
+    googleSafeBrowsingFlagged: gsbResult.flagged,
+    urlhausFlagged: urlhausResult.flagged,
+    domainPreviouslyFlagged: false,
+    redirectCount: redirectAnalysis.redirectCount,
+    multipleRedirects: redirectAnalysis.multipleRedirects,
+    crossDomainRedirectChain: redirectAnalysis.crossDomainRedirectChain,
+    redirectChainToDifferentRegistrantLikeTarget: redirectAnalysis.redirectChainToDifferentRegistrantLikeTarget,
+    wrapperToExternalDestination: Boolean(urlFeatureAnalysis.wrapperToExternalDestination),
+    suspiciousRedirectPattern: redirectAnalysis.suspiciousPattern,
+    trackingHopToUnrelatedDomain: redirectAnalysis.trackingHopToUnrelatedDomain,
+    shortenerToUnrelatedDomain: redirectAnalysis.shortenerToUnrelatedDomain,
+    shortenedUrl: urlFeatureAnalysis.shortenedUrl,
+    obfuscatedUrl: urlFeatureAnalysis.obfuscatedUrl,
+    suspiciousTld: urlFeatureAnalysis.suspiciousTld,
+    textMismatch: false,
+    excessiveQueryComplexity: urlFeatureAnalysis.excessiveQueryComplexity,
+    suspiciousPath: urlFeatureAnalysis.suspiciousPath,
+    excessiveSubdomainDepth: urlFeatureAnalysis.excessiveSubdomainDepth,
+    usernamePasswordTrick: urlFeatureAnalysis.usernamePasswordTrick,
+    integrityHashMismatch: false
+  };
+}
+
+function buildUrlAnalysisCacheKeys(urlFeatures = {}, analysisUrl = "") {
+  const keys = [];
+  const candidates = [
+    analysisUrl,
+    urlFeatures.normalizedUrl,
+    urlFeatures.unwrappedUrl,
+    urlFeatures.rawComparableUrl
+  ];
+
+  for (const candidate of candidates) {
+    const cacheKey = normalizeCacheKey(candidate);
+    if (cacheKey && !keys.includes(cacheKey)) {
+      keys.push(cacheKey);
+    }
+  }
+
+  return keys;
+}
+
+function normalizeCacheKey(candidate) {
+  if (!candidate) {
+    return "";
+  }
+
+  try {
+    return normalizeUrl(candidate);
+  } catch {
+    return String(candidate || "").trim();
+  }
+}
+
+function getUrlAnalysisCacheEntry(cacheKey) {
+  if (!cacheKey) {
+    return null;
+  }
+
+  const entry = urlAnalysisCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+
+  if (entry.expiresAt <= Date.now()) {
+    urlAnalysisCache.delete(cacheKey);
+    return null;
+  }
+
+  return {
+    cachedAt: entry.cachedAt,
+    expiresAt: entry.expiresAt,
+    ...cloneValue(entry.payload)
+  };
+}
+
+function setUrlAnalysisCacheEntry(cacheKeys, payload, cachedAt = Date.now()) {
+  const normalizedKeys = [...new Set((cacheKeys || []).filter(Boolean))];
+  if (normalizedKeys.length === 0) {
+    return;
+  }
+
+  const entry = {
+    cachedAt,
+    expiresAt: cachedAt + URL_ANALYSIS_CACHE_TTL_MS,
+    payload: cloneValue(payload)
+  };
+
+  for (const cacheKey of normalizedKeys) {
+    urlAnalysisCache.set(cacheKey, entry);
+  }
+
+  pruneUrlAnalysisCache();
+}
+
+function pruneUrlAnalysisCache() {
+  const now = Date.now();
+
+  for (const [cacheKey, entry] of urlAnalysisCache.entries()) {
+    if (entry.expiresAt <= now) {
+      urlAnalysisCache.delete(cacheKey);
+    }
+  }
+}
+
+function cloneValue(value) {
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (typeof structuredClone === "function") {
+    return structuredClone(value);
+  }
+
+  return JSON.parse(JSON.stringify(value));
+}
+
+function stripUrlAnalysisCacheMetadata(entry) {
+  if (!entry) {
+    return entry;
+  }
+
+  const { cachedAt, expiresAt, ...payload } = entry;
+  return payload;
 }
 
 async function runThreatIntelligenceChecks(normalizedUrl) {
@@ -244,9 +528,23 @@ async function runThreatIntelligenceChecks(normalizedUrl) {
 
 async function lookupGoogleSafeBrowsing(normalizedUrl) {
   const config = await getRuntimeConfig();
+  const checkedAt = Date.now();
   const key = String(config.GSB_API_KEY || "").trim();
 
   if (!key) {
+    const missingKeyMessage = config.configLoaded
+      ? `GSB_API_KEY is missing in ${CONFIG_FILE_NAME}.`
+      : config.configError || `Failed to load ${CONFIG_FILE_NAME}.`;
+
+    updateGsbHealth({
+      configured: false,
+      available: false,
+      lastStatus: "not-configured",
+      lastHttpStatus: null,
+      lastError: missingKeyMessage,
+      lastCheckedAt: checkedAt
+    });
+
     return {
       provider: "gsb",
       configured: false,
@@ -255,14 +553,16 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
       category: null,
       details: {
         status: "not-configured",
-        message: "GSB_API_KEY is missing in config.local.js."
+        message: missingKeyMessage
       }
     };
   }
 
+  let response = null;
+
   try {
     const endpoint = `https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${encodeURIComponent(key)}`;
-    const response = await fetch(endpoint, {
+    response = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
@@ -282,6 +582,17 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
     });
 
     if (!response.ok) {
+      const errorMessage = `Safe Browsing lookup returned HTTP ${response.status}.`;
+
+      updateGsbHealth({
+        configured: true,
+        available: false,
+        lastStatus: "error",
+        lastHttpStatus: response.status,
+        lastError: errorMessage,
+        lastCheckedAt: checkedAt
+      });
+
       return {
         provider: "gsb",
         configured: true,
@@ -291,7 +602,7 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
         details: {
           status: "error",
           httpStatus: response.status,
-          message: "Safe Browsing lookup returned non-OK status."
+          message: errorMessage
         }
       };
     }
@@ -299,6 +610,15 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
     const payload = await response.json();
     const matches = Array.isArray(payload.matches) ? payload.matches : [];
     const category = matches[0]?.threatType || null;
+
+    updateGsbHealth({
+      configured: true,
+      available: true,
+      lastStatus: "ok",
+      lastHttpStatus: response.status,
+      lastError: null,
+      lastCheckedAt: checkedAt
+    });
 
     return {
       provider: "gsb",
@@ -313,6 +633,15 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
       }
     };
   } catch (error) {
+    updateGsbHealth({
+      configured: true,
+      available: false,
+      lastStatus: "error",
+      lastHttpStatus: response?.status ?? null,
+      lastError: safeErrorMessage(error, "Unknown Safe Browsing error."),
+      lastCheckedAt: checkedAt
+    });
+
     return {
       provider: "gsb",
       configured: true,
@@ -321,35 +650,47 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
       category: null,
       details: {
         status: "error",
-        message: error.message || "Unknown Safe Browsing error."
+        httpStatus: response?.status ?? null,
+        message: safeErrorMessage(error, "Unknown Safe Browsing error.")
       }
     };
   }
 }
 
 async function lookupUrlhaus(normalizedUrl) {
-  const config = await getRuntimeConfig();
-  const optionalAuth = String(config.URLHAUS_AUTH_TOKEN || config.URLHAUS_API_KEY || "").trim();
+  const config = getRuntimeConfig();
+  const checkedAt = Date.now();
+  const authKey = String(config.URLHAUS_AUTH_KEY || "").trim();
+  const mode = "public";
   const headers = {
     "Content-Type": "application/x-www-form-urlencoded"
   };
 
-  if (optionalAuth) {
-    headers.Authorization = `Bearer ${optionalAuth}`;
-  }
+  let response = null;
 
   try {
     const body = new URLSearchParams({
       url: normalizedUrl
     });
 
-    const response = await fetch("https://urlhaus-api.abuse.ch/v1/url/", {
+    response = await fetch("https://urlhaus-api.abuse.ch/v1/url/", {
       method: "POST",
       headers,
       body: body.toString()
     });
 
     if (!response.ok) {
+      const errorMessage = `URLhaus lookup returned HTTP ${response.status}.`;
+
+      updateUrlhausHealth({
+        mode,
+        available: false,
+        lastStatus: "error",
+        lastHttpStatus: response.status,
+        lastError: errorMessage,
+        lastCheckedAt: checkedAt
+      });
+
       return {
         provider: "urlhaus",
         configured: true,
@@ -359,8 +700,10 @@ async function lookupUrlhaus(normalizedUrl) {
         details: {
           status: "error",
           httpStatus: response.status,
-          message: "URLhaus lookup returned non-OK status.",
-          authConfigured: Boolean(optionalAuth)
+          message: errorMessage,
+          mode,
+          authConfigured: Boolean(authKey),
+          authKeyConfigured: Boolean(authKey)
         }
       };
     }
@@ -369,6 +712,15 @@ async function lookupUrlhaus(normalizedUrl) {
     const status = String(payload.query_status || "").toLowerCase();
     const flagged = status === "ok" || status === "online";
     const category = payload.threat || payload.tags?.[0] || "malware-oriented";
+
+    updateUrlhausHealth({
+      mode,
+      available: true,
+      lastStatus: "ok",
+      lastHttpStatus: response.status,
+      lastError: null,
+      lastCheckedAt: checkedAt
+    });
 
     return {
       provider: "urlhaus",
@@ -380,11 +732,22 @@ async function lookupUrlhaus(normalizedUrl) {
         status: "checked",
         queryStatus: payload.query_status || null,
         source: payload.urlhaus_reference || payload.reporter || null,
-        authConfigured: Boolean(optionalAuth),
+        mode,
+        authConfigured: Boolean(authKey),
+        authKeyConfigured: Boolean(authKey),
         payload
       }
     };
   } catch (error) {
+    updateUrlhausHealth({
+      mode,
+      available: false,
+      lastStatus: "error",
+      lastHttpStatus: response?.status ?? null,
+      lastError: safeErrorMessage(error, "Unknown URLhaus lookup error."),
+      lastCheckedAt: checkedAt
+    });
+
     return {
       provider: "urlhaus",
       configured: true,
@@ -393,18 +756,18 @@ async function lookupUrlhaus(normalizedUrl) {
       category: null,
       details: {
         status: "error",
-        message: error.message || "Unknown URLhaus lookup error.",
-        authConfigured: Boolean(optionalAuth)
+        httpStatus: response?.status ?? null,
+        message: safeErrorMessage(error, "Unknown URLhaus lookup error."),
+        mode,
+        authConfigured: Boolean(authKey),
+        authKeyConfigured: Boolean(authKey)
       }
     };
   }
 }
 
 async function buildPopupSummary(tabUrl) {
-  const [records, config] = await Promise.all([
-    getAllAnalysisRecords(),
-    getRuntimeConfig()
-  ]);
+  const records = await getAllAnalysisRecords();
   const isSupportedTab = isSupportedFacebookUrl(tabUrl);
   const sessionRecords = records.filter((record) => Number(record.timestamp || 0) >= sessionInfo.startedAt);
   const analyzedPostsInSession = new Set(sessionRecords.map((record) => record.postId).filter(Boolean)).size;
@@ -420,11 +783,6 @@ async function buildPopupSummary(tabUrl) {
     analyzedPostsInSession,
     flaggedPostsInSession,
     totalStoredAnalyses: records.length,
-    providerStatus: {
-      gsbConfigured: Boolean(String(config.GSB_API_KEY || "").trim()),
-      urlhausConfigured: true,
-      urlhausAuthConfigured: Boolean(String(config.URLHAUS_AUTH_TOKEN || config.URLHAUS_API_KEY || "").trim())
-    },
     recentActivity: records
       .slice(-10)
       .reverse()
@@ -476,32 +834,113 @@ async function triggerRescanForActiveTab() {
   }
 }
 
-async function getRuntimeConfig() {
-  if (cachedConfigPromise) {
-    return cachedConfigPromise;
+function getRuntimeConfig() {
+  return runtimeConfig;
+}
+
+function createRuntimeConfig() {
+  return {
+    GSB_API_KEY: String(GSB_API_KEY || "").trim(),
+    URLHAUS_AUTH_KEY: String(URLHAUS_AUTH_KEY || "").trim(),
+    configLoaded: true,
+    configSource: CONFIG_FILE_NAME,
+    configError: null
+  };
+}
+
+function createInitialProviderHealth() {
+  return {
+    configLoaded: false,
+    configSource: "not-yet-loaded",
+    configError: null,
+    gsb: {
+      configured: false,
+      available: false,
+      lastStatus: "not-yet-run",
+      lastHttpStatus: null,
+      lastError: null,
+      lastCheckedAt: null
+    },
+    urlhaus: {
+      mode: "public",
+      authKeyConfigured: false,
+      available: true,
+      lastStatus: "not-yet-run",
+      lastHttpStatus: null,
+      lastError: null,
+      lastCheckedAt: null
+    }
+  };
+}
+
+function applyConfigDiagnostics(config) {
+  const gsbKeyLoaded = Boolean(String(config.GSB_API_KEY || "").trim());
+  const urlhausAuthKeyLoaded = Boolean(String(config.URLHAUS_AUTH_KEY || "").trim());
+  const configError = config.configLoaded ? null : config.configError || `Unable to load ${CONFIG_FILE_NAME}.`;
+
+  providerHealth.configLoaded = Boolean(config.configLoaded);
+  providerHealth.configSource = config.configSource || (config.configLoaded ? CONFIG_FILE_NAME : "fallback");
+  providerHealth.configError = configError;
+
+  providerHealth.gsb.configured = gsbKeyLoaded;
+
+  if (!gsbKeyLoaded) {
+    providerHealth.gsb.available = false;
+    providerHealth.gsb.lastStatus = "not-configured";
+    providerHealth.gsb.lastHttpStatus = null;
+    providerHealth.gsb.lastError = config.configLoaded
+      ? `GSB_API_KEY is missing in ${CONFIG_FILE_NAME}.`
+      : configError;
+  } else {
+    if (providerHealth.gsb.lastStatus === "not-configured") {
+      providerHealth.gsb.lastStatus = "not-yet-run";
+      providerHealth.gsb.lastHttpStatus = null;
+      providerHealth.gsb.lastError = null;
+    }
+
+    providerHealth.gsb.available = providerHealth.gsb.lastStatus !== "error";
   }
 
-  cachedConfigPromise = (async () => {
-    const fallback = {
-      GSB_API_KEY: "",
-      URLHAUS_API_KEY: "",
-      URLHAUS_AUTH_TOKEN: ""
-    };
+  providerHealth.urlhaus.mode = "public";
+  providerHealth.urlhaus.authKeyConfigured = urlhausAuthKeyLoaded;
+  providerHealth.urlhaus.available = providerHealth.urlhaus.lastStatus !== "error";
 
-    try {
-      const module = await import(chrome.runtime.getURL("config.local.js"));
-      return {
-        ...fallback,
-        GSB_API_KEY: String(module.GSB_API_KEY || ""),
-        URLHAUS_API_KEY: String(module.URLHAUS_API_KEY || ""),
-        URLHAUS_AUTH_TOKEN: String(module.URLHAUS_AUTH_TOKEN || "")
-      };
-    } catch {
-      return fallback;
+  if (providerHealth.urlhaus.lastStatus === "not-yet-run") {
+    providerHealth.urlhaus.lastError = null;
+  }
+}
+
+function updateGsbHealth(patch) {
+  Object.assign(providerHealth.gsb, patch);
+}
+
+function updateUrlhausHealth(patch) {
+  Object.assign(providerHealth.urlhaus, patch);
+}
+
+function getProviderHealthSnapshot() {
+  return {
+    configLoaded: providerHealth.configLoaded,
+    configSource: providerHealth.configSource,
+    configError: providerHealth.configError,
+    gsb: {
+      configured: providerHealth.gsb.configured,
+      available: providerHealth.gsb.available,
+      lastStatus: providerHealth.gsb.lastStatus,
+      lastHttpStatus: providerHealth.gsb.lastHttpStatus,
+      lastError: providerHealth.gsb.lastError,
+      lastCheckedAt: providerHealth.gsb.lastCheckedAt
+    },
+    urlhaus: {
+      mode: providerHealth.urlhaus.mode,
+      authKeyConfigured: providerHealth.urlhaus.authKeyConfigured,
+      available: providerHealth.urlhaus.available,
+      lastStatus: providerHealth.urlhaus.lastStatus,
+      lastHttpStatus: providerHealth.urlhaus.lastHttpStatus,
+      lastError: providerHealth.urlhaus.lastError,
+      lastCheckedAt: providerHealth.urlhaus.lastCheckedAt
     }
-  })();
-
-  return cachedConfigPromise;
+  };
 }
 
 function createDefaultProviderResult(provider) {
@@ -533,6 +972,18 @@ function safeHostname(rawUrl) {
   } catch {
     return "";
   }
+}
+
+function safeErrorMessage(error, fallbackMessage) {
+  if (error && typeof error.message === "string" && error.message.trim()) {
+    return error.message.trim();
+  }
+
+  if (typeof error === "string" && error.trim()) {
+    return error.trim();
+  }
+
+  return fallbackMessage;
 }
 
 function logDebug(message) {

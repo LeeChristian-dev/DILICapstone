@@ -1,5 +1,6 @@
 const MESSAGE_TYPES = {
   GET_POPUP_SUMMARY: "DILI_GET_POPUP_SUMMARY",
+  GET_PROVIDER_HEALTH: "DILI_GET_PROVIDER_HEALTH",
   GET_ANALYSIS_RECORDS: "DILI_GET_ANALYSIS_RECORDS",
   CLEAR_ANALYSIS_RECORDS: "DILI_CLEAR_ANALYSIS_RECORDS",
   RESCAN_CURRENT_TAB: "DILI_RESCAN_CURRENT_TAB"
@@ -66,26 +67,44 @@ function bindActions() {
 async function refreshPopupData() {
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const tabUrl = activeTab?.url || "";
-  const response = await sendMessage({
-    type: MESSAGE_TYPES.GET_POPUP_SUMMARY,
-    tabUrl
-  });
+  const [summaryResponse, providerHealthResponse] = await Promise.all([
+    sendMessage({
+      type: MESSAGE_TYPES.GET_POPUP_SUMMARY,
+      tabUrl
+    }),
+    sendMessage({
+      type: MESSAGE_TYPES.GET_PROVIDER_HEALTH
+    })
+  ]);
 
-  const summary = response?.summary || {};
-  renderStatus(summary);
+  const summary = summaryResponse?.summary || {};
+  const providerHealth = providerHealthResponse?.providerHealth || {};
+
+  renderStatus(summary, providerHealth);
   renderActivity(summary.recentActivity || []);
 }
 
-function renderStatus(summary) {
-  const providerStatus = summary.providerStatus || {};
+function renderStatus(summary, providerHealth) {
+  const gsb = providerHealth.gsb || {};
+  const urlhaus = providerHealth.urlhaus || {};
   const items = [
     `Current tab supported: ${summary.tabSupported ? "Yes" : "No"}`,
     `Analyzed posts (session): ${summary.analyzedPostsInSession || 0}`,
     `Flagged posts (session): ${summary.flaggedPostsInSession || 0}`,
     `Stored analyses: ${summary.totalStoredAnalyses || 0}`,
-    `GSB configured: ${providerStatus.gsbConfigured ? "Yes" : "No"}`,
-    `URLhaus configured: ${providerStatus.urlhausConfigured ? "Yes" : "No (unexpected)"}`,
-    `URLhaus auth token: ${providerStatus.urlhausAuthConfigured ? "Provided" : "Not provided (public mode)"}`
+    `Config loaded: ${providerHealth.configLoaded ? "Yes" : "No"}`,
+    `Config source: ${providerHealth.configSource || "unknown"}`,
+    `Config error: ${formatText(providerHealth.configError, "none")}`,
+    `GSB key loaded: ${gsb.configured ? "Yes" : "No"}`,
+    `GSB last check: ${formatProviderStatus(gsb.lastStatus)}`,
+    `GSB last HTTP status: ${formatText(gsb.lastHttpStatus, "n/a")}`,
+    `GSB last error: ${formatText(gsb.lastError, "none")}`,
+    `GSB last checked at: ${formatTimestampOrFallback(gsb.lastCheckedAt)}`,
+    `URLhaus mode: ${urlhaus.mode || "public"}`,
+    `URLhaus last check: ${formatProviderStatus(urlhaus.lastStatus)}`,
+    `URLhaus last HTTP status: ${formatText(urlhaus.lastHttpStatus, "n/a")}`,
+    `URLhaus last error: ${formatText(urlhaus.lastError, "none")}`,
+    `URLhaus last checked at: ${formatTimestampOrFallback(urlhaus.lastCheckedAt)}`
   ];
 
   statusList.innerHTML = items.map((text) => `<li>${escapeHtml(text)}</li>`).join("");
@@ -189,9 +208,29 @@ function findProviderResult(results, providerName) {
   return results.find((item) => item.provider === providerName) || null;
 }
 
+function formatProviderStatus(status) {
+  return formatText(status, "not-yet-run");
+}
+
 function formatTimestamp(timestamp) {
   const date = new Date(Number(timestamp || Date.now()));
   return Number.isNaN(date.getTime()) ? "invalid-date" : date.toISOString();
+}
+
+function formatTimestampOrFallback(timestamp) {
+  if (!timestamp) {
+    return "not-yet-run";
+  }
+
+  return formatTimestamp(timestamp);
+}
+
+function formatText(value, fallback) {
+  if (value === null || value === undefined || value === "") {
+    return fallback;
+  }
+
+  return String(value);
 }
 
 function timestampForFilename(date) {
