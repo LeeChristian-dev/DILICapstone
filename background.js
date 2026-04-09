@@ -2,14 +2,16 @@ import { GSB_API_KEY, URLHAUS_AUTH_KEY } from "./config.local.js";
 import { calculateSafetyScore, classifySafetyScore } from "./riskEngine.js";
 import { sha256Hex } from "./utils/hash.js";
 import { analyzeRedirects } from "./utils/redirectAnalyzer.js";
-import { analyzeUrlFeatures, detectDomainMismatch, normalizeUrl } from "./utils/urlAnalyzer.js";
+import { analyzeUrlFeatures, detectDomainMismatch, getRegistrableDomain, normalizeUrl } from "./utils/urlAnalyzer.js";
 import {
   appendAnalysisRecord,
   checkDomainPreviouslyFlagged,
   clearAnalysisRecords,
   getAllAnalysisRecords,
   getBaseline,
+  getScanEnabledState,
   markDomainFlagged,
+  setScanEnabledState,
   setBaseline,
   updatePostAnalysis
 } from "./utils/storage.js";
@@ -21,25 +23,27 @@ const MESSAGE_TYPES = {
   REANALYZE_LINK: "DILI_REANALYZE_LINK",
   GET_POST_STATE: "DILI_GET_POST_STATE",
   SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
+  GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
+  SET_SCAN_STATE: "DILI_SET_SCAN_STATE",
   GET_POPUP_SUMMARY: "DILI_GET_POPUP_SUMMARY",
   GET_PROVIDER_HEALTH: "DILI_GET_PROVIDER_HEALTH",
   GET_ANALYSIS_RECORDS: "DILI_GET_ANALYSIS_RECORDS",
   CLEAR_ANALYSIS_RECORDS: "DILI_CLEAR_ANALYSIS_RECORDS",
+  RESET_SESSION: "DILI_RESET_SESSION",
   RESCAN_CURRENT_TAB: "DILI_RESCAN_CURRENT_TAB",
   RESCAN_NOW: "DILI_RESCAN_NOW"
 };
 
-const sessionInfo = {
-  startedAt: Date.now()
-};
-
 const providerHealth = createInitialProviderHealth();
 const runtimeConfig = createRuntimeConfig();
-const CURRENT_ANALYSIS_SCHEMA_VERSION = 2;
+const CURRENT_ANALYSIS_SCHEMA_VERSION = 3;
+const SESSION_TTL_MS = 60 * 60 * 1000;
 const URL_ANALYSIS_CACHE_TTL_MS = 10 * 60 * 1000;
 const urlAnalysisCache = new Map();
+const sessionInfo = createSessionState();
 
 applyConfigDiagnostics(runtimeConfig);
+bindSessionLifecycleObservers();
 
 chrome.runtime.onInstalled.addListener(() => {
   logDebug("Background service worker installed.");
@@ -73,6 +77,18 @@ async function handleMessage(message) {
         baseline: await setNoLinkState(message)
       };
 
+    case MESSAGE_TYPES.GET_SCAN_STATE:
+      return {
+        type: MESSAGE_TYPES.GET_SCAN_STATE,
+        scanEnabled: await getScanEnabledState()
+      };
+
+    case MESSAGE_TYPES.SET_SCAN_STATE:
+      return {
+        type: MESSAGE_TYPES.SET_SCAN_STATE,
+        scanEnabled: await setScanEnabledState(message?.enabled !== false)
+      };
+
     case MESSAGE_TYPES.ANALYZE_LINK:
       return {
         type: MESSAGE_TYPES.ANALYZE_LINK,
@@ -80,6 +96,7 @@ async function handleMessage(message) {
           postId: message.postId,
           rawUrl: message.url,
           displayedText: message.displayedText,
+          candidateContext: message.candidateContext,
           isReanalysis: false
         })
       };
@@ -91,6 +108,7 @@ async function handleMessage(message) {
           postId: message.postId,
           rawUrl: message.url,
           displayedText: message.displayedText,
+          candidateContext: message.candidateContext,
           isReanalysis: true
         })
       };
@@ -109,6 +127,7 @@ async function handleMessage(message) {
       };
 
     case MESSAGE_TYPES.GET_ANALYSIS_RECORDS:
+      await ensureActiveSession("popup-records");
       return {
         type: MESSAGE_TYPES.GET_ANALYSIS_RECORDS,
         records: await getAllAnalysisRecords()
@@ -120,6 +139,12 @@ async function handleMessage(message) {
       return {
         type: MESSAGE_TYPES.CLEAR_ANALYSIS_RECORDS,
         cleared: true
+      };
+
+    case MESSAGE_TYPES.RESET_SESSION:
+      return {
+        type: MESSAGE_TYPES.RESET_SESSION,
+        result: await restartSession()
       };
 
     case MESSAGE_TYPES.RESCAN_CURRENT_TAB:
@@ -147,7 +172,13 @@ async function setNoLinkState(message) {
   });
 }
 
-async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis }) {
+async function performLinkAnalysis({ postId, rawUrl, displayedText, candidateContext, isReanalysis }) {
+  if (!(await getScanEnabledState())) {
+    throw new Error("Scanning is currently disabled.");
+  }
+
+  await ensureActiveSession("analysis");
+
   const urlFeatures = analyzeUrlFeatures({
     rawUrl
   });
@@ -164,6 +195,11 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis
   const redirectAnalysis = reusableUrlAnalysis.redirectAnalysis;
   const providerResults = reusableUrlAnalysis.providerResults;
   const domain = reusableUrlAnalysis.domain || safeHostname(analysisUrl || normalizedUrl);
+  const normalizedCandidateContext = buildCandidateContext(candidateContext, {
+    analysisUrl,
+    normalizedUrl,
+    domain
+  });
   const currentHash = await sha256Hex(buildStableUrlHashInput({
     analysisUrl,
     normalizedUrl
@@ -178,7 +214,8 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis
     integrityHashMismatch: Boolean(isReanalysis && hasCompatibleIntegrityMismatch(compatibleBaseline, {
       currentHash,
       analysisUrl,
-      normalizedUrl
+      normalizedUrl,
+      candidateContext: normalizedCandidateContext
     }))
   };
   const enrichedUrlFeatures = {
@@ -192,13 +229,21 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis
     textMismatch: postContextFeatures.textMismatch,
     wrapperToExternalDestination: Boolean(reusableUrlAnalysis.urlFeatureAnalysis.wrapperToExternalDestination || redirectAnalysis.wrapperToExternalDestination)
   };
-  const urlLevelFeatures = {
+  const urlLevelFeaturesBase = {
     ...reusableUrlAnalysis.urlLevelFeatures,
     wrapperToExternalDestination: enrichedUrlFeatures.wrapperToExternalDestination
   };
-  const features = {
+  const urlLevelFeatures = {
+    ...urlLevelFeaturesBase,
+    trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(urlLevelFeaturesBase)
+  };
+  const combinedFeaturesBase = {
     ...urlLevelFeatures,
     ...postContextFeatures
+  };
+  const features = {
+    ...combinedFeaturesBase,
+    trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(combinedFeaturesBase)
   };
   const urlLevelScoring = calculateSafetyScore(urlLevelFeatures);
   const urlLevelClassification = classifySafetyScore(urlLevelScoring.score);
@@ -212,6 +257,11 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis
     analysisUrl,
     rawUrl,
     urlHash: currentHash,
+    candidateMode: normalizedCandidateContext.candidateMode,
+    dominantDomain: normalizedCandidateContext.dominantDomain,
+    candidateDomainCount: normalizedCandidateContext.candidateDomainCount,
+    selectedNormalizedTarget: normalizedCandidateContext.selectedNormalizedTarget,
+    candidateContext: normalizedCandidateContext,
     classification,
     safetyScore: scoring.score,
     features,
@@ -245,6 +295,8 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, isReanalysis
     providerResults,
     state: nextState
   });
+
+  sessionInfo.lastActivityAt = Date.now();
 
   if (features.integrityHashMismatch) {
     logDebug(`Edit detection for ${postId}: integrity hash changed.`);
@@ -296,6 +348,21 @@ function hasCompatibleIntegrityMismatch(existingBaseline, currentAnalysis) {
     return false;
   }
 
+  const baselineCandidateContext = buildCandidateContext(existingBaseline.candidateContext || existingBaseline, existingBaseline);
+  const currentCandidateContext = buildCandidateContext(currentAnalysis.candidateContext, currentAnalysis);
+
+  if (!isStableSingleTargetCandidateMode(baselineCandidateContext) || !isStableSingleTargetCandidateMode(currentCandidateContext)) {
+    return hasMeaningfulCandidateDestinationChange(baselineCandidateContext, currentCandidateContext);
+  }
+
+  if (
+    baselineCandidateContext.selectedNormalizedTarget &&
+    currentCandidateContext.selectedNormalizedTarget &&
+    baselineCandidateContext.selectedNormalizedTarget === currentCandidateContext.selectedNormalizedTarget
+  ) {
+    return false;
+  }
+
   const baselineTarget = buildStableUrlHashInput({
     analysisUrl: existingBaseline.analysisUrl,
     normalizedUrl: existingBaseline.normalizedUrl
@@ -307,6 +374,90 @@ function hasCompatibleIntegrityMismatch(existingBaseline, currentAnalysis) {
   }
 
   return existingBaseline.urlHash !== currentAnalysis.currentHash;
+}
+
+function buildCandidateContext(candidateContext = {}, fallback = {}) {
+  const selectedNormalizedTarget = normalizeComparableCandidateTarget(
+    candidateContext.selectedNormalizedTarget ||
+    fallback.selectedNormalizedTarget ||
+    fallback.analysisUrl ||
+    fallback.normalizedUrl
+  );
+  const dominantDomain = normalizeCandidateDomain(
+    candidateContext.dominantDomain ||
+    fallback.dominantDomain ||
+    getRegistrableDomain(fallback.domain || safeHostname(selectedNormalizedTarget || fallback.analysisUrl || fallback.normalizedUrl))
+  );
+  const candidateDomainCount = Math.max(1, Number(candidateContext.candidateDomainCount || fallback.candidateDomainCount || (dominantDomain ? 1 : 0)));
+  const candidateMode = normalizeCandidateMode(
+    candidateContext.candidateMode ||
+    fallback.candidateMode,
+    candidateDomainCount
+  );
+
+  return {
+    candidateMode,
+    dominantDomain,
+    candidateDomainCount,
+    selectedNormalizedTarget
+  };
+}
+
+function normalizeComparableCandidateTarget(candidate) {
+  if (!candidate) {
+    return "";
+  }
+
+  try {
+    return normalizeUrl(candidate);
+  } catch {
+    return String(candidate || "").trim();
+  }
+}
+
+function normalizeCandidateDomain(domain) {
+  return String(domain || "").toLowerCase().trim();
+}
+
+function normalizeCandidateMode(mode, candidateDomainCount = 1) {
+  const normalizedMode = String(mode || "").toLowerCase().trim();
+  if (["single", "multi-same-domain", "multi-mixed"].includes(normalizedMode)) {
+    return normalizedMode;
+  }
+
+  return Number(candidateDomainCount || 0) > 1 ? "multi-mixed" : "single";
+}
+
+function isStableSingleTargetCandidateMode(candidateContext) {
+  return candidateContext?.candidateMode === "single";
+}
+
+function hasMeaningfulCandidateDestinationChange(baselineCandidateContext, currentCandidateContext) {
+  if (!baselineCandidateContext || !currentCandidateContext) {
+    return false;
+  }
+
+  if (
+    baselineCandidateContext.dominantDomain &&
+    currentCandidateContext.dominantDomain &&
+    baselineCandidateContext.dominantDomain === currentCandidateContext.dominantDomain
+  ) {
+    return false;
+  }
+
+  if (
+    baselineCandidateContext.selectedNormalizedTarget &&
+    currentCandidateContext.selectedNormalizedTarget &&
+    baselineCandidateContext.selectedNormalizedTarget === currentCandidateContext.selectedNormalizedTarget
+  ) {
+    return false;
+  }
+
+  return Boolean(
+    baselineCandidateContext.dominantDomain &&
+    currentCandidateContext.dominantDomain &&
+    baselineCandidateContext.dominantDomain !== currentCandidateContext.dominantDomain
+  );
 }
 
 function buildStableUrlHashInput({ analysisUrl, normalizedUrl }) {
@@ -356,11 +507,21 @@ async function getReusableUrlAnalysis(rawUrl, urlFeatures) {
   const redirectAnalysis = await analyzeRedirects(rawUrl);
   const analysisUrl = resolveAnalysisUrl(urlFeatures, redirectAnalysis);
   const domain = safeHostname(analysisUrl || urlFeatures.normalizedUrl);
+  const analysisUrlFeatures = analyzeUrlFeatures({
+    rawUrl: analysisUrl
+  });
   const providerResults = await runThreatIntelligenceChecks(analysisUrl);
   const stableUrlFeatureAnalysis = {
-    ...urlFeatures,
+    ...analysisUrlFeatures,
+    sourceNormalizedUrl: urlFeatures.normalizedUrl,
+    sourceUnwrappedUrl: urlFeatures.unwrappedUrl,
+    sourceRawComparableUrl: urlFeatures.rawComparableUrl,
     finalAnalysisUrl: analysisUrl,
     finalDomain: domain,
+    shortenedUrl: Boolean(urlFeatures.shortenedUrl || analysisUrlFeatures.shortenedUrl),
+    usesKnownWrapper: Boolean(urlFeatures.usesKnownWrapper),
+    wrapperChain: urlFeatures.wrapperChain,
+    wrapperHosts: urlFeatures.wrapperHosts,
     wrapperToExternalDestination: Boolean(urlFeatures.wrapperToExternalDestination || redirectAnalysis.wrapperToExternalDestination)
   };
   const urlLevelFeatures = buildUrlLevelFeatures({
@@ -390,7 +551,7 @@ function buildUrlLevelFeatures({ redirectAnalysis, providerResults, urlFeatureAn
   const gsbResult = providerResults.find((item) => item.provider === "gsb") || createDefaultProviderResult("gsb");
   const urlhausResult = providerResults.find((item) => item.provider === "urlhaus") || createDefaultProviderResult("urlhaus");
 
-  return {
+  const baseFeatures = {
     googleSafeBrowsingFlagged: gsbResult.flagged,
     urlhausFlagged: urlhausResult.flagged,
     domainPreviouslyFlagged: false,
@@ -410,8 +571,46 @@ function buildUrlLevelFeatures({ redirectAnalysis, providerResults, urlFeatureAn
     suspiciousPath: urlFeatureAnalysis.suspiciousPath,
     excessiveSubdomainDepth: urlFeatureAnalysis.excessiveSubdomainDepth,
     usernamePasswordTrick: urlFeatureAnalysis.usernamePasswordTrick,
+    trustedEndpoint: Boolean(urlFeatureAnalysis.trustedEndpoint),
+    httpsEndpoint: Boolean(urlFeatureAnalysis.httpsEndpoint),
+    trustedEndpointMitigationEligible: false,
     integrityHashMismatch: false
   };
+
+  return {
+    ...baseFeatures,
+    trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(baseFeatures)
+  };
+}
+
+function isTrustedEndpointMitigationEligible(features = {}) {
+  const redirectCount = Number(features.redirectCount || 0);
+
+  if (!features.trustedEndpoint || !features.httpsEndpoint) {
+    return false;
+  }
+
+  if (features.googleSafeBrowsingFlagged || features.urlhausFlagged) {
+    return false;
+  }
+
+  if (features.textMismatch || features.integrityHashMismatch) {
+    return false;
+  }
+
+  if (features.suspiciousTld || features.suspiciousPath || features.obfuscatedUrl || features.usernamePasswordTrick) {
+    return false;
+  }
+
+  if (features.suspiciousRedirectPattern || features.shortenerToUnrelatedDomain || features.trackingHopToUnrelatedDomain) {
+    return false;
+  }
+
+  if (redirectCount > 3) {
+    return false;
+  }
+
+  return true;
 }
 
 function buildUrlAnalysisCacheKeys(urlFeatures = {}, analysisUrl = "") {
@@ -767,10 +966,14 @@ async function lookupUrlhaus(normalizedUrl) {
 }
 
 async function buildPopupSummary(tabUrl) {
+  await ensureActiveSession("popup-summary");
+
   const records = await getAllAnalysisRecords();
+  const scanEnabled = await getScanEnabledState();
   const isSupportedTab = isSupportedFacebookUrl(tabUrl);
   const sessionRecords = records.filter((record) => Number(record.timestamp || 0) >= sessionInfo.startedAt);
-  const analyzedPostsInSession = new Set(sessionRecords.map((record) => record.postId).filter(Boolean)).size;
+  const scannedPostsInSession = new Set(sessionRecords.map((record) => record.postId).filter(Boolean)).size;
+  const analyzedLinksInSession = sessionRecords.length;
   const flaggedPostsInSession = new Set(
     sessionRecords
       .filter((record) => record.classification === "Suspicious" || record.classification === "High Risk")
@@ -779,10 +982,17 @@ async function buildPopupSummary(tabUrl) {
   ).size;
 
   return {
+    scanEnabled,
     tabSupported: isSupportedTab,
-    analyzedPostsInSession,
+    postsScannedInSession: scannedPostsInSession,
+    scannedPostsInSession,
+    postsAnalyzedInSession: analyzedLinksInSession,
+    analyzedPostsInSession: scannedPostsInSession,
+    analyzedLinksInSession,
     flaggedPostsInSession,
     totalStoredAnalyses: records.length,
+    sessionStartedAt: sessionInfo.startedAt,
+    providerSummary: buildCompactProviderSummary(),
     recentActivity: records
       .slice(-10)
       .reverse()
@@ -798,6 +1008,13 @@ async function buildPopupSummary(tabUrl) {
 }
 
 async function triggerRescanForActiveTab() {
+  if (!(await getScanEnabledState())) {
+    return {
+      success: false,
+      message: "Protection is off. Turn DILI on before scanning."
+    };
+  }
+
   const [activeTab] = await chrome.tabs.query({
     active: true,
     currentWindow: true
@@ -831,6 +1048,98 @@ async function triggerRescanForActiveTab() {
       success: false,
       message: error.message || "Failed to send re-scan message to content script."
     };
+  }
+}
+
+async function restartSession() {
+  await resetSession("manual");
+
+  return {
+    success: true,
+    message: "Session restarted."
+  };
+}
+
+async function ensureActiveSession(reason) {
+  if (Date.now() - sessionInfo.startedAt < SESSION_TTL_MS) {
+    return false;
+  }
+
+  await resetSession(`${reason}-expired`);
+  return true;
+}
+
+async function resetSession(reason) {
+  await clearAnalysisRecords();
+
+  const now = Date.now();
+  sessionInfo.id = createSessionId(now);
+  sessionInfo.startedAt = now;
+  sessionInfo.lastActivityAt = now;
+  sessionInfo.lastResetAt = now;
+  sessionInfo.lastResetReason = reason || "manual";
+
+  logDebug(`Session reset: ${sessionInfo.lastResetReason}`);
+}
+
+function createSessionState(now = Date.now()) {
+  return {
+    id: createSessionId(now),
+    startedAt: now,
+    lastActivityAt: now,
+    lastResetAt: now,
+    lastResetReason: "startup",
+    trackedFacebookTabs: new Map()
+  };
+}
+
+function createSessionId(timestamp = Date.now()) {
+  return `session-${timestamp}`;
+}
+
+function bindSessionLifecycleObservers() {
+  if (chrome.webNavigation?.onCommitted) {
+    chrome.webNavigation.onCommitted.addListener((details) => {
+      handleSupportedTopLevelNavigation(details).catch((error) => {
+        console.warn("[DILI] Session navigation handling failed", error);
+      });
+    });
+  }
+}
+
+async function handleSupportedTopLevelNavigation(details) {
+  if (!details || details.frameId !== 0 || !isSupportedFacebookUrl(details.url || "")) {
+    return;
+  }
+
+  const normalizedUrl = normalizeSupportedTabUrl(details.url);
+  const previousUrl = sessionInfo.trackedFacebookTabs.get(details.tabId) || "";
+  const isReload = details.transitionType === "reload";
+  const isNavigationChange = Boolean(previousUrl && previousUrl !== normalizedUrl);
+  const isFirstSupportedLoad = !previousUrl;
+
+  sessionInfo.trackedFacebookTabs.set(details.tabId, normalizedUrl);
+
+  if (!isReload && !isNavigationChange && !isFirstSupportedLoad) {
+    return;
+  }
+
+  const reason = isReload
+    ? "page-refresh"
+    : isNavigationChange
+      ? "page-navigation"
+      : "page-load";
+
+  await resetSession(reason);
+}
+
+function normalizeSupportedTabUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return String(rawUrl || "").trim();
   }
 }
 
@@ -941,6 +1250,65 @@ function getProviderHealthSnapshot() {
       lastCheckedAt: providerHealth.urlhaus.lastCheckedAt
     }
   };
+}
+
+function buildCompactProviderSummary() {
+  const snapshot = getProviderHealthSnapshot();
+
+  return {
+    config: {
+      label: "Config",
+      state: snapshot.configLoaded && !snapshot.configError ? "ready" : "error",
+      text: snapshot.configLoaded && !snapshot.configError ? "Ready" : "Error"
+    },
+    gsb: {
+      label: "GSB",
+      state: getGsbProviderState(snapshot.gsb || {}),
+      text: formatCompactProviderText(getGsbProviderState(snapshot.gsb || {}))
+    },
+    urlhaus: {
+      label: "URLhaus",
+      state: getUrlhausProviderState(snapshot.urlhaus || {}),
+      text: formatCompactProviderText(getUrlhausProviderState(snapshot.urlhaus || {}))
+    }
+  };
+}
+
+function getGsbProviderState(gsb = {}) {
+  if (!gsb.configured) {
+    return "off";
+  }
+
+  if (gsb.lastStatus === "error" || gsb.available === false) {
+    return "error";
+  }
+
+  return "ready";
+}
+
+function getUrlhausProviderState(urlhaus = {}) {
+  if (urlhaus.lastStatus === "error" || urlhaus.available === false) {
+    return "error";
+  }
+
+  if (urlhaus.mode === "public") {
+    return "public";
+  }
+
+  return "ready";
+}
+
+function formatCompactProviderText(state) {
+  switch (state) {
+    case "ready":
+      return "Ready";
+    case "public":
+      return "Public";
+    case "off":
+      return "Off";
+    default:
+      return "Error";
+  }
 }
 
 function createDefaultProviderResult(provider) {

@@ -4,6 +4,7 @@
     REANALYZE_LINK: "DILI_REANALYZE_LINK",
     GET_POST_STATE: "DILI_GET_POST_STATE",
     SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
+    GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
     RESCAN_NOW: "DILI_RESCAN_NOW"
   };
 
@@ -18,6 +19,25 @@
     '[data-ad-comet-preview="message"]',
     '[data-testid="post_message"]',
     '[dir="auto"]'
+  ];
+  const EXCLUDED_CANDIDATE_CONTROL_PATTERNS = [
+    /\blike\b/i,
+    /\bcomment\b/i,
+    /\breply\b/i,
+    /\bshare\b/i,
+    /\breaction\b/i,
+    /\breact\b/i,
+    /\bclose\b/i,
+    /\bdismiss\b/i,
+    /\bmenu\b/i,
+    /\boptions\b/i,
+    /\breport\b/i,
+    /\bhide\b/i,
+    /\bnext\b/i,
+    /\bprevious\b/i,
+    /\bprev\b/i,
+    /\bcarousel\b/i,
+    /\bslide\b/i
   ];
 
   const TRACKING_PARAMS = new Set([
@@ -51,6 +71,12 @@
     keydownHandler: null,
     focusTarget: null
   };
+  const scanRuntimeState = {
+    enabled: true,
+    runtimeListenerBound: false,
+    clickInterceptionBound: false,
+    scrollListenerBound: false
+  };
   let flushTimer = null;
   let rescanTimer = null;
   let observer = null;
@@ -64,17 +90,35 @@
       return;
     }
 
-    console.debug("[DILI] Content script initialized.");
     bindRuntimeListeners();
+    scanRuntimeState.enabled = await getScanEnabledState();
+    resetOwnedUiArtifacts();
+
+    if (!scanRuntimeState.enabled) {
+      console.debug("[DILI] Content script loaded with protection disabled.");
+      stopScanning();
+      return;
+    }
+
+    console.debug("[DILI] Content script initialized.");
     bindClickInterception();
     initialScan();
     observeFeed();
-    window.addEventListener("scroll", scheduleVisibleRescan, { passive: true });
+    bindScrollRescan();
   }
 
   function bindRuntimeListeners() {
+    if (scanRuntimeState.runtimeListenerBound) {
+      return;
+    }
+
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (message?.type !== MESSAGE_TYPES.RESCAN_NOW) {
+        return false;
+      }
+
+      if (!scanRuntimeState.enabled) {
+        sendResponse({ ok: true, skipped: true, reason: "Scanning disabled." });
         return false;
       }
 
@@ -84,14 +128,30 @@
 
       return true;
     });
+
+    scanRuntimeState.runtimeListenerBound = true;
   }
 
   function bindClickInterception() {
+    if (scanRuntimeState.clickInterceptionBound) {
+      return;
+    }
+
     document.addEventListener("click", handleDocumentClickCapture, true);
+    scanRuntimeState.clickInterceptionBound = true;
+  }
+
+  function bindScrollRescan() {
+    if (scanRuntimeState.scrollListenerBound) {
+      return;
+    }
+
+    window.addEventListener("scroll", scheduleVisibleRescan, { passive: true });
+    scanRuntimeState.scrollListenerBound = true;
   }
 
   async function handleDocumentClickCapture(event) {
-    if (event.defaultPrevented) {
+    if (!scanRuntimeState.enabled || event.defaultPrevented) {
       return;
     }
 
@@ -698,6 +758,10 @@
   }
 
   async function forceRescan() {
+    if (!scanRuntimeState.enabled) {
+      return;
+    }
+
     for (const post of collectCandidatePosts(document)) {
       enqueuePost(post);
     }
@@ -707,6 +771,10 @@
   }
 
   function initialScan() {
+    if (!scanRuntimeState.enabled) {
+      return;
+    }
+
     for (const post of collectCandidatePosts(document)) {
       enqueuePost(post);
     }
@@ -715,6 +783,10 @@
   }
 
   function scheduleVisibleRescan() {
+    if (!scanRuntimeState.enabled) {
+      return;
+    }
+
     if (rescanTimer !== null) {
       return;
     }
@@ -729,6 +801,10 @@
   }
 
   function observeFeed() {
+    if (!scanRuntimeState.enabled) {
+      return;
+    }
+
     observer = new MutationObserver((mutations) => {
       const affectedPosts = new Set();
 
@@ -808,7 +884,7 @@
   }
 
   function enqueuePost(post) {
-    if (!(post instanceof Element)) {
+    if (!scanRuntimeState.enabled || !(post instanceof Element)) {
       return;
     }
 
@@ -816,6 +892,10 @@
   }
 
   function scheduleFlush() {
+    if (!scanRuntimeState.enabled) {
+      return;
+    }
+
     if (flushTimer !== null) {
       return;
     }
@@ -843,6 +923,10 @@
   }
 
   async function processPost(post) {
+    if (!scanRuntimeState.enabled) {
+      return;
+    }
+
     if (!post.isConnected || !isProbablyVisible(post)) {
       return;
     }
@@ -875,7 +959,8 @@
       type: messageType,
       postId,
       url: linkInfo.url,
-      displayedText: linkInfo.displayText
+      displayedText: linkInfo.displayText,
+      candidateContext: linkInfo.candidateContext
     });
 
     if (!response?.analysis) {
@@ -900,39 +985,46 @@
       type: MESSAGE_TYPES.SET_NO_LINK_STATE,
       postId
     });
+    selectedPostLinkCache.delete(postId);
     removeOwnedPanel(post);
   }
 
   function extractRelevantLink(post, postId = getStablePostId(post)) {
     const rememberedSelection = selectedPostLinkCache.get(postId) || null;
     const candidateElements = [...post.querySelectorAll("a[href], [data-lynx-uri], [data-url]")].filter((element) => {
-      return element instanceof Element && !element.closest(".dili-badge, .dili-panel");
+      return element instanceof Element && isUserFacingOutboundCandidate(element, post);
     });
     const candidates = candidateElements
       .map((element) => buildRelevantLinkCandidate(element, post))
       .filter(Boolean);
+    const candidateSummary = summarizePostLinkCandidates(candidates, rememberedSelection);
 
-    if (candidates.length === 0) {
+    if (!candidateSummary?.dominantCandidate) {
+      selectedPostLinkCache.delete(postId);
       return null;
     }
 
-    const persistedCandidate = pickRememberedLinkCandidate(candidates, rememberedSelection);
-    const selectedCandidate = persistedCandidate || candidates.sort(compareRelevantLinkCandidates)[0] || null;
-
-    if (!selectedCandidate) {
-      return null;
-    }
-
+    const selectedCandidate = candidateSummary.dominantCandidate;
     selectedPostLinkCache.set(postId, {
-      normalizedTargetUrl: selectedCandidate.normalizedTargetUrl,
-      rawUrl: selectedCandidate.url
+      candidateMode: candidateSummary.candidateMode,
+      dominantDomain: candidateSummary.dominantDomain,
+      clusterKey: candidateSummary.dominantClusterKey,
+      normalizedTargetUrl: selectedCandidate.normalizedTargetUrl
     });
 
     return {
       element: selectedCandidate.element,
       url: selectedCandidate.url,
       displayText: selectedCandidate.displayText,
-      normalizedTargetUrl: selectedCandidate.normalizedTargetUrl
+      normalizedTargetUrl: selectedCandidate.normalizedTargetUrl,
+      candidateContext: {
+        candidateMode: candidateSummary.candidateMode,
+        candidateCount: candidateSummary.candidateCount,
+        candidateDomainCount: candidateSummary.candidateDomainCount,
+        dominantDomain: candidateSummary.dominantDomain,
+        selectedNormalizedTarget: candidateSummary.selectedNormalizedTarget,
+        signature: candidateSummary.signature
+      }
     };
   }
 
@@ -945,16 +1037,26 @@
     const displayText = extractAnchorDisplayText(element);
     const normalizedTargetUrl = safelyNormalizeComparableUrl(rawUrl);
     const domPath = buildDomPath(element);
+    const hostname = safeHostname(normalizedTargetUrl || rawUrl);
+    const registrableDomain = getRegistrableDomain(hostname);
+    const rect = element.getBoundingClientRect();
+    const visualArea = Math.round(Math.max(rect.width, 0) * Math.max(rect.height, 0));
+    const hasMedia = Boolean(element.querySelector("img, picture, video, svg"));
+    const meaningfulText = hasMeaningfulCandidateText(displayText);
 
     return {
       element,
       url: rawUrl,
       normalizedTargetUrl,
       displayText,
+      hostname,
+      registrableDomain,
       wrapperOutbound: isFacebookWrapperHref(rawUrl),
-      meaningfulText: Boolean(displayText),
+      meaningfulText,
       inMainContent: isElementInMainPostContent(element, post),
       inActionArea: isElementInActionArea(element, post),
+      hasMedia,
+      visualArea,
       textLength: displayText.length,
       urlLength: normalizedTargetUrl.length,
       domPath
@@ -990,24 +1092,64 @@
     return "";
   }
 
-  function pickRememberedLinkCandidate(candidates, rememberedSelection) {
-    if (!rememberedSelection?.normalizedTargetUrl) {
+  function summarizePostLinkCandidates(candidates, rememberedSelection) {
+    if (!Array.isArray(candidates) || candidates.length === 0) {
       return null;
     }
 
-    const exactMatch = candidates.find((candidate) => {
-      return candidate.normalizedTargetUrl === rememberedSelection.normalizedTargetUrl && candidate.url === rememberedSelection.rawUrl;
+    const sortedCandidates = [...candidates].sort(compareRelevantLinkCandidates);
+    const uniqueDomains = [...new Set(sortedCandidates.map((candidate) => candidate.registrableDomain).filter(Boolean))];
+    const uniqueTargets = [...new Set(sortedCandidates.map((candidate) => candidate.normalizedTargetUrl).filter(Boolean))];
+    const domainGroups = buildCandidateGroups(sortedCandidates, (candidate) => {
+      return candidate.registrableDomain || candidate.normalizedTargetUrl || candidate.url;
     });
+    const domainGroupSummaries = domainGroups
+      .map((group) => buildCandidateGroupSummary(group.key, group.candidates))
+      .sort(compareCandidateGroupSummaries);
+    const dominantDomainGroup = pickRememberedCandidateGroup(domainGroupSummaries, rememberedSelection) || domainGroupSummaries[0] || null;
 
-    if (exactMatch) {
-      return exactMatch;
+    if (!dominantDomainGroup) {
+      return null;
     }
 
-    const matchingTargetCandidates = candidates
-      .filter((candidate) => candidate.normalizedTargetUrl === rememberedSelection.normalizedTargetUrl)
-      .sort(compareRelevantLinkCandidates);
+    const targetGroups = buildCandidateGroups(dominantDomainGroup.candidates, (candidate) => {
+      return candidate.normalizedTargetUrl || candidate.url;
+    });
+    const targetGroupSummaries = targetGroups
+      .map((group) => buildCandidateGroupSummary(group.key, group.candidates))
+      .sort(compareCandidateGroupSummaries);
+    const dominantTargetGroup = pickRememberedTargetGroup(targetGroupSummaries, rememberedSelection) || targetGroupSummaries[0] || null;
+    const dominantCandidate = dominantTargetGroup?.candidates?.[0] || null;
 
-    return matchingTargetCandidates[0] || null;
+    if (!dominantCandidate) {
+      return null;
+    }
+
+    const candidateMode = uniqueDomains.length <= 1
+      ? uniqueTargets.length <= 1
+        ? "single"
+        : "multi-same-domain"
+      : "multi-mixed";
+    const dominantDomain = dominantDomainGroup.registrableDomain || dominantCandidate.registrableDomain || "";
+    const selectedNormalizedTarget = dominantCandidate.normalizedTargetUrl || dominantCandidate.url;
+    const signature = buildCandidateSummarySignature({
+      candidateMode,
+      dominantDomain,
+      selectedNormalizedTarget,
+      uniqueDomains
+    });
+
+    return {
+      candidateCount: sortedCandidates.length,
+      candidateDomainCount: uniqueDomains.length,
+      candidateMode,
+      dominantDomain,
+      dominantCandidate,
+      dominantClusterKey: candidateMode === "single" ? selectedNormalizedTarget : dominantDomain || dominantDomainGroup.key,
+      selectedNormalizedTarget,
+      uniqueDomains,
+      signature
+    };
   }
 
   function compareRelevantLinkCandidates(left, right) {
@@ -1033,25 +1175,229 @@
     let score = 0;
 
     if (candidate.inMainContent) {
-      score += 40;
+      score += 45;
     }
 
     if (candidate.wrapperOutbound) {
-      score += 25;
+      score += 20;
     }
 
     if (candidate.meaningfulText) {
-      score += 20;
+      score += 18;
     }
 
     if (!candidate.inActionArea) {
       score += 10;
     }
 
+    if (candidate.hasMedia) {
+      score += 12;
+    }
+
+    score += Math.min(Math.round(candidate.visualArea / 450), 80);
     score += Math.min(candidate.textLength, 60);
     score += Math.min(candidate.urlLength, 30);
 
     return score;
+  }
+
+  function isUserFacingOutboundCandidate(element, post) {
+    if (!(element instanceof Element) || !post.contains(element)) {
+      return false;
+    }
+
+    if (element.closest(".dili-badge, .dili-panel, .dili-warning-overlay")) {
+      return false;
+    }
+
+    if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true") {
+      return false;
+    }
+
+    if (!isRenderedCandidateElement(element)) {
+      return false;
+    }
+
+    if (isElementInActionArea(element, post) || isElementInsideExcludedControlArea(element)) {
+      return false;
+    }
+
+    return hasMeaningfulCandidateSurface(element);
+  }
+
+  function isRenderedCandidateElement(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+
+    return style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.opacity !== "0" &&
+      rect.width >= 8 &&
+      rect.height >= 8 &&
+      rect.width * rect.height >= 80;
+  }
+
+  function hasMeaningfulCandidateSurface(element) {
+    const rect = element.getBoundingClientRect();
+    const text = extractAnchorDisplayText(element);
+    const hasMedia = Boolean(element.querySelector("img, picture, video, svg"));
+
+    if (hasMeaningfulCandidateText(text)) {
+      return true;
+    }
+
+    if (hasMedia) {
+      return true;
+    }
+
+    return rect.width * rect.height >= 900;
+  }
+
+  function hasMeaningfulCandidateText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim().length >= 2;
+  }
+
+  function isElementInsideExcludedControlArea(element) {
+    const utilityText = buildCandidateUtilityText(element);
+    return EXCLUDED_CANDIDATE_CONTROL_PATTERNS.some((pattern) => pattern.test(utilityText));
+  }
+
+  function buildCandidateUtilityText(element) {
+    const parts = [];
+    let current = element;
+    let depth = 0;
+
+    while (current instanceof Element && depth < 4) {
+      parts.push(
+        current.getAttribute("aria-label") || "",
+        current.getAttribute("title") || "",
+        current.getAttribute("role") || "",
+        current.id || "",
+        typeof current.className === "string" ? current.className : ""
+      );
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    return parts.join(" ").toLowerCase();
+  }
+
+  function buildCandidateGroups(candidates, keySelector) {
+    const groups = new Map();
+
+    for (const candidate of candidates) {
+      const key = String(keySelector(candidate) || candidate.normalizedTargetUrl || candidate.url || "").trim();
+      if (!key) {
+        continue;
+      }
+
+      if (!groups.has(key)) {
+        groups.set(key, []);
+      }
+
+      groups.get(key).push(candidate);
+    }
+
+    return [...groups.entries()].map(([key, groupCandidates]) => ({
+      key,
+      candidates: [...groupCandidates].sort(compareRelevantLinkCandidates)
+    }));
+  }
+
+  function buildCandidateGroupSummary(key, candidates) {
+    const sortedCandidates = [...candidates].sort(compareRelevantLinkCandidates);
+    const bestCandidate = sortedCandidates[0] || null;
+
+    return {
+      key,
+      candidates: sortedCandidates,
+      bestCandidate,
+      bestScore: bestCandidate ? buildRelevantLinkScore(bestCandidate) : 0,
+      totalScore: sortedCandidates.reduce((sum, candidate) => sum + buildRelevantLinkScore(candidate), 0),
+      candidateCount: sortedCandidates.length,
+      mainContentCount: sortedCandidates.filter((candidate) => candidate.inMainContent).length,
+      registrableDomain: bestCandidate?.registrableDomain || ""
+    };
+  }
+
+  function compareCandidateGroupSummaries(left, right) {
+    if (right.bestScore !== left.bestScore) {
+      return right.bestScore - left.bestScore;
+    }
+
+    if (right.mainContentCount !== left.mainContentCount) {
+      return right.mainContentCount - left.mainContentCount;
+    }
+
+    if (right.candidateCount !== left.candidateCount) {
+      return right.candidateCount - left.candidateCount;
+    }
+
+    if (right.totalScore !== left.totalScore) {
+      return right.totalScore - left.totalScore;
+    }
+
+    return left.key.localeCompare(right.key);
+  }
+
+  function pickRememberedCandidateGroup(groups, rememberedSelection) {
+    if (!rememberedSelection) {
+      return null;
+    }
+
+    if (rememberedSelection.clusterKey) {
+      const clusterMatch = groups.find((group) => group.key === rememberedSelection.clusterKey);
+      if (clusterMatch) {
+        return clusterMatch;
+      }
+    }
+
+    if (rememberedSelection.dominantDomain) {
+      const domainMatch = groups.find((group) => group.registrableDomain === rememberedSelection.dominantDomain);
+      if (domainMatch) {
+        return domainMatch;
+      }
+    }
+
+    if (rememberedSelection.normalizedTargetUrl) {
+      const targetMatch = groups.find((group) => {
+        return group.candidates.some((candidate) => candidate.normalizedTargetUrl === rememberedSelection.normalizedTargetUrl);
+      });
+      if (targetMatch) {
+        return targetMatch;
+      }
+    }
+
+    return null;
+  }
+
+  function pickRememberedTargetGroup(groups, rememberedSelection) {
+    if (!rememberedSelection?.normalizedTargetUrl) {
+      return null;
+    }
+
+    return groups.find((group) => group.key === rememberedSelection.normalizedTargetUrl) || null;
+  }
+
+  function buildCandidateSummarySignature(summary) {
+    if (!summary) {
+      return "no-link";
+    }
+
+    if (summary.candidateMode === "single") {
+      return `single|${summary.selectedNormalizedTarget || summary.dominantDomain || "unknown-target"}`;
+    }
+
+    const domainSignature = (summary.uniqueDomains || [])
+      .filter(Boolean)
+      .sort()
+      .join("|");
+
+    return `${summary.candidateMode}|${summary.dominantDomain || "unknown-domain"}|${domainSignature || "no-domain"}`;
   }
 
   function isElementInMainPostContent(anchor, post) {
@@ -1071,6 +1417,47 @@
     if (panel) {
       panel.remove();
     }
+  }
+
+  function removeAllOwnedPanels() {
+    for (const panel of document.querySelectorAll(".dili-panel[data-dili-owned='true']")) {
+      panel.remove();
+    }
+  }
+
+  function removeOwnedWarningOverlays() {
+    for (const overlay of document.querySelectorAll(".dili-warning-overlay[data-dili-owned='true']")) {
+      overlay.remove();
+    }
+  }
+
+  function resetOwnedUiArtifacts() {
+    removeAllOwnedPanels();
+    closeWarningModal({ restoreFocus: false });
+    removeOwnedWarningOverlays();
+  }
+
+  function stopScanning() {
+    pendingPosts.clear();
+    selectedPostLinkCache.clear();
+    observedPostIds.clear();
+
+    if (flushTimer !== null) {
+      window.clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+
+    if (rescanTimer !== null) {
+      window.clearTimeout(rescanTimer);
+      rescanTimer = null;
+    }
+
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+
+    resetOwnedUiArtifacts();
   }
 
   function isFacebookWrapperHref(rawUrl) {
@@ -1168,32 +1555,37 @@
 
   function mapAnalysisToViewModel(analysis) {
     const details = [];
+    const seenDetails = new Set();
 
     for (const item of analysis.deductions || []) {
       if (item.triggered) {
-        details.push(`${item.label} (-${item.deduction})`);
+        pushUniqueAnalysisDetail(details, seenDetails, formatAnalysisDeductionDetail(item));
       }
     }
 
     for (const note of analysis.redirectAnalysis?.notes || []) {
-      details.push(note);
+      pushUniqueAnalysisDetail(details, seenDetails, note);
+    }
+
+    for (const note of analysis.analysisNotes || []) {
+      pushUniqueAnalysisDetail(details, seenDetails, note);
     }
 
     const gsb = findProviderResult(analysis.providerResults, "gsb");
     const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
 
     if (!gsb?.configured) {
-      details.push("Google Safe Browsing lookup was not configured.");
+      pushUniqueAnalysisDetail(details, seenDetails, "Google Safe Browsing lookup was not configured.");
     }
 
     if (!urlhaus?.checked) {
-      details.push("URLhaus lookup could not be completed.");
+      pushUniqueAnalysisDetail(details, seenDetails, "URLhaus lookup could not be completed.");
     } else if (urlhaus?.details?.authKeyConfigured === false || urlhaus?.details?.authConfigured === false) {
-      details.push("URLhaus was checked in public mode without an auth key.");
+      pushUniqueAnalysisDetail(details, seenDetails, "URLhaus was checked in public mode without an auth key.");
     }
 
     if (details.length === 0) {
-      details.push("No score deductions were triggered by the current heuristic set.");
+      pushUniqueAnalysisDetail(details, seenDetails, "No score deductions were triggered by the current heuristic set.");
     }
 
     const severityLevel = normalizeInlineSeverityLevel({
@@ -1238,6 +1630,70 @@
       ),
       details
     };
+  }
+
+  function formatAnalysisDeductionDetail(item) {
+    const label = String(item?.label || "").trim();
+    const deduction = Number(item?.deduction);
+
+    if (!label || !Number.isFinite(deduction) || deduction === 0) {
+      return label;
+    }
+
+    if (deduction < 0) {
+      return `${label} (+${Math.abs(deduction)})`;
+    }
+
+    return `${label} (-${deduction})`;
+  }
+
+  function pushUniqueAnalysisDetail(details, seenDetails, detail) {
+    const text = String(detail || "").trim();
+    if (!text) {
+      return;
+    }
+
+    const dedupeKey = buildAnalysisDetailDedupeKey(text);
+    if (seenDetails.has(dedupeKey)) {
+      return;
+    }
+
+    seenDetails.add(dedupeKey);
+    details.push(text);
+  }
+
+  function buildAnalysisDetailDedupeKey(detail) {
+    const normalized = String(detail || "")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/\s*\(([+-]?\d+)\)\s*$/g, "")
+      .trim();
+
+    if (
+      normalized.includes("single redirect hop") ||
+      normalized.includes("short redirect chain") ||
+      normalized.includes("moderate redirect chain") ||
+      normalized.includes("long redirect chain") ||
+      normalized.includes("longer redirect chain than usual") ||
+      normalized.includes("unusually long redirect chain") ||
+      normalized.includes("passes through multiple redirects before reaching the final destination")
+    ) {
+      return "redirect-chain-length";
+    }
+
+    if (normalized.includes("network probing observed an additional redirect hop")) {
+      return "redirect-network-hop";
+    }
+
+    if (normalized.includes("redirect chain hands the user across different domains")) {
+      return "redirect-cross-domain";
+    }
+
+    if (normalized.includes("pattern commonly seen in deceptive links")) {
+      return "redirect-suspicious-pattern";
+    }
+
+    return normalized;
   }
 
   function normalizeInlineSeverityLevel(viewModel = {}) {
@@ -1438,7 +1894,11 @@
       return "no-link";
     }
 
-    return `${linkInfo.normalizedTargetUrl || linkInfo.url}|${linkInfo.displayText}`;
+    if (linkInfo.candidateContext?.signature) {
+      return linkInfo.candidateContext.signature;
+    }
+
+    return linkInfo.normalizedTargetUrl || linkInfo.url || "unknown-link";
   }
 
   function findPostContainer(node) {
@@ -1606,6 +2066,20 @@
     }
   }
 
+  function getRegistrableDomain(hostname) {
+    const parts = String(hostname || "").split(".").filter(Boolean);
+    if (parts.length <= 2) {
+      return parts.join(".");
+    }
+
+    const compoundSuffix = `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+    if (["co.uk", "com.au", "com.br", "co.jp", "co.kr", "com.sg"].includes(compoundSuffix) && parts.length >= 3) {
+      return parts.slice(-3).join(".");
+    }
+
+    return parts.slice(-2).join(".");
+  }
+
   async function sendRuntimeMessage(message) {
     try {
       const response = await chrome.runtime.sendMessage(message);
@@ -1620,6 +2094,14 @@
         error: error.message || "Runtime messaging failed."
       };
     }
+  }
+
+  async function getScanEnabledState() {
+    const response = await sendRuntimeMessage({
+      type: MESSAGE_TYPES.GET_SCAN_STATE
+    });
+
+    return response?.scanEnabled !== false;
   }
 
   function hashString(value) {

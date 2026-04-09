@@ -2,6 +2,8 @@ const POST_PREFIX = "dili:post:";
 const DOMAIN_PREFIX = "dili:domain:";
 const ANALYSIS_LOG_KEY = "dili:analysis:records";
 const ANALYSIS_LOG_LIMIT = 2000;
+const ANALYSIS_LOG_TTL_MS = 60 * 60 * 1000;
+const SCAN_STATE_KEY = "dili:scan:enabled";
 
 /**
  * Get the stored baseline or analysis record for a Facebook post.
@@ -91,7 +93,7 @@ export async function checkDomainPreviouslyFlagged(domain) {
  * @returns {Promise<object>}
  */
 export async function appendAnalysisRecord(record) {
-  const logs = await getAllAnalysisRecords();
+  const logs = await readPrunedAnalysisRecords();
   logs.push(record);
 
   const trimmedLogs = logs.slice(-ANALYSIS_LOG_LIMIT);
@@ -107,9 +109,7 @@ export async function appendAnalysisRecord(record) {
  * @returns {Promise<object[]>}
  */
 export async function getAllAnalysisRecords() {
-  const result = await storageGet(ANALYSIS_LOG_KEY);
-  const logs = result[ANALYSIS_LOG_KEY];
-  return Array.isArray(logs) ? logs : [];
+  return readPrunedAnalysisRecords();
 }
 
 /**
@@ -120,6 +120,45 @@ export async function clearAnalysisRecords() {
   await storageSet({
     [ANALYSIS_LOG_KEY]: []
   });
+}
+
+/**
+ * Read the global scan-enabled state. Defaults to true when unset.
+ * @returns {Promise<boolean>}
+ */
+export async function getScanEnabledState() {
+  const result = await storageGet(SCAN_STATE_KEY);
+  return result[SCAN_STATE_KEY] !== false;
+}
+
+/**
+ * Persist the global scan-enabled state.
+ * @param {boolean} enabled
+ * @returns {Promise<boolean>}
+ */
+export async function setScanEnabledState(enabled) {
+  const normalized = Boolean(enabled);
+
+  await storageSet({
+    [SCAN_STATE_KEY]: normalized
+  });
+
+  return normalized;
+}
+
+async function readPrunedAnalysisRecords() {
+  const result = await storageGet(ANALYSIS_LOG_KEY);
+  const logs = Array.isArray(result[ANALYSIS_LOG_KEY]) ? result[ANALYSIS_LOG_KEY] : [];
+  const oldestAllowedTimestamp = Date.now() - ANALYSIS_LOG_TTL_MS;
+  const prunedLogs = logs.filter((record) => Number(record?.timestamp || 0) >= oldestAllowedTimestamp);
+
+  if (prunedLogs.length !== logs.length) {
+    await storageSet({
+      [ANALYSIS_LOG_KEY]: prunedLogs
+    });
+  }
+
+  return prunedLogs;
 }
 
 function postStorageKey(postId) {

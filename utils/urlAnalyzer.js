@@ -131,6 +131,13 @@ const SUSPICIOUS_QUERY_KEYS = new Set([
   "callback"
 ]);
 
+const TRUSTED_ENDPOINT_DOMAINS = new Set([
+  "monday.com",
+  "securitybank.com",
+  "shopee.com",
+  "shopee.ph"
+]);
+
 /**
  * Normalize a URL for stable hashing and comparisons.
  * @param {string} rawUrl
@@ -418,6 +425,11 @@ export function detectDomainMismatch(displayText, rawUrl) {
  *   actualDomain: string | null,
  *   displayTextLooksLikeDomain: boolean,
  *   genericDisplayText: boolean,
+ *   httpsEndpoint: boolean,
+ *   finalHostname: string,
+ *   finalRegistrableDomain: string,
+ *   trustedEndpoint: boolean,
+ *   trustedEndpointMatch: string | null,
  *   usesKnownWrapper: boolean,
  *   wrapperToExternalDestination: boolean,
  *   wrapperChain: string[],
@@ -434,6 +446,9 @@ export function analyzeUrlFeatures(input) {
   const obfuscation = detectObfuscationIndicators(comparisonUrl, comparisonUrl);
   const mismatch = detectDomainMismatch(input.displayedText || "", comparisonUrl);
   const parsed = safeUrl(comparisonUrl);
+  const finalHostname = safeHostname(comparisonUrl) || "";
+  const finalRegistrableDomain = getRegistrableDomain(finalHostname);
+  const trustedEndpointMatch = isTrustedEndpointDomain(finalHostname) ? finalRegistrableDomain : null;
   const queryAnalysis = analyzeQueryComplexity(parsed);
   const pathAnalysis = analyzePathRisk(parsed);
   const subdomainDepth = getSubdomainDepth(parsed?.hostname);
@@ -462,6 +477,11 @@ export function analyzeUrlFeatures(input) {
     actualDomain: mismatch.actualDomain,
     displayTextLooksLikeDomain: mismatch.displayTextLooksLikeDomain,
     genericDisplayText: mismatch.genericText,
+    httpsEndpoint: parsed?.protocol === "https:",
+    finalHostname,
+    finalRegistrableDomain,
+    trustedEndpoint: Boolean(trustedEndpointMatch),
+    trustedEndpointMatch,
     usesKnownWrapper: wrapperAnalysis.usedWrapper,
     wrapperToExternalDestination: wrapperAnalysis.wrapperToExternalDestination,
     wrapperChain: wrapperAnalysis.chain,
@@ -558,6 +578,11 @@ export function getRegistrableDomain(hostname) {
  */
 export function isFacebookWrapperHost(hostname) {
   return FACEBOOK_REDIRECT_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
+function isTrustedEndpointDomain(hostname) {
+  const registrableDomain = getRegistrableDomain(hostname);
+  return Boolean(registrableDomain) && TRUSTED_ENDPOINT_DOMAINS.has(registrableDomain);
 }
 
 function analyzeDisplayText(displayText) {

@@ -3,45 +3,82 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DILI Monitor</title>
+    <title>DILI</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <main class="popup-root">
-      <header class="popup-header">
-        <h1>DILI</h1>
-        <p>Detecting Illegal Link Injections</p>
-      </header>
+      <section class="dashboard-shell">
+        <header class="popup-topbar">
+          <div class="brand-block">
+            <h1>DILI</h1>
+            <p>Detecting Illegal Link Injections</p>
+          </div>
 
-      <section class="popup-card">
-        <h2>Status</h2>
-        <ul id="status-list" class="metric-list"></ul>
+          <div class="menu-anchor">
+            <button
+              id="menu-toggle"
+              type="button"
+              class="icon-button"
+              aria-label="Open settings menu"
+              aria-expanded="false"
+              aria-controls="settings-menu"
+            >
+              <span aria-hidden="true">&#8942;</span>
+            </button>
+
+            <div id="settings-menu" class="settings-menu" hidden>
+              <button id="export-btn" type="button" class="menu-item">Export CSV</button>
+              <button id="restart-btn" type="button" class="menu-item">Restart Session</button>
+              <button id="clear-btn" type="button" class="menu-item danger">Clear Session Logs</button>
+              <button
+                id="how-toggle"
+                type="button"
+                class="menu-item menu-item-secondary"
+                aria-expanded="false"
+                aria-controls="how-panel"
+              >
+                How it works
+              </button>
+
+              <section id="how-panel" class="menu-panel" hidden>
+                <p>DILI scans Facebook posts, resolves outbound links, and warns when a destination looks risky.</p>
+                <ol class="menu-flow">
+                  <li>Scan the current page.</li>
+                  <li>Resolve link destinations.</li>
+                  <li>Show risk results and warnings.</li>
+                </ol>
+              </section>
+            </div>
+          </div>
+        </header>
+
+        <section class="hero-card">
+          <button
+            id="power-toggle"
+            type="button"
+            class="power-toggle power-toggle-on"
+            aria-label="Toggle DILI protection"
+            aria-pressed="true"
+          >
+            <span class="power-symbol" aria-hidden="true">&#x23FB;</span>
+          </button>
+          <p id="power-status" class="power-status">Protection On</p>
+        </section>
+
+        <section class="stats-grid" aria-label="Session statistics">
+          <article class="stat-card">
+            <span class="stat-label">Posts scanned</span>
+            <strong id="stat-scanned-posts" class="stat-value">0</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">Posts analyzed</span>
+            <strong id="stat-analyzed-posts" class="stat-value">0</strong>
+          </article>
+        </section>
+
+        <p id="message" class="message" role="status" aria-live="polite" hidden></p>
       </section>
-
-      <section class="popup-card">
-        <h2>Flow</h2>
-        <ol class="flow-list">
-          <li>Scan Facebook posts</li>
-          <li>Detect embedded links</li>
-          <li>Hash URL baseline</li>
-          <li>Monitor post edits</li>
-          <li>Run GSB and URLhaus checks</li>
-          <li>Compute Safety Score</li>
-        </ol>
-      </section>
-
-      <section class="popup-card">
-        <h2>Recent Activity</h2>
-        <ul id="activity-list" class="activity-list"></ul>
-      </section>
-
-      <section class="popup-actions">
-        <button id="rescan-btn" type="button">Re-scan Current Tab</button>
-        <button id="export-btn" type="button">Export CSV</button>
-        <button id="clear-btn" type="button" class="danger">Clear Session Logs</button>
-      </section>
-
-      <p id="message" class="message"></p>
     </main>
 
     <script type="module" src="popup.js"></script>

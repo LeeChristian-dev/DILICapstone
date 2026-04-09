@@ -1,17 +1,32 @@
 const MESSAGE_TYPES = {
   GET_POPUP_SUMMARY: "DILI_GET_POPUP_SUMMARY",
-  GET_PROVIDER_HEALTH: "DILI_GET_PROVIDER_HEALTH",
+  GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
+  SET_SCAN_STATE: "DILI_SET_SCAN_STATE",
   GET_ANALYSIS_RECORDS: "DILI_GET_ANALYSIS_RECORDS",
   CLEAR_ANALYSIS_RECORDS: "DILI_CLEAR_ANALYSIS_RECORDS",
+  RESET_SESSION: "DILI_RESET_SESSION",
   RESCAN_CURRENT_TAB: "DILI_RESCAN_CURRENT_TAB"
 };
 
-const statusList = document.getElementById("status-list");
-const activityList = document.getElementById("activity-list");
-const messageBox = document.getElementById("message");
+const popupState = {
+  activeTab: null,
+  summary: {},
+  scanEnabled: true
+};
+
+const dashboardShell = document.querySelector(".dashboard-shell");
+const menuToggleButton = document.getElementById("menu-toggle");
+const settingsMenu = document.getElementById("settings-menu");
+const howToggleButton = document.getElementById("how-toggle");
+const howPanel = document.getElementById("how-panel");
+const powerToggleButton = document.getElementById("power-toggle");
+const powerStatus = document.getElementById("power-status");
 const exportButton = document.getElementById("export-btn");
+const restartButton = document.getElementById("restart-btn");
 const clearButton = document.getElementById("clear-btn");
-const rescanButton = document.getElementById("rescan-btn");
+const messageBox = document.getElementById("message");
+const statScannedPosts = document.getElementById("stat-scanned-posts");
+const statAnalyzedPosts = document.getElementById("stat-analyzed-posts");
 
 init().catch((error) => {
   setMessage(`Failed to initialize popup: ${error.message || "unknown error"}`);
@@ -23,43 +38,111 @@ async function init() {
 }
 
 function bindActions() {
+  menuToggleButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleSettingsMenu();
+  });
+
+  howToggleButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    toggleHowPanel();
+  });
+
+  document.addEventListener("click", (event) => {
+    if (settingsMenu.hidden) {
+      return;
+    }
+
+    if (settingsMenu.contains(event.target) || menuToggleButton.contains(event.target)) {
+      return;
+    }
+
+    closeSettingsMenu();
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeSettingsMenu();
+    }
+  });
+
+  powerToggleButton.addEventListener("click", async () => {
+    closeSettingsMenu();
+
+    try {
+      const nextEnabled = !popupState.scanEnabled;
+      const response = await sendMessage({
+        type: MESSAGE_TYPES.SET_SCAN_STATE,
+        enabled: nextEnabled
+      });
+
+      popupState.scanEnabled = response?.scanEnabled !== false;
+      renderProtectionState();
+
+      if (popupState.summary?.tabSupported && popupState.activeTab?.id) {
+        await chrome.tabs.reload(popupState.activeTab.id);
+      }
+
+      setMessage(
+        popupState.scanEnabled
+          ? "Protection turned on. Current page refreshed."
+          : "Protection turned off. Current page refreshed."
+      );
+
+      await refreshPopupData();
+    } catch (error) {
+      setMessage(`Failed to update protection state: ${error.message || "unknown error"}`);
+    }
+  });
+
   exportButton.addEventListener("click", async () => {
+    closeSettingsMenu();
+
     try {
       const response = await sendMessage({ type: MESSAGE_TYPES.GET_ANALYSIS_RECORDS });
       const records = response?.records || [];
       if (records.length === 0) {
-        setMessage("No analysis records available to export.");
+        setMessage("No retained session records are available to export.");
         return;
       }
 
       const csv = convertRecordsToCsv(records);
       downloadCsv(csv);
       setMessage(`CSV export completed with ${records.length} record(s).`);
-      console.debug("[DILI] CSV export completed.");
     } catch (error) {
       console.warn("[DILI] CSV export failed", error);
       setMessage(`CSV export failed: ${error.message || "unknown error"}`);
     }
   });
 
-  clearButton.addEventListener("click", async () => {
+  restartButton.addEventListener("click", async () => {
+    closeSettingsMenu();
+
     try {
-      await sendMessage({ type: MESSAGE_TYPES.CLEAR_ANALYSIS_RECORDS });
-      setMessage("Analysis logs cleared.");
-      console.debug("[DILI] Popup requested log clear.");
+      await sendMessage({ type: MESSAGE_TYPES.RESET_SESSION });
+
+      let message = "Session restarted.";
+      if (popupState.scanEnabled && popupState.summary?.tabSupported) {
+        const response = await sendMessage({ type: MESSAGE_TYPES.RESCAN_CURRENT_TAB });
+        message = response?.result?.message || "Session restarted and page scan triggered.";
+      }
+
+      setMessage(message);
       await refreshPopupData();
     } catch (error) {
-      setMessage(`Failed to clear logs: ${error.message || "unknown error"}`);
+      setMessage(`Failed to restart session: ${error.message || "unknown error"}`);
     }
   });
 
-  rescanButton.addEventListener("click", async () => {
+  clearButton.addEventListener("click", async () => {
+    closeSettingsMenu();
+
     try {
-      const response = await sendMessage({ type: MESSAGE_TYPES.RESCAN_CURRENT_TAB });
-      setMessage(response?.result?.message || "Re-scan command sent.");
+      await sendMessage({ type: MESSAGE_TYPES.CLEAR_ANALYSIS_RECORDS });
+      setMessage("Session logs cleared.");
       await refreshPopupData();
     } catch (error) {
-      setMessage(`Re-scan failed: ${error.message || "unknown error"}`);
+      setMessage(`Failed to clear logs: ${error.message || "unknown error"}`);
     }
   });
 }
@@ -67,63 +150,62 @@ function bindActions() {
 async function refreshPopupData() {
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const tabUrl = activeTab?.url || "";
-  const [summaryResponse, providerHealthResponse] = await Promise.all([
+  const [summaryResponse, scanStateResponse] = await Promise.all([
     sendMessage({
       type: MESSAGE_TYPES.GET_POPUP_SUMMARY,
       tabUrl
     }),
     sendMessage({
-      type: MESSAGE_TYPES.GET_PROVIDER_HEALTH
+      type: MESSAGE_TYPES.GET_SCAN_STATE
     })
   ]);
 
-  const summary = summaryResponse?.summary || {};
-  const providerHealth = providerHealthResponse?.providerHealth || {};
+  popupState.activeTab = activeTab || null;
+  popupState.summary = summaryResponse?.summary || {};
+  popupState.scanEnabled = scanStateResponse?.scanEnabled !== false;
 
-  renderStatus(summary, providerHealth);
-  renderActivity(summary.recentActivity || []);
+  renderProtectionState();
+  renderStats(popupState.summary);
 }
 
-function renderStatus(summary, providerHealth) {
-  const gsb = providerHealth.gsb || {};
-  const urlhaus = providerHealth.urlhaus || {};
-  const items = [
-    `Current tab supported: ${summary.tabSupported ? "Yes" : "No"}`,
-    `Analyzed posts (session): ${summary.analyzedPostsInSession || 0}`,
-    `Flagged posts (session): ${summary.flaggedPostsInSession || 0}`,
-    `Stored analyses: ${summary.totalStoredAnalyses || 0}`,
-    `Config loaded: ${providerHealth.configLoaded ? "Yes" : "No"}`,
-    `Config source: ${providerHealth.configSource || "unknown"}`,
-    `Config error: ${formatText(providerHealth.configError, "none")}`,
-    `GSB key loaded: ${gsb.configured ? "Yes" : "No"}`,
-    `GSB last check: ${formatProviderStatus(gsb.lastStatus)}`,
-    `GSB last HTTP status: ${formatText(gsb.lastHttpStatus, "n/a")}`,
-    `GSB last error: ${formatText(gsb.lastError, "none")}`,
-    `GSB last checked at: ${formatTimestampOrFallback(gsb.lastCheckedAt)}`,
-    `URLhaus mode: ${urlhaus.mode || "public"}`,
-    `URLhaus last check: ${formatProviderStatus(urlhaus.lastStatus)}`,
-    `URLhaus last HTTP status: ${formatText(urlhaus.lastHttpStatus, "n/a")}`,
-    `URLhaus last error: ${formatText(urlhaus.lastError, "none")}`,
-    `URLhaus last checked at: ${formatTimestampOrFallback(urlhaus.lastCheckedAt)}`
-  ];
-
-  statusList.innerHTML = items.map((text) => `<li>${escapeHtml(text)}</li>`).join("");
+function renderProtectionState() {
+  powerToggleButton.classList.toggle("power-toggle-on", popupState.scanEnabled);
+  powerToggleButton.classList.toggle("power-toggle-off", !popupState.scanEnabled);
+  powerToggleButton.setAttribute("aria-pressed", String(popupState.scanEnabled));
+  powerStatus.textContent = popupState.scanEnabled ? "Protection On" : "Protection Off";
+  dashboardShell.classList.toggle("protection-off", !popupState.scanEnabled);
 }
 
-function renderActivity(activity) {
-  if (!activity.length) {
-    activityList.innerHTML = "<li>No analysis events yet.</li>";
+function renderStats(summary) {
+  statScannedPosts.textContent = String(summary.postsScannedInSession ?? summary.scannedPostsInSession ?? 0);
+  statAnalyzedPosts.textContent = String(summary.postsAnalyzedInSession ?? summary.analyzedLinksInSession ?? 0);
+}
+
+function toggleSettingsMenu() {
+  if (settingsMenu.hidden) {
+    openSettingsMenu();
     return;
   }
 
-  activityList.innerHTML = activity
-    .map((entry) => {
-      const time = formatTimestamp(entry.timestamp);
-      const domain = entry.domain || "unknown-domain";
-      const score = Number.isFinite(entry.safetyScore) ? entry.safetyScore : "--";
-      return `<li>${escapeHtml(`${time} | ${entry.classification || "Unknown"} (${score}) | ${domain}`)}</li>`;
-    })
-    .join("");
+  closeSettingsMenu();
+}
+
+function openSettingsMenu() {
+  settingsMenu.hidden = false;
+  menuToggleButton.setAttribute("aria-expanded", "true");
+}
+
+function closeSettingsMenu() {
+  settingsMenu.hidden = true;
+  howPanel.hidden = true;
+  menuToggleButton.setAttribute("aria-expanded", "false");
+  howToggleButton.setAttribute("aria-expanded", "false");
+}
+
+function toggleHowPanel() {
+  const nextHiddenState = !howPanel.hidden;
+  howPanel.hidden = nextHiddenState;
+  howToggleButton.setAttribute("aria-expanded", String(!nextHiddenState));
 }
 
 function convertRecordsToCsv(records) {
@@ -197,7 +279,9 @@ function csvEscape(value) {
 }
 
 function setMessage(text) {
-  messageBox.textContent = text;
+  const value = String(text || "").trim();
+  messageBox.textContent = value;
+  messageBox.hidden = !value;
 }
 
 function findProviderResult(results, providerName) {
@@ -208,29 +292,9 @@ function findProviderResult(results, providerName) {
   return results.find((item) => item.provider === providerName) || null;
 }
 
-function formatProviderStatus(status) {
-  return formatText(status, "not-yet-run");
-}
-
 function formatTimestamp(timestamp) {
   const date = new Date(Number(timestamp || Date.now()));
-  return Number.isNaN(date.getTime()) ? "invalid-date" : date.toISOString();
-}
-
-function formatTimestampOrFallback(timestamp) {
-  if (!timestamp) {
-    return "not-yet-run";
-  }
-
-  return formatTimestamp(timestamp);
-}
-
-function formatText(value, fallback) {
-  if (value === null || value === undefined || value === "") {
-    return fallback;
-  }
-
-  return String(value);
+  return Number.isNaN(date.getTime()) ? "invalid-date" : date.toLocaleString();
 }
 
 function timestampForFilename(date) {
@@ -244,15 +308,6 @@ function timestampForFilename(date) {
   ];
 
   return `${parts[0]}-${parts[1]}-${parts[2]}-${parts[3]}-${parts[4]}-${parts[5]}`;
-}
-
-function escapeHtml(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
 
 async function sendMessage(message) {

@@ -65,11 +65,6 @@ const DEDUCTION_RULES = [
     label: "The destination uses unusually deep subdomains."
   },
   {
-    id: "multipleRedirects",
-    deduction: 12,
-    label: "The link passes through multiple redirects before reaching the final destination."
-  },
-  {
     id: "crossDomainRedirectChain",
     deduction: 16,
     label: "The redirect chain hands the user across different domains."
@@ -102,7 +97,14 @@ const COMBINATION_RULES = [
     deduction: 10,
     label: "A shortened URL is combined with suspicious redirect behavior.",
     when(features) {
-      return Boolean(features.shortenedUrl && (features.multipleRedirects || features.suspiciousRedirectPattern || features.shortenerToUnrelatedDomain));
+      return Boolean(
+        features.shortenedUrl &&
+        (
+          features.suspiciousRedirectPattern ||
+          features.shortenerToUnrelatedDomain ||
+          (features.multipleRedirects && Number(features.redirectCount || 0) >= 4)
+        )
+      );
     }
   },
   {
@@ -139,6 +141,17 @@ const COMBINATION_RULES = [
   }
 ];
 
+const MITIGATION_RULES = [
+  {
+    id: "trustedEndpointMitigation",
+    credit: 18,
+    label: "The resolved destination is a trusted endpoint and did not show strong contradictory warning signs.",
+    when(features) {
+      return Boolean(features.trustedEndpointMitigationEligible);
+    }
+  }
+];
+
 /**
  * Calculate a transparent weighted safety score from collected link features.
  * @param {object} features
@@ -170,15 +183,14 @@ export function calculateSafetyScore(features = {}) {
 
   if (redirectCount === 1) {
     redirectLabel = "The URL uses a single redirect hop, which is common and only mildly informative.";
-  } else if (redirectCount === 2) {
+  } else if (redirectCount >= 2 && redirectCount <= 3) {
+    redirectLabel = "The URL uses a short redirect chain, which is common in marketing and analytics links.";
+  } else if (redirectCount >= 4 && redirectCount <= 5) {
     redirectDeduction = 6;
-    redirectLabel = "The URL uses a short redirect chain.";
-  } else if (redirectCount >= 3 && redirectCount <= 4) {
+    redirectLabel = "The URL uses a longer redirect chain than usual.";
+  } else if (redirectCount > 5) {
     redirectDeduction = 12;
-    redirectLabel = "The URL uses a moderate redirect chain.";
-  } else if (redirectCount > 4) {
-    redirectDeduction = 18;
-    redirectLabel = "The URL uses a long redirect chain.";
+    redirectLabel = "The URL uses an unusually long redirect chain.";
   }
 
   totalDeduction += redirectDeduction;
@@ -205,11 +217,28 @@ export function calculateSafetyScore(features = {}) {
     });
   }
 
-  const score = clamp(100 - totalDeduction, 0, 100);
+  for (const rule of MITIGATION_RULES) {
+    const triggered = Boolean(rule.when(features));
+    const appliedCredit = triggered ? rule.credit : 0;
+
+    if (triggered) {
+      totalDeduction -= rule.credit;
+    }
+
+    deductions.push({
+      id: rule.id,
+      label: rule.label,
+      deduction: triggered ? -appliedCredit : 0,
+      triggered
+    });
+  }
+
+  const boundedTotalDeduction = clamp(totalDeduction, 0, 100);
+  const score = clamp(100 - boundedTotalDeduction, 0, 100);
 
   return {
     score,
-    totalDeduction,
+    totalDeduction: boundedTotalDeduction,
     deductions
   };
 }
