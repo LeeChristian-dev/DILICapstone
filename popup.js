@@ -11,8 +11,11 @@ const MESSAGE_TYPES = {
 const popupState = {
   activeTab: null,
   summary: {},
-  scanEnabled: true
+  scanEnabled: true,
+  refreshIntervalId: null
 };
+
+const LIVE_REFRESH_INTERVAL_MS = 3000;
 
 const dashboardShell = document.querySelector(".dashboard-shell");
 const menuToggleButton = document.getElementById("menu-toggle");
@@ -25,8 +28,17 @@ const exportButton = document.getElementById("export-btn");
 const restartButton = document.getElementById("restart-btn");
 const clearButton = document.getElementById("clear-btn");
 const messageBox = document.getElementById("message");
+const refreshButton = document.getElementById("refresh-btn");
+const tabContext = document.getElementById("tab-context");
+const tabContextText = document.getElementById("tab-context-text");
 const statScannedPosts = document.getElementById("stat-scanned-posts");
 const statAnalyzedPosts = document.getElementById("stat-analyzed-posts");
+const statFlaggedPosts = document.getElementById("stat-flagged-posts");
+const statTotalStored = document.getElementById("stat-total-stored");
+const sessionSinceEl = document.getElementById("session-since");
+const providerChipsEl = document.getElementById("provider-chips");
+const recentActivityList = document.getElementById("recent-activity-list");
+const recentEmptyEl = document.getElementById("recent-empty");
 
 init().catch((error) => {
   setMessage(`Failed to initialize popup: ${error.message || "unknown error"}`);
@@ -35,9 +47,42 @@ init().catch((error) => {
 async function init() {
   bindActions();
   await refreshPopupData();
+  startLiveRefresh();
 }
 
+function startLiveRefresh() {
+  if (popupState.refreshIntervalId !== null) {
+    return;
+  }
+
+  popupState.refreshIntervalId = setInterval(() => {
+    refreshPopupData().catch(() => {});
+  }, LIVE_REFRESH_INTERVAL_MS);
+}
+
+function stopLiveRefresh() {
+  if (popupState.refreshIntervalId !== null) {
+    clearInterval(popupState.refreshIntervalId);
+    popupState.refreshIntervalId = null;
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    stopLiveRefresh();
+  } else {
+    refreshPopupData().catch(() => {});
+    startLiveRefresh();
+  }
+});
+
 function bindActions() {
+  refreshButton.addEventListener("click", async () => {
+    refreshButton.classList.add("spinning");
+    await refreshPopupData().catch(() => {});
+    setTimeout(() => refreshButton.classList.remove("spinning"), 500);
+  });
+
   menuToggleButton.addEventListener("click", (event) => {
     event.stopPropagation();
     toggleSettingsMenu();
@@ -165,7 +210,11 @@ async function refreshPopupData() {
   popupState.scanEnabled = scanStateResponse?.scanEnabled !== false;
 
   renderProtectionState();
+  renderTabContext(popupState.activeTab, popupState.summary);
   renderStats(popupState.summary);
+  renderSessionSince(popupState.summary);
+  renderProviderChips(popupState.summary.providerSummary);
+  renderRecentActivity(popupState.summary.recentActivity);
 }
 
 function renderProtectionState() {
@@ -178,7 +227,132 @@ function renderProtectionState() {
 
 function renderStats(summary) {
   statScannedPosts.textContent = String(summary.postsScannedInSession ?? summary.scannedPostsInSession ?? 0);
-  statAnalyzedPosts.textContent = String(summary.postsAnalyzedInSession ?? summary.analyzedLinksInSession ?? 0);
+  statAnalyzedPosts.textContent = String(
+    summary.analyzedLinksInSession ?? summary.postsAnalyzedInSession ?? 0
+  );
+  statFlaggedPosts.textContent = String(summary.flaggedPostsInSession ?? 0);
+  statTotalStored.textContent = String(summary.totalStoredAnalyses ?? 0);
+}
+
+function renderTabContext(activeTab, summary) {
+  const url = String(activeTab?.url || "").trim();
+  const tabSupported = summary.tabSupported === true;
+
+  tabContext.classList.remove("context-ok", "context-warn", "context-bad");
+
+  const isRestricted =
+    !url ||
+    url.startsWith("chrome://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("devtools://");
+
+  if (isRestricted) {
+    tabContextText.textContent =
+      "Open a normal Facebook tab (facebook.com) to scan posts. Extension pages and browser settings URLs cannot be scanned.";
+    tabContext.classList.add("context-warn");
+    return;
+  }
+
+  if (tabSupported) {
+    tabContextText.textContent = "Facebook tab — DILI can scan posts on this page.";
+    tabContext.classList.add("context-ok");
+    return;
+  }
+
+  tabContextText.textContent = "Not a Facebook URL — DILI only runs on *.facebook.com.";
+  tabContext.classList.add("context-warn");
+}
+
+function renderSessionSince(summary) {
+  const started = Number(summary.sessionStartedAt || 0);
+  if (!Number.isFinite(started) || started <= 0) {
+    sessionSinceEl.hidden = true;
+    sessionSinceEl.textContent = "";
+    return;
+  }
+
+  const label = formatTimestamp(started);
+  sessionSinceEl.textContent = `Session started: ${label}`;
+  sessionSinceEl.hidden = false;
+}
+
+function renderProviderChips(providerSummary) {
+  providerChipsEl.textContent = "";
+
+  if (!providerSummary || typeof providerSummary !== "object") {
+    const fallback = document.createElement("span");
+    fallback.className = "recent-meta";
+    fallback.style.padding = "4px 2px";
+    fallback.textContent = "Provider status unavailable.";
+    providerChipsEl.appendChild(fallback);
+    return;
+  }
+
+  const order = ["config", "gsb", "urlhaus"];
+  for (const key of order) {
+    const entry = providerSummary[key];
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const chip = document.createElement("span");
+    const state = String(entry.state || "off");
+    chip.className = `provider-chip provider-chip--${sanitizeProviderStateClass(state)}`;
+
+    const labelSpan = document.createElement("span");
+    labelSpan.className = "prov-label";
+    labelSpan.textContent = `${entry.label || key}:`;
+
+    const textSpan = document.createElement("span");
+    textSpan.textContent = String(entry.text || "—");
+
+    chip.appendChild(labelSpan);
+    chip.appendChild(textSpan);
+    providerChipsEl.appendChild(chip);
+  }
+}
+
+function sanitizeProviderStateClass(state) {
+  if (state === "ready" || state === "public" || state === "off" || state === "error") {
+    return state;
+  }
+
+  return "off";
+}
+
+function renderRecentActivity(recentActivity) {
+  recentActivityList.textContent = "";
+
+  if (!Array.isArray(recentActivity) || recentActivity.length === 0) {
+    recentEmptyEl.hidden = false;
+    return;
+  }
+
+  recentEmptyEl.hidden = true;
+
+  for (const item of recentActivity) {
+    const li = document.createElement("li");
+    const title = document.createElement("span");
+    const domain = item.domain || "—";
+    const classification = item.classification || "—";
+    const score =
+      item.safetyScore === null || item.safetyScore === undefined || item.safetyScore === ""
+        ? "—"
+        : String(item.safetyScore);
+    title.textContent = `${domain} · ${classification} · score ${score}`;
+
+    const meta = document.createElement("span");
+    meta.className = "recent-meta";
+    meta.textContent = `${formatTimestamp(item.timestamp)} · ${String(item.postId || "").slice(0, 24)}${
+      String(item.postId || "").length > 24 ? "…" : ""
+    } · ${item.state || "—"}`;
+
+    li.appendChild(title);
+    li.appendChild(meta);
+    recentActivityList.appendChild(li);
+  }
 }
 
 function toggleSettingsMenu() {

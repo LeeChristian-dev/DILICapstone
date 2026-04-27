@@ -5,18 +5,19 @@
   --dili-panel-accent: #475569;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  width: min(100%, 420px);
-  margin: 10px 0 0;
-  padding: 12px 14px;
+  gap: 10px;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  margin: 12px auto 0;
+  padding: 12px 18px;
   border: 1px solid var(--dili-panel-border);
   border-left: 5px solid var(--dili-panel-accent);
-  border-radius: 16px;
+  border-radius: 14px;
   background: var(--dili-panel-bg);
   color: var(--dili-ink);
   font: 600 13px/1.45 "Segoe UI", Tahoma, sans-serif;
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
-  max-width: min(100%, 420px);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
 }
 
 .dili-panel-safe {
@@ -52,21 +53,21 @@
 .dili-badge {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   width: 100%;
 }
 
 .dili-badge-top {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 16px;
   width: 100%;
 }
 
 .dili-badge-status {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 10px;
   min-width: 0;
   flex: 1 1 auto;
@@ -74,6 +75,7 @@
 
 .dili-badge-copy {
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 .dili-status-label {
@@ -150,10 +152,10 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 88px;
-  min-height: 40px;
-  padding: 0 12px;
-  border-radius: 12px;
+  min-width: 96px;
+  min-height: 38px;
+  padding: 0 16px;
+  border-radius: 10px;
   font-size: 13px;
   font-weight: 800;
   line-height: 1;
@@ -233,18 +235,16 @@
   margin-bottom: 0;
 }
 
-@media (max-width: 560px) {
-  .dili-panel {
-    width: 100%;
-  }
-
+@media (max-width: 480px) {
   .dili-badge-top {
     flex-direction: column;
-    align-items: stretch;
+    align-items: flex-start;
+    gap: 10px;
   }
 
   .dili-score-chip {
     align-self: flex-start;
+    min-width: 80px;
   }
 }
 
@@ -253,6 +253,7 @@ html.dili-warning-open body {
   overflow: hidden !important;
 }
 
+/* ── Overlay ─────────────────────────────────────────────────── */
 .dili-warning-overlay {
   position: fixed;
   inset: 0;
@@ -260,164 +261,212 @@ html.dili-warning-open body {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: 16px;
   background:
-    linear-gradient(180deg, rgba(15, 23, 42, 0.72), rgba(15, 23, 42, 0.82)),
-    radial-gradient(circle at top, rgba(239, 68, 68, 0.22), transparent 40%);
-  backdrop-filter: blur(6px);
+    linear-gradient(180deg, rgba(15, 23, 42, 0.68), rgba(15, 23, 42, 0.78)),
+    radial-gradient(circle at top, rgba(239, 68, 68, 0.18), transparent 40%);
+  backdrop-filter: blur(5px);
 }
 
+/* ── Modal card ──────────────────────────────────────────────── */
 .dili-warning-modal {
-  width: min(100%, 720px);
-  max-height: min(90vh, 900px);
-  overflow: auto;
-  border-radius: 20px;
-  border: 1px solid rgba(127, 29, 29, 0.18);
+  width: min(96vw, 860px);
+  max-height: 92vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border-radius: 18px;
+  border: 1px solid rgba(127, 29, 29, 0.14);
   background: #fffaf7;
   color: #1f2933;
-  box-shadow: 0 24px 80px rgba(15, 23, 42, 0.28);
-  font: 500 14px/1.55 "Segoe UI", Tahoma, sans-serif;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.3);
+  font: 500 13px/1.5 "Segoe UI", Tahoma, sans-serif;
 }
 
+/* ── Header strip ────────────────────────────────────────────── */
 .dili-warning-header {
-  padding: 24px 24px 18px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: start;
+  gap: 12px;
+  padding: 16px 20px 14px;
   border-bottom: 1px solid rgba(127, 29, 29, 0.08);
-  background: linear-gradient(180deg, rgba(254, 226, 226, 0.85), rgba(255, 250, 247, 0.3));
+  background: linear-gradient(180deg, rgba(254, 226, 226, 0.7), rgba(255, 250, 247, 0.2));
+  flex-shrink: 0;
+}
+
+.dili-warning-header-left {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
 }
 
 .dili-warning-kicker {
   display: inline-flex;
-  margin-bottom: 10px;
-  padding: 4px 10px;
+  align-self: flex-start;
+  padding: 3px 9px;
   border-radius: 999px;
-  background: rgba(185, 28, 28, 0.12);
+  background: rgba(185, 28, 28, 0.11);
   color: #991b1b;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.09em;
   text-transform: uppercase;
 }
 
 .dili-warning-header h2 {
-  margin: 0 0 8px;
+  margin: 0;
   color: #7f1d1d;
-  font-size: 28px;
-  line-height: 1.1;
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1.15;
 }
 
 .dili-warning-header p {
   margin: 0;
-  color: rgba(31, 41, 51, 0.82);
+  font-size: 12.5px;
+  color: rgba(31, 41, 51, 0.76);
+  max-width: 600px;
 }
 
+/* ── Summary chips row ───────────────────────────────────────── */
 .dili-warning-summary {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
-  padding: 18px 24px 0;
+  display: flex;
+  gap: 10px;
+  padding: 12px 20px 0;
+  flex-shrink: 0;
 }
 
 .dili-warning-summary-item {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 14px 16px;
-  border-radius: 14px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 10px;
   background: #ffffff;
-  border: 1px solid rgba(148, 163, 184, 0.18);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .dili-warning-summary-item span {
-  color: rgba(31, 41, 51, 0.62);
-  font-size: 12px;
+  color: rgba(31, 41, 51, 0.55);
+  font-size: 10px;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .dili-warning-summary-item strong {
   color: #111827;
-  font-size: 16px;
-  line-height: 1.35;
+  font-size: 13px;
+  font-weight: 800;
   word-break: break-word;
+  line-height: 1.2;
 }
 
+/* ── Scrollable body ─────────────────────────────────────────── */
 .dili-warning-body {
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  padding: 20px 24px 24px;
+  gap: 10px;
+  padding: 12px 20px;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .dili-warning-section {
-  padding: 16px 18px;
-  border-radius: 16px;
-  background: rgba(255, 255, 255, 0.92);
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.9);
   border: 1px solid rgba(148, 163, 184, 0.14);
 }
 
 .dili-warning-section h3 {
-  margin: 0 0 10px;
+  margin: 0 0 8px;
   color: #7f1d1d;
-  font-size: 15px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
 .dili-warning-reasons {
   margin: 0;
-  padding-left: 18px;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
-.dili-warning-reasons li + li {
-  margin-top: 8px;
+.dili-warning-reasons li {
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .dili-warning-destination {
   margin: 0;
-  padding: 12px 14px;
-  border-radius: 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
   background: #fff7ed;
   color: #9a3412;
-  word-break: break-word;
+  font-size: 12.5px;
+  word-break: break-all;
 }
 
+/* ── Report section (scrollable internally) ──────────────────── */
 .dili-warning-report-copy,
 .dili-warning-report-status {
   margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
 }
 
 .dili-warning-report-status {
-  margin-top: 8px;
-  color: #475569;
+  margin-top: 6px;
+  color: #15803d;
+  font-weight: 600;
 }
 
 .dili-warning-report-preview {
   width: 100%;
-  min-height: 140px;
-  margin-top: 12px;
-  padding: 12px 14px;
-  border-radius: 12px;
+  max-height: 160px;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
   border: 1px solid rgba(148, 163, 184, 0.28);
   background: #f8fafc;
   color: #0f172a;
   resize: vertical;
-  font: 500 12px/1.5 Consolas, "Courier New", monospace;
+  overflow-y: auto;
+  font: 500 11.5px/1.5 Consolas, "Courier New", monospace;
+  box-sizing: border-box;
 }
 
+/* ── Action row ──────────────────────────────────────────────── */
 .dili-warning-actions {
   display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
+  gap: 10px;
   justify-content: flex-end;
-  padding: 0 24px 24px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(255, 250, 247, 0.6);
+  flex-shrink: 0;
 }
 
 .dili-warning-button {
-  min-height: 44px;
-  padding: 0 16px;
-  border-radius: 12px;
+  min-height: 38px;
+  padding: 0 18px;
+  border-radius: 10px;
   border: 1px solid transparent;
-  font: 700 14px/1 "Segoe UI", Tahoma, sans-serif;
+  font: 700 13px/1 "Segoe UI", Tahoma, sans-serif;
   cursor: pointer;
-  transition: transform 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+  white-space: nowrap;
+  transition: transform 0.12s ease, box-shadow 0.12s ease, background-color 0.12s ease;
 }
 
 .dili-warning-button:hover {
@@ -431,13 +480,13 @@ html.dili-warning-open body {
 
 .dili-warning-button-secondary {
   background: #ffffff;
-  border-color: rgba(15, 23, 42, 0.1);
-  color: #111827;
+  border-color: rgba(15, 23, 42, 0.12);
+  color: #374151;
 }
 
 .dili-warning-button-neutral {
   background: #fff7ed;
-  border-color: rgba(249, 115, 22, 0.18);
+  border-color: rgba(249, 115, 22, 0.2);
   color: #9a3412;
 }
 
@@ -445,27 +494,26 @@ html.dili-warning-open body {
   background: #b91c1c;
   border-color: #991b1b;
   color: #ffffff;
-  box-shadow: 0 12px 28px rgba(185, 28, 28, 0.22);
+  box-shadow: 0 8px 20px rgba(185, 28, 28, 0.22);
 }
 
-@media (max-width: 720px) {
-  .dili-warning-overlay {
-    padding: 16px;
+/* ── Responsive ──────────────────────────────────────────────── */
+@media (max-width: 600px) {
+  .dili-warning-summary {
+    flex-direction: column;
   }
 
   .dili-warning-header h2 {
-    font-size: 24px;
-  }
-
-  .dili-warning-summary {
-    grid-template-columns: 1fr;
+    font-size: 17px;
   }
 
   .dili-warning-actions {
     flex-direction: column-reverse;
+    gap: 8px;
   }
 
   .dili-warning-button {
     width: 100%;
+    justify-content: center;
   }
 }

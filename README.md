@@ -2,6 +2,12 @@
 
 DILI is a Manifest V3 Chrome extension for Facebook link monitoring. It fingerprints URLs, stores per-post baselines, detects link edits and insertions, runs external threat-intelligence checks, computes a Safety Score, and renders inline post badges.
 
+## Release documentation
+
+- **Branch `beta-2.3.0`:** [Release notes and capstone appendix](docs/RELEASE_NOTES-beta-2.3.0.md) — feature list, changelog-style summary, setup, limitations, and security notes.
+- **Process-flow coverage (capstone):** [Process-flow appendix & rubric](docs/PROCESS_FLOW_APPENDIX-beta-2.3.0.md) — stage-by-stage mapping to the DILI flow diagram, weighted **~87%** alignment, PDF export notes.
+- **Detailed branch report:** [Detailed report — `beta-2.3.0`](docs/DETAILED_REPORT-beta-2.3.0.md) — architecture, data flow, modules, persistence, UX, limitations, and next steps.
+
 ## What Is New In This Revision
 
 - Google Safe Browsing integration (real request flow when key is configured)
@@ -71,11 +77,11 @@ Click the extension toolbar icon to open the popup.
 
 The popup shows:
 
-- Supported tab status (Facebook vs unsupported)
-- Session analyzed post count
-- Session flagged post count
-- Provider configuration status (GSB + URLhaus)
-- Recent analysis activity
+- **Current tab context** (Facebook vs unsupported / non-scannable URLs)
+- **Session stats:** unique posts scanned, analysis-record count, flagged posts (Suspicious/High risk), total analyses in storage
+- **Session started** timestamp (when the background session began)
+- **Provider chips:** config readiness, Google Safe Browsing, URLhaus compact status
+- **Recent activity** list (latest stored analyses)
 - Action buttons:
 - Export CSV
 - Clear Session Logs

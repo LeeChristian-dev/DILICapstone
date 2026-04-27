@@ -53,6 +53,11 @@
           </div>
         </header>
 
+        <section class="context-banner" id="tab-context" aria-live="polite">
+          <span class="context-dot" id="tab-context-dot" aria-hidden="true"></span>
+          <p id="tab-context-text" class="context-text">Loading tab context…</p>
+        </section>
+
         <section class="hero-card">
           <button
             id="power-toggle"
@@ -66,15 +71,41 @@
           <p id="power-status" class="power-status">Protection On</p>
         </section>
 
-        <section class="stats-grid" aria-label="Session statistics">
+        <div class="stats-header">
+          <h2 class="section-title">Session stats</h2>
+          <button id="refresh-btn" type="button" class="refresh-button" aria-label="Refresh stats" title="Refresh stats">&#8635;</button>
+        </div>
+
+        <section class="stats-grid stats-grid-four" aria-label="Session statistics">
           <article class="stat-card">
             <span class="stat-label">Posts scanned</span>
             <strong id="stat-scanned-posts" class="stat-value">0</strong>
           </article>
           <article class="stat-card">
-            <span class="stat-label">Posts analyzed</span>
+            <span class="stat-label">Session analyses</span>
             <strong id="stat-analyzed-posts" class="stat-value">0</strong>
           </article>
+          <article class="stat-card">
+            <span class="stat-label">Flagged posts</span>
+            <strong id="stat-flagged-posts" class="stat-value">0</strong>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">Stored analyses</span>
+            <strong id="stat-total-stored" class="stat-value">0</strong>
+          </article>
+        </section>
+
+        <p id="session-since" class="session-since" hidden></p>
+
+        <section class="provider-section" aria-label="Provider configuration">
+          <h2 class="section-title">Providers</h2>
+          <div class="provider-chips" id="provider-chips"></div>
+        </section>
+
+        <section class="recent-section" aria-label="Recent analysis activity">
+          <h2 class="section-title">Recent activity</h2>
+          <ul id="recent-activity-list" class="recent-list"></ul>
+          <p id="recent-empty" class="recent-empty">No activity recorded yet.</p>
         </section>
 
         <p id="message" class="message" role="status" aria-live="polite" hidden></p>

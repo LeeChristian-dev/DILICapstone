@@ -545,23 +545,26 @@
 
     overlay.innerHTML = `
       <div class="dili-warning-modal" role="dialog" aria-modal="true" aria-labelledby="dili-warning-title">
+
         <div class="dili-warning-header">
-          <span class="dili-warning-kicker">${escapeHtml(kickerText)}</span>
-          <h2 id="dili-warning-title">${escapeHtml(titleText)}</h2>
-          <p>${escapeHtml(explanationText)}</p>
+          <div class="dili-warning-header-left">
+            <span class="dili-warning-kicker">${escapeHtml(kickerText)}</span>
+            <h2 id="dili-warning-title">${escapeHtml(titleText)}</h2>
+            <p>${escapeHtml(explanationText)}</p>
+          </div>
         </div>
 
         <div class="dili-warning-summary">
           <div class="dili-warning-summary-item">
-            <span>Destination domain</span>
+            <span>Domain</span>
             <strong>${escapeHtml(destinationDomain)}</strong>
           </div>
           <div class="dili-warning-summary-item">
-            <span>Risk classification</span>
+            <span>Classification</span>
             <strong>${escapeHtml(classificationText)}</strong>
           </div>
           <div class="dili-warning-summary-item">
-            <span>Safety score</span>
+            <span>Score</span>
             <strong>${escapeHtml(scoreText)}</strong>
           </div>
         </div>
@@ -578,20 +581,19 @@
           </div>
 
           <div class="dili-warning-section">
-            <h3>Report help</h3>
-            <p class="dili-warning-report-copy">
-              ${escapeHtml(reportCopyText)}
-            </p>
-            <p class="dili-warning-report-status" data-role="report-status">No report copied yet.</p>
+            <h3>Report this post</h3>
+            <p class="dili-warning-report-copy">${escapeHtml(reportCopyText)}</p>
+            <p class="dili-warning-report-status" data-role="report-status"></p>
             <textarea class="dili-warning-report-preview" data-role="report-preview" readonly hidden></textarea>
           </div>
         </div>
 
         <div class="dili-warning-actions">
           <button type="button" class="dili-warning-button dili-warning-button-secondary" data-action="stay">Stay on Facebook</button>
-          <button type="button" class="dili-warning-button dili-warning-button-neutral" data-action="report">Report this post</button>
+          <button type="button" class="dili-warning-button dili-warning-button-neutral" data-action="report">Copy report</button>
           <button type="button" class="dili-warning-button dili-warning-button-danger" data-action="proceed">Proceed anyway</button>
         </div>
+
       </div>
     `;
 
