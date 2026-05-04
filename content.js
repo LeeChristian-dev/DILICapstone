@@ -1,13 +1,33 @@
 (function initializeDili() {
+  if (window.__DILI_CONTENT_ACTIVE__ && !window.__DILI_FORCE_REINIT__) {
+    return;
+  }
+
+  if (window.__DILI_FORCE_REINIT__ && typeof window.__DILI_STOP__ === "function") {
+    window.__DILI_STOP__();
+  }
+
+  window.__DILI_CONTENT_ACTIVE__ = true;
+  window.__DILI_FORCE_REINIT__ = false;
+
   const MESSAGE_TYPES = {
     ANALYZE_LINK: "DILI_ANALYZE_LINK",
     REANALYZE_LINK: "DILI_REANALYZE_LINK",
     GET_POST_STATE: "DILI_GET_POST_STATE",
     SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
     GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
-    RESCAN_NOW: "DILI_RESCAN_NOW"
+    SET_SCAN_STATE: "DILI_SET_SCAN_STATE",
+    RESCAN_NOW: "DILI_RESCAN_NOW",
+    GET_SCAN_STATUS: "DILI_GET_SCAN_STATUS"
   };
 
+  const FEED_ROOT_SELECTORS = [
+    '[role="main"]',
+    '[role="feed"]',
+    '[data-pagelet*="MainFeed"]',
+    '[data-pagelet*="FeedUnit"]',
+    '[data-pagelet*="ProfileTimeline"]'
+  ];
   const POST_SELECTORS = [
     'div[role="article"]',
     'article',
@@ -32,12 +52,26 @@
     /\bmenu\b/i,
     /\boptions\b/i,
     /\breport\b/i,
-    /\bhide\b/i,
-    /\bnext\b/i,
-    /\bprevious\b/i,
-    /\bprev\b/i,
-    /\bcarousel\b/i,
-    /\bslide\b/i
+    /\bhide\b/i
+  ];
+  const DOMAIN_TEXT_PATTERN = /\b[a-z0-9.-]+\.(?:ai|app|biz|click|com|dev|info|io|net|org|ph|shop|site|store|xyz)\b/i;
+  const CTA_TEXT_PATTERNS = [
+    /\bsign up\b/i,
+    /\bclaim now\b/i,
+    /\bdownload\b/i,
+    /\bshop now\b/i,
+    /\blearn more\b/i,
+    /\bapply now\b/i,
+    /\binstall\b/i,
+    /\bwatch more\b/i,
+    /\bbook now\b/i,
+    /\bget offer\b/i,
+    /\bsubscribe\b/i,
+    /\bcontact us\b/i,
+    /\bsend message\b/i,
+    /\buse app\b/i,
+    /\bopen app\b/i,
+    /\border now\b/i
   ];
 
   const TRACKING_PARAMS = new Set([
@@ -50,21 +84,52 @@
     "utm_medium",
     "utm_campaign",
     "utm_term",
-    "utm_content"
+    "utm_content",
+    "__cft__",
+    "__tn__",
+    "h",
+    "eid",
+    "paipv",
+    "ref",
+    "refsrc",
+    "mibextid"
   ]);
 
   const FACEBOOK_REDIRECT_HOSTS = new Set([
     "l.facebook.com",
     "lm.facebook.com",
-    "m.facebook.com"
+    "m.facebook.com",
+    "facebook.com",
+    "www.facebook.com"
   ]);
+  const FACEBOOK_REDIRECT_PARAMS = new Set([
+  "u",
+  "url",
+  "target",
+  "dest",
+  "destination",
+  "redirect",
+  "redirect_url",
+  "redirect_uri",
+  "redir",
+  "continue",
+  "next",
+  "r",
+  "link",
+  "to",
+  "out",
+  "goto"
+]);  
   const POST_PROCESS_CONCURRENCY = 4;
+  const MAX_LINKS_PER_POST = 8;
 
   const pendingPosts = new Set();
   const postIdCache = new WeakMap();
-  const postSignatureCache = new WeakMap();
+  let postSignatureCache = new WeakMap();
   const selectedPostLinkCache = new Map();
   const observedPostIds = new Map();
+  const latestRequestByPostId = new Map();
+  const cachedPanelByPostId = new Map();
   const clickWarningState = {
     activeToken: 0,
     overlay: null,
@@ -75,7 +140,30 @@
     enabled: true,
     runtimeListenerBound: false,
     clickInterceptionBound: false,
-    scrollListenerBound: false
+    scrollListenerBound: false,
+    extensionContextInvalidated: false
+  };
+  const scanStatus = {
+    enabled: true,
+    route: location.href,
+    lastScanAt: null,
+    feedRootsFound: 0,
+    candidatePostsFound: 0,
+    eligibleLinkPostsFound: 0,
+    analyzedPosts: 0,
+    renderedPanels: 0,
+    visiblePanels: 0,
+    queuedPosts: 0,
+    skippedSidebar: 0,
+    skippedInvisible: 0,
+    skippedNoLinks: 0,
+    skippedActionArea: 0,
+    staleResponsesDiscarded: 0,
+    duplicatePanelsRemoved: 0,
+    sponsoredFallbackAttempts: 0,
+    sponsoredFallbackAccepted: 0,
+    lastError: "",
+    lastRenderedDomain: ""
   };
   let flushTimer = null;
   let rescanTimer = null;
@@ -86,6 +174,11 @@
   });
 
   async function start() {
+    if (isRuntimeInvalidated()) {
+      invalidateRuntimeContext();
+      return;
+    }
+
     if (!location.hostname.includes("facebook.com")) {
       return;
     }
@@ -113,6 +206,17 @@
     }
 
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      if (message?.type === MESSAGE_TYPES.GET_SCAN_STATUS) {
+        sendResponse({ ok: true, status: buildScanStatusSnapshot() });
+        return false;
+      }
+
+      if (message?.type === MESSAGE_TYPES.SET_SCAN_STATE) {
+        applyScanState(message.enabled !== false);
+        sendResponse({ ok: true, enabled: scanRuntimeState.enabled });
+        return false;
+      }
+
       if (message?.type !== MESSAGE_TYPES.RESCAN_NOW) {
         return false;
       }
@@ -150,8 +254,23 @@
     scanRuntimeState.scrollListenerBound = true;
   }
 
+  function applyScanState(enabled) {
+    scanRuntimeState.enabled = Boolean(enabled) && !scanRuntimeState.extensionContextInvalidated;
+    scanStatus.enabled = scanRuntimeState.enabled;
+
+    if (!scanRuntimeState.enabled) {
+      stopScanning();
+      return;
+    }
+
+    bindClickInterception();
+    observeFeed();
+    bindScrollRescan();
+    initialScan();
+  }
+
   async function handleDocumentClickCapture(event) {
-    if (!scanRuntimeState.enabled || event.defaultPrevented) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated || event.defaultPrevented) {
       return;
     }
 
@@ -207,35 +326,35 @@
       return null;
     }
 
-    const anchor = event.target.closest("a[href]");
-    if (!(anchor instanceof HTMLAnchorElement)) {
+    const targetElement = event.target.closest("a[href], [data-lynx-uri], [data-url]");
+    if (!(targetElement instanceof Element)) {
       return null;
     }
 
-    if (anchor.closest(".dili-panel, .dili-warning-overlay")) {
+    if (targetElement.closest(".dili-panel, .dili-warning-overlay")) {
       return null;
     }
 
-    const post = findPostContainer(anchor);
+    const post = getOwningPostContainer(targetElement);
     if (!post) {
       return null;
     }
 
-    const rawUrl = anchor.href;
+    const rawUrl = getCandidateRawUrl(targetElement);
     if (!isEligibleLink(rawUrl)) {
       return null;
     }
 
     const normalizedTargetUrl = safelyNormalizeComparableUrl(rawUrl);
     return {
-      anchor,
+      anchor: targetElement,
       post,
       postId: getStablePostId(post),
       postPermalink: findPermalink(post),
       rawUrl,
       normalizedTargetUrl,
-      displayText: extractAnchorDisplayText(anchor),
-      intent: deriveNavigationIntent(anchor, event)
+      displayText: extractAnchorDisplayText(targetElement),
+      intent: deriveNavigationIntent(targetElement, event)
     };
   }
 
@@ -760,32 +879,27 @@
   }
 
   async function forceRescan() {
-    if (!scanRuntimeState.enabled) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
       return;
     }
 
-    for (const post of collectCandidatePosts(document)) {
-      enqueuePost(post);
-    }
-
-    scheduleFlush();
+    scanAndQueueVisiblePosts(document);
     console.debug("[DILI] Manual re-scan requested from popup.");
   }
 
   function initialScan() {
-    if (!scanRuntimeState.enabled) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
       return;
     }
 
-    for (const post of collectCandidatePosts(document)) {
-      enqueuePost(post);
-    }
-
-    scheduleFlush();
+    scanAndQueueVisiblePosts();
+    scheduleDelayedScan(300);
+    scheduleDelayedScan(1000);
+    scheduleDelayedScan(2500);
   }
 
   function scheduleVisibleRescan() {
-    if (!scanRuntimeState.enabled) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
       return;
     }
 
@@ -795,19 +909,47 @@
 
     rescanTimer = window.setTimeout(() => {
       rescanTimer = null;
-      for (const post of collectCandidatePosts(document)) {
-        enqueuePost(post);
+      scanAndQueueVisiblePosts();
+    }, 1000);
+  }
+
+  function scheduleDelayedScan(delayMs) {
+    window.setTimeout(() => {
+      if (scanRuntimeState.enabled && !scanRuntimeState.extensionContextInvalidated) {
+        scanAndQueueVisiblePosts();
       }
-      scheduleFlush();
-    }, 300);
+    }, delayMs);
+  }
+
+  function scanAndQueueVisiblePosts(root = document) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
+      return;
+    }
+
+    scanStatus.lastScanAt = Date.now();
+    scanStatus.route = location.href;
+
+    for (const post of collectCandidatePosts(root)) {
+      enqueuePost(post);
+    }
+
+    scheduleFlush();
   }
 
   function observeFeed() {
-    if (!scanRuntimeState.enabled) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
+      return;
+    }
+
+    if (observer) {
       return;
     }
 
     observer = new MutationObserver((mutations) => {
+      if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
+        return;
+      }
+
       const affectedPosts = new Set();
 
       for (const mutation of mutations) {
@@ -856,45 +998,142 @@
       return false;
     }
 
-    return Boolean(target.closest(".dili-badge, .dili-panel, .dili-details, .dili-warning-overlay, .dili-warning-modal"));
+    return Boolean(target.closest(".dili-badge, .dili-panel, .dili-panel-slot, .dili-details, .dili-warning-overlay, .dili-warning-modal"));
   }
 
   function collectCandidatePosts(root) {
     const candidates = new Set();
-    const searchRoot = root instanceof Document ? root : root;
+    const searchRoots = getScanRoots(root);
 
-    if (searchRoot instanceof Element) {
-      const directContainer = findPostContainer(searchRoot);
-      if (directContainer) {
-        candidates.add(directContainer);
+    for (const searchRoot of searchRoots) {
+      if (searchRoot instanceof Element) {
+        const directContainer = getOwningPostContainer(searchRoot);
+        if (directContainer && isScannablePostContainer(directContainer)) {
+          candidates.add(directContainer);
+        }
       }
-    }
 
-    if (!(searchRoot instanceof Document || searchRoot instanceof Element)) {
-      return candidates;
-    }
+      if (!(searchRoot instanceof Document || searchRoot instanceof Element)) {
+        continue;
+      }
 
-    for (const selector of POST_SELECTORS) {
-      for (const element of searchRoot.querySelectorAll(selector)) {
-        if (element instanceof Element && isProbablyVisible(element)) {
-          candidates.add(element);
+      for (const selector of POST_SELECTORS) {
+        for (const element of searchRoot.querySelectorAll(selector)) {
+          const owningPost = getOwningPostContainer(element);
+          if (owningPost && isScannablePostContainer(owningPost)) {
+            candidates.add(owningPost);
+          }
+        }
+      }
+
+      for (const element of searchRoot.querySelectorAll('a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]')) {
+        if (!(element instanceof Element)) {
+          continue;
+        }
+
+        const owningPost = getOwningPostContainer(element);
+        if (owningPost && isScannablePostContainer(owningPost)) {
+          candidates.add(owningPost);
         }
       }
     }
 
+    scanStatus.candidatePostsFound = candidates.size;
     return candidates;
   }
 
+  function getScanRoots(root) {
+    if (root instanceof Element && isExcludedSurface(root)) {
+      scanStatus.skippedSidebar += 1;
+      return [];
+    }
+
+    if (root instanceof Element && getOwningPostContainer(root)) {
+      return [root];
+    }
+
+    const base = root instanceof Document ? root : root instanceof Element ? root : document;
+    const roots = [];
+
+    for (const selector of FEED_ROOT_SELECTORS) {
+      for (const element of base.querySelectorAll(selector)) {
+        if (element instanceof Element && !isExcludedSurface(element)) {
+          roots.push(element);
+        }
+      }
+    }
+
+    const uniqueRoots = [...new Set(roots)];
+    scanStatus.feedRootsFound = uniqueRoots.length;
+
+    if (uniqueRoots.length > 0) {
+      return uniqueRoots;
+    }
+
+    return [base];
+  }
+
+  function isScannablePostContainer(post) {
+    if (!(post instanceof Element)) {
+      return false;
+    }
+
+    if (isExcludedSurface(post)) {
+      scanStatus.skippedSidebar += 1;
+      return false;
+    }
+
+    if (!isProbablyVisible(post)) {
+      scanStatus.skippedInvisible += 1;
+      return false;
+    }
+
+    return isNearViewport(post);
+  }
+
+  function getOwningPostContainer(element) {
+    if (!(element instanceof Element)) {
+      return null;
+    }
+
+    return getCanonicalPost(element);
+  }
+
+  function isExcludedSurface(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    if (element.closest('[role="complementary"], aside')) {
+      return true;
+    }
+
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.width < 380 && rect.left > window.innerWidth * 0.62;
+  }
+
+  function isNearViewport(element) {
+    const rect = element.getBoundingClientRect();
+    const buffer = window.innerHeight || 800;
+    return rect.bottom >= -buffer && rect.top <= (window.innerHeight || 800) + buffer;
+  }
+
   function enqueuePost(post) {
-    if (!scanRuntimeState.enabled || !(post instanceof Element)) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated || !(post instanceof Element)) {
       return;
     }
 
-    pendingPosts.add(post);
+    const owningPost = getOwningPostContainer(post) || post;
+    if (!isScannablePostContainer(owningPost)) {
+      return;
+    }
+
+    pendingPosts.add(owningPost);
+    scanStatus.queuedPosts = pendingPosts.size;
   }
 
   function scheduleFlush() {
-    if (!scanRuntimeState.enabled) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
       return;
     }
 
@@ -912,6 +1151,10 @@
   }
 
   async function processPostBatch(batch) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
+      return;
+    }
+
     for (let index = 0; index < batch.length; index += POST_PROCESS_CONCURRENCY) {
       const slice = batch.slice(index, index + POST_PROCESS_CONCURRENCY);
       const results = await Promise.allSettled(slice.map((post) => processPost(post)));
@@ -925,48 +1168,133 @@
   }
 
   async function processPost(post) {
-    if (!scanRuntimeState.enabled) {
+    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
       return;
     }
 
-    if (!post.isConnected || !isProbablyVisible(post)) {
+    const owningPost = getOwningPostContainer(post) || post;
+    if (!owningPost.isConnected || !isScannablePostContainer(owningPost)) {
       return;
     }
 
-    const postId = getStablePostId(post);
-    const linkInfo = extractRelevantLink(post, postId);
+    const postIdentity = getStablePostIdentity(owningPost);
+    const postId = postIdentity.id;
+    const postTextSnapshot = await buildVisiblePostTextSnapshot(owningPost);
+    const linkInfo = extractRelevantLinks(owningPost, postId);
     const signature = buildPostSignature(linkInfo);
 
-    if (postSignatureCache.get(post) === signature) {
+    if (postSignatureCache.get(owningPost) === signature) {
+      const cachedPanel = cachedPanelByPostId.get(postId);
+      if (linkInfo && cachedPanel && !owningPost.querySelector(".dili-panel[data-dili-owned='true']")) {
+        renderBadge(owningPost, cachedPanel);
+        return;
+      }
+
+      if (!linkInfo) {
+        const currentState = await sendRuntimeMessage({
+          type: MESSAGE_TYPES.GET_POST_STATE,
+          postId
+        });
+        const storedBaseline = currentState?.baseline || null;
+        const hasOwnedArtifacts = Boolean(
+          owningPost.querySelector(".dili-panel[data-dili-owned='true'], .dili-panel-slot[data-dili-owned='true']") ||
+          cachedPanel
+        );
+
+        if (
+          !storedBaseline ||
+          storedBaseline.baselineState !== "no_link" ||
+          storedBaseline.postTextHash !== postTextSnapshot.postTextHash ||
+          hasOwnedArtifacts
+        ) {
+          await setNoLinkState(owningPost, postId, postTextSnapshot);
+        }
+      }
+
       return;
     }
 
-    postSignatureCache.set(post, signature);
+    postSignatureCache.set(owningPost, signature);
     observedPostIds.set(postId, {
       signature,
       lastSeen: Date.now()
     });
 
     if (!linkInfo) {
-      await setNoLinkState(post, postId);
+      scanStatus.skippedNoLinks += 1;
+      await setNoLinkState(owningPost, postId, postTextSnapshot);
       return;
     }
 
+    scanStatus.eligibleLinkPostsFound += 1;
     const currentState = await sendRuntimeMessage({
       type: MESSAGE_TYPES.GET_POST_STATE,
       postId
     });
-    const messageType = currentState?.baseline?.urlHash ? MESSAGE_TYPES.REANALYZE_LINK : MESSAGE_TYPES.ANALYZE_LINK;
+
+    const baseline = currentState?.baseline || null;
+
+    const hasPriorBaseline = Boolean(
+      baseline?.urlHash ||
+      baseline?.baselineState === "no_link" ||
+      baseline?.hadLinkAtBaseline === false ||
+      baseline?.postTextHash
+    );
+
+    const messageType = hasPriorBaseline
+      ? MESSAGE_TYPES.REANALYZE_LINK
+      : MESSAGE_TYPES.ANALYZE_LINK;
+
+    const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const linkFingerprint = linkInfo.linkFingerprint;
+    latestRequestByPostId.set(postId, {
+      requestId,
+      signature,
+      linkFingerprint,
+      postTextHash: postTextSnapshot.postTextHash
+    });
+    renderBadge(owningPost, {
+      label: "Analyzing",
+      safetyScore: null,
+      state: "monitored",
+      severityLevel: "unverified",
+      summaryLine: "DILI is resolving this post's external link destination.",
+      detailsSummary: "Scan details",
+      details: [`Checking ${linkInfo.links.length} link${linkInfo.links.length === 1 ? "" : "s"}.`]
+    });
+
     const response = await sendRuntimeMessage({
       type: messageType,
       postId,
-      url: linkInfo.url,
+      url: linkInfo.links[0]?.url,
+      links: linkInfo.links,
       displayedText: linkInfo.displayText,
-      candidateContext: linkInfo.candidateContext
+      postTextHash: postTextSnapshot.postTextHash,
+      normalizedVisiblePostText: postTextSnapshot.normalizedVisiblePostText,
+      candidateContext: {
+        ...linkInfo.candidateContext,
+        postIdentityStable: postIdentity.stable
+      },
+      requestId,
+      postSignature: signature,
+      linkFingerprint
     });
 
+    const latestRequest = latestRequestByPostId.get(postId);
+    if (
+      !latestRequest ||
+      latestRequest.requestId !== requestId ||
+      latestRequest.signature !== signature ||
+      latestRequest.linkFingerprint !== linkFingerprint ||
+      latestRequest.postTextHash !== postTextSnapshot.postTextHash ||
+      buildPostSignature(extractRelevantLinks(owningPost, postId)) !== signature
+    ) {
+      scanStatus.staleResponsesDiscarded += 1;
+      return;
+    }
+
     if (!response?.analysis) {
-      renderBadge(post, {
+      renderBadge(owningPost, {
         label: "Analysis unavailable",
         safetyScore: null,
         state: "monitored",
@@ -979,38 +1307,61 @@
       return;
     }
 
-    renderBadge(post, mapAnalysisToViewModel(response.analysis));
+    scanStatus.analyzedPosts += 1;
+    renderBadge(owningPost, mapAnalysisToViewModel(response.analysis));
   }
 
-  async function setNoLinkState(post, postId) {
+  async function setNoLinkState(post, postId, postTextSnapshot = null) {
     await sendRuntimeMessage({
       type: MESSAGE_TYPES.SET_NO_LINK_STATE,
-      postId
+      postId,
+      postTextHash: postTextSnapshot?.postTextHash || "",
+      normalizedVisiblePostText: postTextSnapshot?.normalizedVisiblePostText || ""
     });
     selectedPostLinkCache.delete(postId);
+    cachedPanelByPostId.delete(postId);
     removeOwnedPanel(post);
   }
 
-  function extractRelevantLink(post, postId = getStablePostId(post)) {
+  function extractRelevantLinks(post, postId = getStablePostId(post)) {
     const rememberedSelection = selectedPostLinkCache.get(postId) || null;
-    const candidateElements = [...post.querySelectorAll("a[href], [data-lynx-uri], [data-url]")].filter((element) => {
+    let candidateElements = [...post.querySelectorAll('a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]')].filter((element) => {
       return element instanceof Element && isUserFacingOutboundCandidate(element, post);
     });
+    candidateElements = includeAncestorAnchors(candidateElements, post);
     const candidates = candidateElements
       .map((element) => buildRelevantLinkCandidate(element, post))
       .filter(Boolean);
+    const withSponsoredFallback = candidates.length > 0 ? candidates : findSponsoredFallbackCandidates(post);
     const candidateSummary = summarizePostLinkCandidates(candidates, rememberedSelection);
 
-    if (!candidateSummary?.dominantCandidate) {
+    if (!candidateSummary?.dominantCandidate && withSponsoredFallback.length === 0) {
       selectedPostLinkCache.delete(postId);
       return null;
     }
 
-    const selectedCandidate = candidateSummary.dominantCandidate;
+    const sortedCandidates = [...(withSponsoredFallback.length ? withSponsoredFallback : candidates)].sort(compareRelevantLinkCandidates);
+    const uniqueCandidates = dedupeLinkCandidates(sortedCandidates).slice(0, MAX_LINKS_PER_POST);
+    const selectedCandidate = candidateSummary?.dominantCandidate || uniqueCandidates[0];
+    const uniqueDomains = [...new Set(uniqueCandidates.map((candidate) => candidate.registrableDomain).filter(Boolean))];
+    const uniqueTargets = [...new Set(uniqueCandidates.map((candidate) => candidate.normalizedTargetUrl).filter(Boolean))];
+    const candidateMode = uniqueDomains.length <= 1
+      ? uniqueTargets.length <= 1
+        ? "single"
+        : "multi-same-domain"
+      : "multi-mixed";
+    const selectedNormalizedTarget = selectedCandidate.normalizedTargetUrl || selectedCandidate.url;
+    const signature = buildCandidateSummarySignature({
+      candidateMode,
+      dominantDomain: selectedCandidate.registrableDomain || "",
+      selectedNormalizedTarget,
+      uniqueDomains
+    });
+
     selectedPostLinkCache.set(postId, {
-      candidateMode: candidateSummary.candidateMode,
-      dominantDomain: candidateSummary.dominantDomain,
-      clusterKey: candidateSummary.dominantClusterKey,
+      candidateMode,
+      dominantDomain: selectedCandidate.registrableDomain || "",
+      clusterKey: selectedNormalizedTarget,
       normalizedTargetUrl: selectedCandidate.normalizedTargetUrl
     });
 
@@ -1019,15 +1370,104 @@
       url: selectedCandidate.url,
       displayText: selectedCandidate.displayText,
       normalizedTargetUrl: selectedCandidate.normalizedTargetUrl,
+      links: uniqueCandidates.map((candidate) => ({
+        url: candidate.url,
+        displayText: candidate.displayText,
+        normalizedTargetUrl: candidate.normalizedTargetUrl,
+        candidateContext: {
+          candidateMode,
+          candidateCount: uniqueCandidates.length,
+          candidateDomainCount: uniqueDomains.length,
+          dominantDomain: candidate.registrableDomain || "",
+          selectedNormalizedTarget: candidate.normalizedTargetUrl,
+          signature
+        }
+      })),
+      linkFingerprint: uniqueTargets.sort().join("|"),
       candidateContext: {
-        candidateMode: candidateSummary.candidateMode,
-        candidateCount: candidateSummary.candidateCount,
-        candidateDomainCount: candidateSummary.candidateDomainCount,
-        dominantDomain: candidateSummary.dominantDomain,
-        selectedNormalizedTarget: candidateSummary.selectedNormalizedTarget,
-        signature: candidateSummary.signature
+        candidateMode,
+        candidateCount: uniqueCandidates.length,
+        candidateDomainCount: uniqueDomains.length,
+        dominantDomain: selectedCandidate.registrableDomain || "",
+        selectedNormalizedTarget,
+        signature
       }
     };
+  }
+
+  function includeAncestorAnchors(elements, post) {
+    const result = new Set(elements);
+    for (const element of elements) {
+      const anchor = element.closest("a[href]");
+      if (anchor instanceof Element && post.contains(anchor)) {
+        result.add(anchor);
+      }
+    }
+    return [...result];
+  }
+
+  function dedupeLinkCandidates(candidates) {
+    const seen = new Set();
+    const unique = [];
+    for (const candidate of candidates) {
+      const key = candidate.normalizedTargetUrl || candidate.url;
+      if (!key || seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      unique.push(candidate);
+    }
+    return unique;
+  }
+
+  function findSponsoredFallbackCandidates(post) {
+    if (!hasSponsoredFallbackSignals(post)) {
+      return [];
+    }
+
+    scanStatus.sponsoredFallbackAttempts += 1;
+    const candidates = [];
+    const searchContainers = [
+      post,
+      ...post.querySelectorAll('[role="button"], [role="link"], a[href], [data-url], [data-lynx-uri]')
+    ];
+
+    for (const container of searchContainers) {
+      if (!(container instanceof Element)) {
+        continue;
+      }
+
+      const elements = [
+        container,
+        ...Array.from(container.querySelectorAll?.('a[href], [data-lynx-uri], [data-url]') || [])
+      ];
+
+      for (const element of elements) {
+        if (!(element instanceof Element)) {
+          continue;
+        }
+
+        const candidate = buildRelevantLinkCandidate(element, post);
+        if (candidate) {
+          candidates.push(candidate);
+        }
+      }
+    }
+
+    const unique = dedupeLinkCandidates(candidates);
+    if (unique.length > 0) {
+      scanStatus.sponsoredFallbackAccepted += 1;
+    }
+
+    return unique;
+  }
+
+  function hasSponsoredFallbackSignals(post) {
+    const text = String(post.textContent || "").replace(/\s+/g, " ").trim();
+    const hasSponsored = /\bsponsored\b/i.test(text);
+    const hasCta = CTA_TEXT_PATTERNS.some((pattern) => pattern.test(text));
+    const hasPreviewDomain = DOMAIN_TEXT_PATTERN.test(text);
+    return hasSponsored && hasCta && hasPreviewDomain;
   }
 
   function buildRelevantLinkCandidate(element, post) {
@@ -1212,6 +1652,10 @@
       return false;
     }
 
+    if (isFacebookInAppFormElement(element) || isInternalFacebookMediaOrActionUrl(getCandidateRawUrl(element))) {
+      return false;
+    }
+
     if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true") {
       return false;
     }
@@ -1221,10 +1665,16 @@
     }
 
     if (isElementInActionArea(element, post) || isElementInsideExcludedControlArea(element)) {
+      scanStatus.skippedActionArea += 1;
       return false;
     }
 
     return hasMeaningfulCandidateSurface(element);
+  }
+
+  function isFacebookInAppFormElement(element) {
+    const text = buildCandidateUtilityText(element);
+    return /lead form|instant form|in-app form|registration form|register on facebook|open form|native form/i.test(text);
   }
 
   function isRenderedCandidateElement(element) {
@@ -1265,7 +1715,16 @@
 
   function isElementInsideExcludedControlArea(element) {
     const utilityText = buildCandidateUtilityText(element);
-    return EXCLUDED_CANDIDATE_CONTROL_PATTERNS.some((pattern) => pattern.test(utilityText));
+    return isCarouselNavigationControl(element) || EXCLUDED_CANDIDATE_CONTROL_PATTERNS.some((pattern) => pattern.test(utilityText));
+  }
+
+  function isCarouselNavigationControl(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    const utilityText = buildCandidateUtilityText(element);
+    return /\b(next|previous|prev)\b/i.test(utilityText) && /\b(carousel|slide)\b/i.test(utilityText);
   }
 
   function buildCandidateUtilityText(element) {
@@ -1415,15 +1874,29 @@
   }
 
   function removeOwnedPanel(post) {
-    const panel = post.querySelector(".dili-panel[data-dili-owned='true']");
-    if (panel) {
-      panel.remove();
+    const postId = getStablePostId(post);
+    cachedPanelByPostId.delete(postId);
+
+    for (const artifact of post.querySelectorAll(".dili-panel[data-dili-owned='true'], .dili-panel-slot[data-dili-owned='true']")) {
+      artifact.remove();
+    }
+
+    for (const badge of post.querySelectorAll(".dili-badge")) {
+      if (!badge.closest(".dili-panel[data-dili-owned='true']")) {
+        badge.remove();
+      }
     }
   }
 
   function removeAllOwnedPanels() {
-    for (const panel of document.querySelectorAll(".dili-panel[data-dili-owned='true']")) {
-      panel.remove();
+    for (const artifact of document.querySelectorAll(".dili-panel[data-dili-owned='true'], .dili-panel-slot[data-dili-owned='true']")) {
+      artifact.remove();
+    }
+
+    for (const badge of document.querySelectorAll(".dili-badge")) {
+      if (!badge.closest(".dili-panel[data-dili-owned='true']")) {
+        badge.remove();
+      }
     }
   }
 
@@ -1433,16 +1906,19 @@
     }
   }
 
-  function resetOwnedUiArtifacts() {
+    function resetOwnedUiArtifacts() {
     removeAllOwnedPanels();
     closeWarningModal({ restoreFocus: false });
     removeOwnedWarningOverlays();
-  }
+    cachedPanelByPostId.clear();
+    postSignatureCache = new WeakMap(); 
+}
 
   function stopScanning() {
     pendingPosts.clear();
     selectedPostLinkCache.clear();
     observedPostIds.clear();
+    latestRequestByPostId.clear();
 
     if (flushTimer !== null) {
       window.clearTimeout(flushTimer);
@@ -1459,8 +1935,20 @@
       observer = null;
     }
 
+    if (scanRuntimeState.scrollListenerBound) {
+      window.removeEventListener("scroll", scheduleVisibleRescan, { passive: true });
+      scanRuntimeState.scrollListenerBound = false;
+    }
+
+    if (scanRuntimeState.clickInterceptionBound) {
+      document.removeEventListener("click", handleDocumentClickCapture, true);
+      scanRuntimeState.clickInterceptionBound = false;
+    }
+
     resetOwnedUiArtifacts();
   }
+
+  window.__DILI_STOP__ = stopScanning;
 
   function isFacebookWrapperHref(rawUrl) {
     try {
@@ -1478,6 +1966,10 @@
 
   function isEligibleLink(rawUrl) {
     try {
+      if (!String(rawUrl || "").trim()) {
+        return false;
+      }
+
       const url = new URL(rawUrl, location.href);
       if (!["http:", "https:"].includes(url.protocol)) {
         return false;
@@ -1491,8 +1983,26 @@
         return false;
       }
 
-      if (/facebook\.com$/i.test(url.hostname)) {
-        return isFacebookOutboundWrapper(url);
+      if (isFacebookHost(url.hostname)) {
+        if (!isFacebookOutboundWrapper(url)) {
+          return false;
+        }
+
+        if (isInternalFacebookMediaOrActionUrl(url.toString())) {
+          return false;
+        }
+
+        const unwrapped = unwrapFacebookRedirectUrl(url.toString());
+        if (isFacebookInAppFormUrl(unwrapped)) {
+          return false;
+        }
+
+        const targetHost = safeHostname(unwrapped);
+        return Boolean(targetHost) && !isFacebookHost(targetHost);
+      }
+
+      if (isFacebookInAppFormUrl(url.toString())) {
+        return false;
       }
 
       return true;
@@ -1502,8 +2012,17 @@
   }
 
   function renderBadge(post, viewModel) {
-    const mountPoint = getBadgeMountPoint(post);
-    let badge = post.querySelector(".dili-panel[data-dili-owned='true']");
+    const owningPost = getOwningPostContainer(post) || post;
+    const mountPoint = getBadgeMountPoint(owningPost);
+    const panels = [...owningPost.querySelectorAll(".dili-panel[data-dili-owned='true']")];
+    if (panels.length > 1) {
+      for (const extraPanel of panels.slice(1)) {
+        extraPanel.remove();
+        scanStatus.duplicatePanelsRemoved += 1;
+      }
+    }
+
+    let badge = owningPost.querySelector(".dili-panel[data-dili-owned='true']");
     if (!badge) {
       badge = document.createElement("div");
       badge.className = "dili-panel";
@@ -1511,11 +2030,7 @@
     }
 
     if (badge.parentElement !== mountPoint) {
-      if (shouldInsertBeforeActionBar(mountPoint, post)) {
-        mountPoint.parentElement.insertBefore(badge, mountPoint);
-      } else {
-        mountPoint.appendChild(badge);
-      }
+      mountPoint.appendChild(badge);
     }
 
     const severityLevel = normalizeInlineSeverityLevel(viewModel);
@@ -1553,54 +2068,27 @@
         <ul class="dili-detail-list">${detailItems || "<li>No detailed indicators recorded.</li>"}</ul>
       </details>
     `;
+
+    cachedPanelByPostId.set(getStablePostId(owningPost), viewModel);
+    scanStatus.renderedPanels += 1;
+    scanStatus.visiblePanels = document.querySelectorAll(".dili-panel[data-dili-owned='true']").length;
+    scanStatus.lastRenderedDomain = viewModel.finalDomain || viewModel.domain || "";
   }
 
   function mapAnalysisToViewModel(analysis) {
-    const details = [];
-    const seenDetails = new Set();
-
-    for (const item of analysis.deductions || []) {
-      if (item.triggered) {
-        pushUniqueAnalysisDetail(details, seenDetails, formatAnalysisDeductionDetail(item));
-      }
-    }
-
-    for (const note of analysis.redirectAnalysis?.notes || []) {
-      pushUniqueAnalysisDetail(details, seenDetails, note);
-    }
-
-    for (const note of analysis.analysisNotes || []) {
-      pushUniqueAnalysisDetail(details, seenDetails, note);
-    }
-
-    const gsb = findProviderResult(analysis.providerResults, "gsb");
-    const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
-
-    if (!gsb?.configured) {
-      pushUniqueAnalysisDetail(details, seenDetails, "Google Safe Browsing lookup was not configured.");
-    }
-
-    if (!urlhaus?.checked) {
-      pushUniqueAnalysisDetail(details, seenDetails, "URLhaus lookup could not be completed.");
-    } else if (urlhaus?.details?.authKeyConfigured === false || urlhaus?.details?.authConfigured === false) {
-      pushUniqueAnalysisDetail(details, seenDetails, "URLhaus was checked in public mode without an auth key.");
-    }
-
-    if (details.length === 0) {
-      pushUniqueAnalysisDetail(details, seenDetails, "No score deductions were triggered by the current heuristic set.");
-    }
-
     const severityLevel = normalizeInlineSeverityLevel({
       label: analysis.classification,
       state: analysis.state,
       safetyScore: analysis.safetyScore
     });
+    const details = buildPanelDetails(analysis);
 
     return {
       label: analysis.classification || "Unknown",
       safetyScore: analysis.safetyScore,
       state: analysis.state,
       severityLevel,
+      finalDomain: analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
       summaryLine: buildInlineSummaryLine(
         {
           label: analysis.classification || "Unknown",
@@ -1632,6 +2120,165 @@
       ),
       details
     };
+  }
+
+  function buildPanelDetails(analysis = {}) {
+    const details = [];
+    const seenDetails = new Set();
+    const finalDomain = analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || safeHostname(analysis.analysisUrl) || "unknown site";
+    const originalDomain = safeHostname(analysis.rawUrl || analysis.normalizedUrl) || analysis.endpointResult?.effectiveDomain || "unknown link";
+    const linkType = describeLinkType(analysis);
+    const scoreLabel = Number.isFinite(analysis.safetyScore) ? `score ${analysis.safetyScore}` : "no score";
+
+    pushUniqueAnalysisDetail(details, seenDetails, `Summary: Final site: ${finalDomain}.`);
+    pushUniqueAnalysisDetail(details, seenDetails, `Summary: Original link: ${originalDomain}.`);
+    pushUniqueAnalysisDetail(details, seenDetails, `Summary: Link type: ${linkType}.`);
+    pushUniqueAnalysisDetail(details, seenDetails, `Summary: Risk level: ${analysis.classification || "Unknown"} (${scoreLabel}).`);
+
+    const mainReasons = buildMainRiskReasons(analysis).slice(0, 5);
+    if (mainReasons.length > 0) {
+      for (const reason of mainReasons) {
+        pushUniqueAnalysisDetail(details, seenDetails, `Reason: ${reason}`);
+      }
+    } else {
+      pushUniqueAnalysisDetail(details, seenDetails, "Reason: No major risk reasons were found.");
+    }
+
+    for (const limitation of buildLimitations(analysis).slice(0, 5)) {
+      pushUniqueAnalysisDetail(details, seenDetails, `Limitation: ${limitation}`);
+    }
+
+    for (const detail of buildTechnicalDetails(analysis).slice(0, 6)) {
+      pushUniqueAnalysisDetail(details, seenDetails, `Technical: ${detail}`);
+    }
+
+    return details;
+  }
+
+  function buildMainRiskReasons(analysis = {}) {
+    const reasons = [];
+    for (const item of analysis.deductions || []) {
+      if (!item?.triggered || Number(item.deduction || 0) <= 0 || !item.label) {
+        continue;
+      }
+
+      if (isProviderErrorText(item.label) || isNormalWrapperText(item.label)) {
+        continue;
+      }
+
+      reasons.push(formatAnalysisDeductionDetail(item));
+    }
+
+    return reasons;
+  }
+
+  function buildLimitations(analysis = {}) {
+    const limitations = [];
+    for (const limitation of analysis.limitations || []) {
+      if (!limitation || isNormalWrapperText(limitation)) {
+        continue;
+      }
+      limitations.push(limitation);
+    }
+
+    const gsb = findProviderResult(analysis.providerResults, "gsb");
+    const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
+
+    if (!gsb?.configured) {
+      limitations.push("Google Safe Browsing is not configured.");
+    } else if (gsb?.details?.status === "error") {
+      limitations.push("Google Safe Browsing lookup returned an error.");
+    }
+
+    if (urlhaus?.details?.status === "error") {
+      limitations.push("URLhaus public lookup was unavailable.");
+    }
+
+    return [...new Set(limitations)];
+  }
+
+  function buildTechnicalDetails(analysis = {}) {
+    const details = [];
+    const endpoint = analysis.endpointResult || {};
+    const finalDomain = endpoint.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || safeHostname(analysis.analysisUrl) || "";
+    const chain = endpoint.resolutionChain || analysis.redirectAnalysis?.redirectChain || [];
+    const chainDomains = [...new Set(chain.map((url) => safeHostname(url)).filter(Boolean))];
+
+    for (const detail of analysis.technicalDetails || []) {
+      if (detail && !isNormalWrapperText(detail)) {
+        details.push(detail);
+      }
+    }
+
+    if (endpoint.isFacebookWrapper && finalDomain) {
+      details.push(`Facebook wrapper unwrapped to ${finalDomain}.`);
+    }
+
+    if (chainDomains.length > 1) {
+      details.push(`Redirect chain: ${chainDomains.join(" -> ")}.`);
+    }
+
+    if (analysis.urlFeatureAnalysis?.sourceNormalizedUrl && analysis.urlFeatureAnalysis?.sourceRawComparableUrl && analysis.urlFeatureAnalysis.sourceNormalizedUrl !== analysis.urlFeatureAnalysis.sourceRawComparableUrl) {
+      details.push("Tracking parameters were stripped for comparison.");
+    }
+
+    if (endpoint.endpointConfidence || analysis.endpointConfidence) {
+      details.push(`Endpoint confidence: ${endpoint.endpointConfidence || analysis.endpointConfidence}.`);
+    }
+
+    if (analysis.postIntegrityEvent) {
+      details.push(`Post integrity event: ${formatIntegrityEventLabel(analysis.postIntegrityEvent)}.`);
+    }
+
+    if (analysis.linkInsertedAfterBaseline) {
+      details.push("A link was inserted after a stored no-link baseline.");
+    }
+
+    if (analysis.baselineFirstSeenAt) {
+      details.push(`Baseline first seen: ${new Date(Number(analysis.baselineFirstSeenAt)).toISOString()}.`);
+    }
+
+    if (analysis.previousPostTextHash) {
+      details.push(`Previous post text hash: ${analysis.previousPostTextHash}.`);
+    }
+
+    if (analysis.currentPostTextHash) {
+      details.push(`Current post text hash: ${analysis.currentPostTextHash}.`);
+    }
+
+    for (const note of analysis.redirectAnalysis?.notes || []) {
+      if (!isNormalWrapperText(note)) {
+        details.push(note);
+      }
+    }
+
+    return [...new Set(details)];
+  }
+
+  function describeLinkType(analysis = {}) {
+    if (analysis.endpointResult?.isShortener || analysis.features?.shortenedUrl) {
+      return "Shortened external link";
+    }
+
+    if (analysis.endpointResult?.isFacebookWrapper) {
+      return "Facebook outbound wrapper";
+    }
+
+    return "External link";
+  }
+
+  function isProviderErrorText(text) {
+    return /not configured|lookup returned an error|lookup could not be completed|public lookup was unavailable|public mode/i.test(String(text || ""));
+  }
+
+  function isNormalWrapperText(text) {
+    return /facebook wrapper concealed|wrapper concealed an external destination|facebook wrapper unwrapped|facebook or tracking wrapper concealed/i.test(String(text || ""));
+  }
+
+  function formatIntegrityEventLabel(value) {
+    return String(value || "")
+      .replace(/_/g, " ")
+      .replace(/\b([a-z])/g, (match) => match.toUpperCase());
   }
 
   function formatAnalysisDeductionDetail(item) {
@@ -1700,7 +2347,7 @@
 
   function normalizeInlineSeverityLevel(viewModel = {}) {
     const explicit = String(viewModel.severityLevel || "").toLowerCase();
-    if (["safe", "suspicious", "high-risk", "unverified", "no-link"].includes(explicit)) {
+    if (["safe", "caution", "suspicious", "high-risk", "unverified", "no-link"].includes(explicit)) {
       return explicit;
     }
 
@@ -1718,7 +2365,11 @@
         return "safe";
       }
 
-      if (score >= 50) {
+      if (score >= 60) {
+        return "caution";
+      }
+
+      if (score >= 40) {
         return "suspicious";
       }
 
@@ -1743,6 +2394,10 @@
       return "high-risk";
     }
 
+    if (sourceText.includes("caution")) {
+      return "caution";
+    }
+
     if (sourceText.includes("suspicious") || sourceText.includes("warning")) {
       return "suspicious";
     }
@@ -1758,6 +2413,8 @@
     switch (severityLevel) {
       case "safe":
         return "Safe";
+      case "caution":
+        return "Caution";
       case "suspicious":
         return "Suspicious";
       case "high-risk":
@@ -1773,8 +2430,10 @@
     switch (severityLevel) {
       case "safe":
         return "SAFE";
-      case "suspicious":
+      case "caution":
         return "CAUTION";
+      case "suspicious":
+        return "SUSPICIOUS";
       case "high-risk":
         return "HIGH RISK";
       case "no-link":
@@ -1788,6 +2447,8 @@
     switch (severityLevel) {
       case "safe":
         return "No major warning signs were detected for this destination.";
+      case "caution":
+        return "This link has minor warning signs or limited verification.";
       case "suspicious":
         return "This link shows warning signs and should be opened carefully.";
       case "high-risk":
@@ -1818,6 +2479,7 @@
   function buildInlineActionHint(viewModel = {}, severityLevel = normalizeInlineSeverityLevel(viewModel)) {
     switch (severityLevel) {
       case "suspicious":
+      case "caution":
         return "Clicking this link may trigger a warning before navigation.";
       case "high-risk":
         return "DILI will pause navigation before opening this link.";
@@ -1829,7 +2491,7 @@
   }
 
   function buildInlineDetailsSummary(viewModel = {}, severityLevel = normalizeInlineSeverityLevel(viewModel)) {
-    if (severityLevel === "high-risk" || severityLevel === "suspicious" || severityLevel === "unverified") {
+    if (severityLevel === "high-risk" || severityLevel === "suspicious" || severityLevel === "caution" || severityLevel === "unverified") {
       return "Why this result was given";
     }
 
@@ -1849,22 +2511,93 @@
   }
 
   function getStablePostId(post) {
+    return getStablePostIdentity(post).id;
+  }
+
+  function getStablePostIdentity(post) {
     const cached = postIdCache.get(post);
     if (cached) {
-      return cached;
+      return typeof cached === "string"
+        ? { id: cached, stable: false, reason: "Legacy cached post id." }
+        : cached;
     }
 
     const permalink = findPermalink(post);
     const dataFt = post.getAttribute("data-ft") || post.dataset?.ft || "";
-    const aria = [post.getAttribute("aria-label"), post.getAttribute("aria-labelledby"), post.getAttribute("aria-posinset")]
+    const stableSource = extractStableFacebookPostToken(permalink) || extractStableFacebookPostToken(dataFt);
+    if (stableSource) {
+      const identity = {
+        id: `fb-${hashString(stableSource)}`,
+        stable: true,
+        reason: "Stable Facebook post identifier or permalink."
+      };
+      postIdCache.set(post, identity);
+      return identity;
+    }
+
+    const authorText = extractAuthorText(post);
+    const previewDomainText = extractPreviewDomainText(post);
+    const ctaText = extractCtaText(post);
+    const sponsoredMarker = /\bsponsored\b/i.test(post.textContent || "") ? "sponsored" : "";
+    const cleanedPostText = String(post.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 160);
+    const timestampText = extractTimestampText(post);
+    const source = [authorText, sponsoredMarker, cleanedPostText, timestampText, previewDomainText, ctaText]
       .filter(Boolean)
       .join("|");
-    const domPath = buildDomPath(post);
-    const source = [permalink, dataFt, aria, domPath].filter(Boolean).join("::") || domPath;
-    const postId = `post-${hashString(source)}`;
+    const identity = {
+      id: `session-${sponsoredMarker || "post"}-${hashString(source || cleanedPostText || "unknown-post")}`,
+      stable: false,
+      reason: "Session-only deterministic post fingerprint."
+    };
 
-    postIdCache.set(post, postId);
-    return postId;
+    postIdCache.set(post, identity);
+    return identity;
+  }
+
+  function extractStableFacebookPostToken(value) {
+    const source = String(value || "");
+    const patterns = [
+      /story_fbid[=:]([0-9]+)/i,
+      /\/posts\/([0-9]+)/i,
+      /\/videos\/([0-9]+)/i,
+      /\/reel\/([0-9]+)/i,
+      /fbid[=:]([0-9]+)/i,
+      /\/permalink\/([0-9]+)/i
+    ];
+
+    for (const pattern of patterns) {
+      const match = source.match(pattern);
+      if (match?.[1]) {
+        return match[0].toLowerCase();
+      }
+    }
+
+    return "";
+  }
+
+  function extractAuthorText(post) {
+    const heading = post.querySelector('h2, h3, strong, [role="heading"]');
+    return String(heading?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  }
+
+  function extractTimestampText(post) {
+    const time = post.querySelector("time, abbr, a[href*='/posts/'], a[href*='story_fbid']");
+    return String(time?.textContent || time?.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  }
+
+  function extractPreviewDomainText(post) {
+    const text = String(post.textContent || "");
+    const match = text.match(DOMAIN_TEXT_PATTERN);
+    return match ? match[0].toLowerCase() : "";
+  }
+
+  function extractCtaText(post) {
+    const text = String(post.textContent || "").replace(/\s+/g, " ");
+    const pattern = CTA_TEXT_PATTERNS.find((item) => item.test(text));
+    return pattern ? String(pattern).replace(/[\\/bi^$]/g, "").slice(0, 40) : "";
   }
 
   function findPermalink(post) {
@@ -1897,39 +2630,443 @@
     }
 
     if (linkInfo.candidateContext?.signature) {
-      return linkInfo.candidateContext.signature;
+      return `${linkInfo.candidateContext.signature}|${linkInfo.linkFingerprint || ""}`;
     }
 
     return linkInfo.normalizedTargetUrl || linkInfo.url || "unknown-link";
   }
 
   function findPostContainer(node) {
-    if (!(node instanceof Element)) {
-      return null;
-    }
-
-    return node.closest(POST_SELECTORS.join(","));
+    return getCanonicalPost(node);
   }
 
   function getBadgeMountPoint(post) {
-    for (const selector of MAIN_POST_CONTENT_SELECTORS) {
-      const matches = [...post.querySelectorAll(selector)].filter((element) => {
-        return element instanceof Element && !element.closest(".dili-panel");
+    return ensurePanelSlot(post);
+  }
+
+  function getArticleAncestors(element) {
+    const ancestors = [];
+    let current = element instanceof Element ? element : null;
+
+    while (current instanceof Element) {
+      if (isPostContainerCandidate(current)) {
+        ancestors.push(current);
+      }
+
+      current = current.parentElement;
+    }
+
+    return ancestors.reverse();
+  }
+
+  function isPostContainerCandidate(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    return POST_SELECTORS.some((selector) => element.matches(selector));
+  }
+
+  function isLikelyFeedPost(element) {
+    if (!(element instanceof Element) || !element.isConnected || !isProbablyVisible(element) || isExcludedSurface(element)) {
+      return false;
+    }
+
+if (
+  isLikelyCommentOrReplyContainer(element) ||
+  isLikelyEmbeddedPreviewContainer(element) ||
+  isLikelyActionBarOrControlContainer(element)
+) {
+  return false;
+}
+
+    const rect = element.getBoundingClientRect();
+    if (rect.width < 180 || rect.height < 120) {
+      return false;
+    }
+
+    return hasPostAuthorHeader(element) && hasPostBodyOrAttachment(element);
+  }
+
+  function hasPostAuthorHeader(post) {
+    return Boolean(findPostHeader(post) || extractAuthorText(post));
+  }
+
+  function hasPostBodyOrAttachment(post) {
+    return Boolean(findPostCaption(post) || findPostAttachmentOrPreview(post) || extractVisiblePostText(post).length >= 24);
+  }
+
+  function isLikelyCommentOrReplyContainer(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    const utilityText = buildCandidateUtilityText(element);
+    return /\b(comment|reply|replies|responses|thread)\b/i.test(utilityText);
+  }
+
+  function isLikelyEmbeddedPreviewContainer(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    const utilityText = buildCandidateUtilityText(element);
+    if (/\b(carousel|preview|attachment|embedded card|link preview|shared link|promo card)\b/i.test(utilityText)) {
+      return true;
+    }
+
+    return Boolean(element.matches('[data-ad-preview]:not([data-ad-preview="message"]), [data-ad-comet-preview]:not([data-ad-comet-preview="message"])'));
+  }
+
+  function isLikelyActionBarOrControlContainer(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    return EXCLUDED_CANDIDATE_CONTROL_PATTERNS.some((pattern) => pattern.test(buildCandidateUtilityText(element)));
+  }
+
+  function getCanonicalPost(element) {
+    const ancestors = getArticleAncestors(element);
+    if (ancestors.length === 0) {
+      return null;
+    }
+
+    const rankedCandidates = ancestors
+      .map((candidate, index) => ({
+        candidate,
+        index,
+        score: scoreCanonicalPostCandidate(candidate)
+      }))
+      .filter((item) => item.score >= 0);
+
+    if (rankedCandidates.length === 0) {
+      return null;
+    }
+
+    const strongestScore = Math.max(...rankedCandidates.map((item) => item.score));
+    const acceptableCandidates = rankedCandidates.filter((item) => item.score >= strongestScore - 8);
+
+    return acceptableCandidates.sort((left, right) => left.index - right.index)[0]?.candidate || null;
+  }
+
+  function scoreCanonicalPostCandidate(candidate) {
+    if (!(candidate instanceof Element) || !candidate.isConnected || !isProbablyVisible(candidate) || isExcludedSurface(candidate)) {
+      return -1;
+    }
+
+    if (isLikelyCommentOrReplyContainer(candidate) || isLikelyEmbeddedPreviewContainer(candidate) || isLikelyActionBarOrControlContainer(candidate)) {
+      return -1;
+    }
+
+    const rect = candidate.getBoundingClientRect();
+    const textLength = extractVisiblePostText(candidate).length;
+    let score = 0;
+
+    if (candidate.matches('div[role="article"]')) {
+      score += 25;
+    }
+
+    if (candidate.matches('article')) {
+      score += 18;
+    }
+
+    if (candidate.matches('[data-pagelet*="FeedUnit"]')) {
+      score += 14;
+    }
+
+    if (candidate.matches('[aria-posinset]')) {
+      score += 8;
+    }
+
+    if (hasPostAuthorHeader(candidate)) {
+      score += 28;
+    }
+
+    if (hasPostBodyOrAttachment(candidate)) {
+      score += 24;
+    }
+
+    if (candidate.closest('[role="feed"], [role="main"]')) {
+      score += 8;
+    }
+
+    if (textLength > 60) {
+      score += 8;
+    } else if (textLength > 20) {
+      score += 4;
+    }
+
+    if (rect.width > 300 && rect.height > 180) {
+      score += 6;
+    }
+
+    if (candidate.querySelector('time, abbr, a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[href*="fbid="]')) {
+      score += 10;
+    }
+
+    return score;
+  }
+
+  function findPostHeader(post) {
+    if (!(post instanceof Element)) {
+      return null;
+    }
+
+    const selectors = [
+      "header",
+      '[role="heading"]',
+      "h1",
+      "h2",
+      "h3",
+      "time",
+      "abbr",
+      'a[href*="/posts/"]',
+      'a[href*="/permalink/"]',
+      'a[href*="story_fbid"]',
+      'a[href*="fbid="]'
+    ];
+    const bodySelectors = [
+      '[data-ad-preview="message"]',
+      '[data-ad-comet-preview="message"]',
+      '[data-testid="post_message"]'
+    ].join(",");
+
+    for (const selector of selectors) {
+      const match = [...post.querySelectorAll(selector)].find((element) => {
+        if (!(element instanceof Element) || !post.contains(element) || !isProbablyVisible(element)) {
+          return false;
+        }
+
+        if (element.closest(bodySelectors) || isLikelyActionBarOrControlContainer(element) || isLikelyCommentOrReplyContainer(element)) {
+          return false;
+        }
+
+        return extractAnchorDisplayText(element).length > 0 || element.tagName === "TIME" || element.tagName === "ABBR" || Boolean(element.querySelector('img, svg, picture'));
       });
 
-      const bestMatch = matches.find((element) => isUsefulMountNode(element, post));
-      if (bestMatch) {
-        return bestMatch;
+      if (match) {
+        return match;
       }
     }
 
-    const actionBar = findActionBar(post);
-    if (actionBar) {
-      return actionBar;
+    return null;
+  }
+
+  function findPostCaption(post) {
+    if (!(post instanceof Element)) {
+      return null;
     }
 
-    const firstBlock = [...post.children].find((child) => child instanceof Element && !child.classList.contains("dili-panel"));
-    return firstBlock || post;
+    for (const selector of MAIN_POST_CONTENT_SELECTORS) {
+      const match = [...post.querySelectorAll(selector)].find((element) => {
+        if (!(element instanceof Element) || !post.contains(element) || !isProbablyVisible(element)) {
+          return false;
+        }
+
+        if (isLikelyActionBarOrControlContainer(element) || isLikelyCommentOrReplyContainer(element)) {
+          return false;
+        }
+
+        return extractVisiblePostText(element).length >= 2;
+      });
+
+      if (match) {
+        return match;
+      }
+    }
+
+    return null;
+  }
+
+  function findPostAttachmentOrPreview(post) {
+    if (!(post instanceof Element)) {
+      return null;
+    }
+
+    const selectors = [
+      '[data-ad-preview]',
+      '[data-ad-comet-preview]',
+      'img',
+      'video',
+      'picture',
+      '[aria-label*="carousel"]',
+      '[aria-label*="preview"]',
+      '[role="link"]'
+    ];
+
+    for (const selector of selectors) {
+      const match = [...post.querySelectorAll(selector)].find((element) => {
+        if (!(element instanceof Element) || !post.contains(element) || !isProbablyVisible(element)) {
+          return false;
+        }
+
+        if (isLikelyActionBarOrControlContainer(element) || isLikelyCommentOrReplyContainer(element)) {
+          return false;
+        }
+
+        if (selector === '[role="link"]' && extractVisiblePostText(element).length < 2 && !element.querySelector('img, video, picture, svg')) {
+          return false;
+        }
+
+        return true;
+      });
+
+      if (match) {
+        return match;
+      }
+    }
+
+    return null;
+  }
+
+  function findPanelInsertionPoint(post) {
+    const headerBlock = findPostHeaderBlock(post);
+    if (headerBlock?.parentElement instanceof Element) {
+      return {
+        parent: headerBlock.parentElement,
+        beforeNode: headerBlock.nextSibling || null
+      };
+    }
+
+    const caption = findPostCaption(post);
+    if (caption?.parentElement instanceof Element) {
+      return {
+        parent: caption.parentElement,
+        beforeNode: caption
+      };
+    }
+
+    const attachment = findPostAttachmentOrPreview(post);
+    if (attachment?.parentElement instanceof Element) {
+      return {
+        parent: attachment.parentElement,
+        beforeNode: attachment
+      };
+    }
+
+    return {
+      parent: post,
+      beforeNode: post.firstElementChild || null
+    };
+  }
+
+  function findPostHeaderBlock(post) {
+    const header = findPostHeader(post);
+    if (!(header instanceof Element) || !post.contains(header)) {
+      return null;
+    }
+
+    let block = header;
+    while (block.parentElement instanceof Element && block.parentElement !== post) {
+      const parent = block.parentElement;
+      if (parent.querySelector('[data-ad-preview="message"], [data-ad-comet-preview="message"], [data-testid="post_message"]')) {
+        break;
+      }
+
+      const parentText = extractVisiblePostText(parent);
+      if (parentText.length > 260) {
+        break;
+      }
+
+      block = parent;
+    }
+
+    return block;
+  }
+
+  function ensurePanelSlot(post) {
+    const ownedSlots = [...post.querySelectorAll(".dili-panel-slot[data-dili-owned='true']")];
+    let slot = ownedSlots[0] || null;
+
+    for (const extraSlot of ownedSlots.slice(1)) {
+      extraSlot.remove();
+      scanStatus.duplicatePanelsRemoved += 1;
+    }
+
+    if (!slot) {
+      slot = document.createElement("div");
+      slot.className = "dili-panel-slot";
+      slot.dataset.diliOwned = "true";
+    }
+
+    const insertionPoint = findPanelInsertionPoint(post);
+    if (slot.parentElement !== insertionPoint.parent || slot.nextSibling !== insertionPoint.beforeNode) {
+      if (insertionPoint.beforeNode instanceof Node) {
+        insertionPoint.parent.insertBefore(slot, insertionPoint.beforeNode);
+      } else {
+        insertionPoint.parent.appendChild(slot);
+      }
+    }
+
+    cleanupDuplicatePanelArtifacts(post, slot);
+    return slot;
+  }
+
+  function cleanupDuplicatePanelArtifacts(post, activeSlot) {
+    const activePanel = activeSlot?.querySelector(".dili-panel[data-dili-owned='true']") || null;
+
+    for (const panel of [...post.querySelectorAll(".dili-panel[data-dili-owned='true']")]) {
+      if (panel !== activePanel) {
+        panel.remove();
+        scanStatus.duplicatePanelsRemoved += 1;
+      }
+    }
+
+    for (const badge of [...post.querySelectorAll(".dili-badge")]) {
+      if (!badge.closest(".dili-panel[data-dili-owned='true']")) {
+        badge.remove();
+        scanStatus.duplicatePanelsRemoved += 1;
+      }
+    }
+  }
+
+  function extractVisiblePostText(post) {
+    if (!(post instanceof Element)) {
+      return "";
+    }
+
+    const clone = post.cloneNode(true);
+    for (const selector of [".dili-panel", ".dili-panel-slot", ".dili-badge", ".dili-details", ".dili-warning-overlay", ".dili-warning-modal", "script", "style", "noscript"]) {
+      for (const element of clone.querySelectorAll(selector)) {
+        element.remove();
+      }
+    }
+
+    return String(clone.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  async function buildVisiblePostTextSnapshot(post) {
+    const normalizedVisiblePostText = extractVisiblePostText(post);
+    const postTextHash = await hashTextFingerprint(normalizedVisiblePostText);
+
+    return {
+      normalizedVisiblePostText,
+      postTextHash
+    };
+  }
+
+  async function hashTextFingerprint(value) {
+    const text = String(value || "");
+
+    try {
+      if (crypto?.subtle?.digest) {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+        return [...new Uint8Array(digest)].map((item) => item.toString(16).padStart(2, "0")).join("");
+      }
+    } catch {
+      // Fall back to the lightweight local hash below.
+    }
+
+    return `fnv-${hashString(text)}`;
+  }
+
+  function formatIntegrityEventLabel(value) {
+    return String(value || "")
+      .replace(/_/g, " ")
+      .replace(/\b([a-z])/g, (match) => match.toUpperCase());
   }
 
   function findActionBar(post) {
@@ -1975,7 +3112,91 @@
   }
 
   function isFacebookOutboundWrapper(url) {
-    return ["l.facebook.com", "lm.facebook.com"].includes(url.hostname.toLowerCase()) && Boolean(url.searchParams.get("u") || url.searchParams.get("url"));
+    if (!FACEBOOK_REDIRECT_HOSTS.has(url.hostname.toLowerCase())) {
+      return false;
+    }
+
+    const targetUrl = getFacebookRedirectTarget(url.toString());
+    if (!targetUrl) {
+      return false;
+    }
+
+    const targetHost = safeHostname(targetUrl);
+    return Boolean(targetHost) && !isFacebookHost(targetHost);
+  }
+
+  function isFacebookHost(hostname) {
+    return /(^|\.)facebook\.com$/i.test(String(hostname || ""));
+  }
+
+  function isFacebookInAppFormUrl(rawUrl) {
+    try {
+      if (!String(rawUrl || "").trim()) {
+        return false;
+      }
+
+      const url = new URL(rawUrl, location.href);
+      const host = url.hostname.toLowerCase();
+      const path = url.pathname.toLowerCase();
+      const source = `${host}${path}?${url.searchParams.toString()}`.toLowerCase();
+
+      if (!isFacebookHost(host)) {
+        return false;
+      }
+
+      return (
+        path.includes("/lead_gen") ||
+        path.includes("/leadgen") ||
+        path.includes("/ads/lead") ||
+        path.includes("/instant_form") ||
+        path.includes("/instantforms") ||
+        path.includes("/forms/") ||
+        path.includes("/event_register") ||
+        path.includes("/events/register") ||
+        source.includes("lead_gen") ||
+        source.includes("leadgen") ||
+        source.includes("instant_form") ||
+        source.includes("registration_form") ||
+        source.includes("event_registration")
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function isInternalFacebookMediaOrActionUrl(rawUrl) {
+    try {
+      if (!String(rawUrl || "").trim()) {
+        return false;
+      }
+
+      const url = new URL(rawUrl, location.href);
+      if (!isFacebookHost(url.hostname)) {
+        return false;
+      }
+
+      const path = url.pathname.toLowerCase();
+      const source = `${path}?${url.searchParams.toString()}`.toLowerCase();
+      return (
+        path.startsWith("/watch") ||
+        path.startsWith("/reel") ||
+        path.includes("/reel/") ||
+        path.includes("/videos/") ||
+        path.includes("/photo") ||
+        path.includes("/photos/") ||
+        path.includes("/profile.php") ||
+        path.includes("/share/") ||
+        path.includes("/shares/") ||
+        path.includes("/comment") ||
+        path.includes("/plugins/") ||
+        path.includes("/ufi/") ||
+        source.includes("comment_id=") ||
+        source.includes("reply_comment_id=") ||
+        source.includes("reaction_type=")
+      );
+    } catch {
+      return false;
+    }
   }
 
   function safelyNormalizeComparableUrl(rawUrl) {
@@ -2036,18 +3257,48 @@
         return inputUrl.toString();
       }
 
-      const nested = inputUrl.searchParams.get("u") || inputUrl.searchParams.get("url");
+      const nested = getFacebookRedirectTarget(inputUrl.toString());
       if (!nested) {
         return inputUrl.toString();
       }
 
-      try {
-        return decodeURIComponent(nested);
-      } catch {
-        return nested;
-      }
+      return nested;
     } catch {
       return String(rawUrl || "");
+    }
+  }
+
+  function getFacebookRedirectTarget(rawUrl) {
+    try {
+      const inputUrl = new URL(rawUrl, location.origin);
+      if (!FACEBOOK_REDIRECT_HOSTS.has(inputUrl.hostname.toLowerCase())) {
+        return "";
+      }
+
+      for (const paramName of FACEBOOK_REDIRECT_PARAMS) {
+        const nested = inputUrl.searchParams.get(paramName);
+        if (!nested) {
+          continue;
+        }
+
+        const decoded = decodeRedirectTarget(nested);
+        const targetHost = safeHostname(decoded);
+        if (targetHost && !isFacebookHost(targetHost)) {
+          return decoded;
+        }
+      }
+
+      return "";
+    } catch {
+      return "";
+    }
+  }
+
+  function decodeRedirectTarget(value) {
+    try {
+      return decodeURIComponent(String(value || ""));
+    } catch {
+      return String(value || "");
     }
   }
 
@@ -2083,6 +3334,15 @@
   }
 
   async function sendRuntimeMessage(message) {
+    if (scanRuntimeState.extensionContextInvalidated || isRuntimeInvalidated()) {
+      invalidateRuntimeContext();
+      return {
+        ok: false,
+        runtimeInvalidated: true,
+        error: "Extension context invalidated."
+      };
+    }
+
     try {
       const response = await chrome.runtime.sendMessage(message);
       if (!response?.ok) {
@@ -2090,12 +3350,51 @@
       }
       return response;
     } catch (error) {
+      if (isRuntimeInvalidationError(error)) {
+        invalidateRuntimeContext();
+        return {
+          ok: false,
+          runtimeInvalidated: true,
+          error: "Extension context invalidated."
+        };
+      }
+
       console.warn("[DILI] Message dispatch failed", error);
       return {
         ok: false,
         error: error.message || "Runtime messaging failed."
       };
     }
+  }
+
+  function isRuntimeInvalidated() {
+    return typeof chrome === "undefined" || !chrome.runtime?.id;
+  }
+
+  function isRuntimeInvalidationError(error) {
+    const message = String(error?.message || error || "");
+    return /Extension context invalidated|context invalidated|Invalid extension context/i.test(message);
+  }
+
+  function invalidateRuntimeContext() {
+    if (scanRuntimeState.extensionContextInvalidated) {
+      return;
+    }
+
+    scanRuntimeState.extensionContextInvalidated = true;
+    scanRuntimeState.enabled = false;
+    scanStatus.enabled = false;
+    scanStatus.lastError = "Extension context invalidated.";
+    console.debug("[DILI] Extension context invalidated; stopping old content script instance.");
+    stopScanning();
+  }
+
+  function buildScanStatusSnapshot() {
+    scanStatus.enabled = scanRuntimeState.enabled && !scanRuntimeState.extensionContextInvalidated;
+    scanStatus.visiblePanels = document.querySelectorAll(".dili-panel[data-dili-owned='true']").length;
+    scanStatus.queuedPosts = pendingPosts.size;
+    scanStatus.route = location.href;
+    return { ...scanStatus };
   }
 
   async function getScanEnabledState() {

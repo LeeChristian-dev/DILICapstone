@@ -1,6 +1,7 @@
-import { GSB_API_KEY, URLHAUS_AUTH_KEY } from "./config.local.js";
+import { GSB_API_KEY, URLHAUS_API_KEY, URLHAUS_AUTH_KEY } from "./config.local.js";
 import { calculateSafetyScore, classifySafetyScore } from "./riskEngine.js";
 import { sha256Hex } from "./utils/hash.js";
+import { resolveEndpoint } from "./utils/endpointResolver.js";
 import { analyzeRedirects } from "./utils/redirectAnalyzer.js";
 import { analyzeUrlFeatures, detectDomainMismatch, getRegistrableDomain, normalizeUrl } from "./utils/urlAnalyzer.js";
 import {
@@ -36,7 +37,7 @@ const MESSAGE_TYPES = {
 
 const providerHealth = createInitialProviderHealth();
 const runtimeConfig = createRuntimeConfig();
-const CURRENT_ANALYSIS_SCHEMA_VERSION = 3;
+const CURRENT_ANALYSIS_SCHEMA_VERSION = 4;
 const SESSION_TTL_MS = 60 * 60 * 1000;
 const URL_ANALYSIS_CACHE_TTL_MS = 10 * 60 * 1000;
 const urlAnalysisCache = new Map();
@@ -84,10 +85,14 @@ async function handleMessage(message) {
       };
 
     case MESSAGE_TYPES.SET_SCAN_STATE:
-      return {
-        type: MESSAGE_TYPES.SET_SCAN_STATE,
-        scanEnabled: await setScanEnabledState(message?.enabled !== false)
-      };
+      {
+        const scanEnabled = await setScanEnabledState(message?.enabled !== false);
+        await notifyActiveFacebookTabScanState(scanEnabled);
+        return {
+          type: MESSAGE_TYPES.SET_SCAN_STATE,
+          scanEnabled
+        };
+      }
 
     case MESSAGE_TYPES.ANALYZE_LINK:
       return {
@@ -95,8 +100,11 @@ async function handleMessage(message) {
         analysis: await performLinkAnalysis({
           postId: message.postId,
           rawUrl: message.url,
+          links: message.links,
           displayedText: message.displayedText,
           candidateContext: message.candidateContext,
+          postTextHash: message.postTextHash,
+          normalizedVisiblePostText: message.normalizedVisiblePostText,
           isReanalysis: false
         })
       };
@@ -107,8 +115,11 @@ async function handleMessage(message) {
         analysis: await performLinkAnalysis({
           postId: message.postId,
           rawUrl: message.url,
+          links: message.links,
           displayedText: message.displayedText,
           candidateContext: message.candidateContext,
+          postTextHash: message.postTextHash,
+          normalizedVisiblePostText: message.normalizedVisiblePostText,
           isReanalysis: true
         })
       };
@@ -160,24 +171,134 @@ async function handleMessage(message) {
 
 async function setNoLinkState(message) {
   const baseline = await getBaseline(message.postId);
-  const state = baseline?.urlHash ? "monitored" : "no_link";
+  const now = Date.now();
+  const firstSeenAt = Number(baseline?.firstSeenAt || baseline?.baselineFirstSeenAt || now);
+  const postTextHash = String(message.postTextHash || baseline?.postTextHash || "");
+  const normalizedVisiblePostText = String(message.normalizedVisiblePostText || baseline?.normalizedVisiblePostText || "");
 
   return updatePostAnalysis(message.postId, {
-    state,
-    classification: baseline?.classification || null,
-    safetyScore: baseline?.safetyScore ?? null,
-    features: baseline?.features || null,
-    lastChecked: Date.now(),
+    analysisSchemaVersion: CURRENT_ANALYSIS_SCHEMA_VERSION,
+    baselineState: "no_link",
+    hadLinkAtBaseline: false,
+    firstSeenAt,
+    baselineFirstSeenAt: firstSeenAt,
+    lastSeenAt: now,
+    lastChecked: now,
+    state: "no_link",
+    classification: "No Link",
+    safetyScore: null,
+    urlHash: "",
+    normalizedUrl: "",
+    analysisUrl: "",
+    rawUrl: "",
+    providerResults: [],
+    deductions: [],
+    technicalDetails: [],
+    redirectAnalysis: {
+      redirectCount: 0,
+      redirectChain: [],
+      notes: []
+    },
+    candidateContext: null,
+    endpointConfidence: "",
+    providerOverride: false,
+    features: {
+      noLinkBaseline: true,
+      linkInsertedAfterBaseline: false,
+      integrityHashMismatch: false
+    },
+    postTextHash,
+    normalizedVisiblePostText,
     postId: message.postId
   });
 }
 
-async function performLinkAnalysis({ postId, rawUrl, displayedText, candidateContext, isReanalysis }) {
+async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candidateContext, postTextHash, normalizedVisiblePostText, isReanalysis }) {
+  const linkInputs = Array.isArray(links) && links.length > 0
+    ? links.slice(0, 8)
+    : [{
+      url: rawUrl,
+      displayText: displayedText,
+      candidateContext
+    }];
+  const analyses = [];
+  const limitations = [];
+
+  for (let index = 0; index < linkInputs.length; index += 1) {
+    const link = linkInputs[index] || {};
+    try {
+      const analysis = await performSingleLinkAnalysis({
+        postId,
+        rawUrl: link.url || rawUrl,
+        displayedText: link.displayText || displayedText,
+        candidateContext: link.candidateContext || candidateContext,
+        postTextHash,
+        normalizedVisiblePostText,
+        isReanalysis,
+        persist: false
+      });
+      analyses.push(analysis);
+    } catch (error) {
+      limitations.push(`Link ${index + 1} analysis failed: ${safeErrorMessage(error, "Unknown link analysis error.")}`);
+    }
+  }
+
+  if (analyses.length === 0) {
+    throw new Error(limitations[0] || "No links could be analyzed.");
+  }
+
+  const worst = analyses
+    .slice()
+    .sort((left, right) => {
+      const leftScore = Number.isFinite(left.safetyScore) ? left.safetyScore : 101;
+      const rightScore = Number.isFinite(right.safetyScore) ? right.safetyScore : 101;
+      return leftScore - rightScore;
+    })[0];
+  const persistedWorst = await persistPostLevelAnalysis(postId, worst);
+
+  return {
+    ...persistedWorst,
+    linkAnalyses: analyses.map(compactLiveLinkAnalysis),
+    analyzedLinkCount: analyses.length,
+    failedLinkLimitations: limitations,
+    limitations: [...(worst.limitations || []), ...limitations].slice(0, 8)
+  };
+}
+
+async function performSingleLinkAnalysis({ postId, rawUrl, displayedText, candidateContext, postTextHash, normalizedVisiblePostText, isReanalysis, persist = true }) {
   if (!(await getScanEnabledState())) {
     throw new Error("Scanning is currently disabled.");
   }
 
   await ensureActiveSession("analysis");
+
+  const endpointResult = await resolveEndpoint(rawUrl);
+  if (endpointResult.isInternalFacebook) {
+    return {
+      postId,
+      rawUrl,
+      normalizedUrl: endpointResult.normalizedRawUrl,
+      analysisUrl: endpointResult.effectiveEndpoint,
+      classification: "Unverified",
+      safetyScore: null,
+      endpointResult,
+      endpointConfidence: endpointResult.endpointConfidence,
+      limitations: ["Internal Facebook link ignored."],
+      features: {
+        internalFacebook: true
+      },
+      deductions: [],
+      providerResults: [createDefaultProviderResult("gsb"), createDefaultProviderResult("urlhaus")],
+      redirectAnalysis: {
+        redirectCount: 0,
+        redirectChain: endpointResult.resolutionChain,
+        notes: endpointResult.warnings
+      },
+      state: "internal-facebook",
+      analysisMode: "internal-facebook-ignored",
+      reusedClassification: false
+    };
+  }
 
   const urlFeatures = analyzeUrlFeatures({
     rawUrl
@@ -190,13 +311,14 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, candidateCon
     logDebug(`Legacy baseline detected for ${postId}; integrity comparison skipped for this scan.`);
   }
 
-  const reusableUrlAnalysis = await getReusableUrlAnalysis(rawUrl, urlFeatures);
+  const reusableUrlAnalysis = normalizeReusableUrlAnalysis(await getReusableUrlAnalysis(rawUrl, urlFeatures, endpointResult, endpointResult?.redirectAnalysis));
   const analysisUrl = reusableUrlAnalysis.analysisUrl;
   const redirectAnalysis = reusableUrlAnalysis.redirectAnalysis;
-  const providerResults = reusableUrlAnalysis.providerResults;
+  const providerResults = normalizeProviderResults(reusableUrlAnalysis.providerResults);
   const domain = reusableUrlAnalysis.domain || safeHostname(analysisUrl || normalizedUrl);
   const normalizedCandidateContext = buildCandidateContext(candidateContext, {
     analysisUrl,
+    endpointResult,
     normalizedUrl,
     domain
   });
@@ -206,17 +328,27 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, candidateCon
   }));
   const textComparison = detectDomainMismatch(displayedText || "", analysisUrl);
   const domainPreviouslyFlagged = await checkDomainPreviouslyFlagged(domain);
-  const gsbResult = providerResults.find((item) => item.provider === "gsb") || createDefaultProviderResult("gsb");
-  const urlhausResult = providerResults.find((item) => item.provider === "urlhaus") || createDefaultProviderResult("urlhaus");
+  const gsbResult = getNormalizedProviderResult(providerResults, "gsb");
+  const urlhausResult = getNormalizedProviderResult(providerResults, "urlhaus");
+  const detectedAt = Date.now();
+  const baselineFirstSeenAt = Number(existingBaseline?.baselineFirstSeenAt || existingBaseline?.firstSeenAt || detectedAt);
+  const currentPostTextHash = String(postTextHash || "");
+  const normalizedCurrentPostText = String(normalizedVisiblePostText || "").replace(/\s+/g, " ").trim();
+  const hadNoLinkBaseline = Boolean(
+    (compatibleBaseline?.baselineState || existingBaseline?.baselineState) === "no_link" ||
+    existingBaseline?.hadLinkAtBaseline === false
+  );
+  const linkInsertedAfterBaseline = Boolean(isReanalysis && hadNoLinkBaseline);
+  const previousPostTextHash = String(existingBaseline?.postTextHash || existingBaseline?.currentPostTextHash || "");
   const postContextFeatures = {
     domainPreviouslyFlagged,
     textMismatch: textComparison.mismatch,
-    integrityHashMismatch: Boolean(isReanalysis && hasCompatibleIntegrityMismatch(compatibleBaseline, {
+    integrityHashMismatch: Boolean(linkInsertedAfterBaseline || (isReanalysis && compatibleBaseline?.postIdentityStable === true && normalizedCandidateContext.candidateMode === "single" && hasCompatibleIntegrityMismatch(compatibleBaseline, {
       currentHash,
       analysisUrl,
       normalizedUrl,
       candidateContext: normalizedCandidateContext
-    }))
+    })))
   };
   const enrichedUrlFeatures = {
     ...reusableUrlAnalysis.urlFeatureAnalysis,
@@ -227,28 +359,50 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, candidateCon
     displayTextLooksLikeDomain: textComparison.displayTextLooksLikeDomain,
     genericDisplayText: textComparison.genericText,
     textMismatch: postContextFeatures.textMismatch,
-    wrapperToExternalDestination: Boolean(reusableUrlAnalysis.urlFeatureAnalysis.wrapperToExternalDestination || redirectAnalysis.wrapperToExternalDestination)
+    wrapperToExternalDestination: shouldApplyWrapperRisk({
+      endpointResult,
+      redirectAnalysis,
+      urlFeatureAnalysis: reusableUrlAnalysis.urlFeatureAnalysis,
+      providerResults,
+      textMismatch: postContextFeatures.textMismatch
+    }),
+    facebookWrapperUnwrapped: Boolean(endpointResult.isFacebookWrapper && !endpointResult.isInternalFacebook)
   };
   const urlLevelFeaturesBase = {
     ...reusableUrlAnalysis.urlLevelFeatures,
     wrapperToExternalDestination: enrichedUrlFeatures.wrapperToExternalDestination
   };
-  const urlLevelFeatures = {
+  const urlLevelFeatures = applyMainstreamResolvedShortlinkMitigation({
     ...urlLevelFeaturesBase,
     trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(urlLevelFeaturesBase)
-  };
+  }, reusableUrlAnalysis, endpointResult);
   const combinedFeaturesBase = {
     ...urlLevelFeatures,
     ...postContextFeatures
   };
-  const features = {
+  const features = applyMainstreamResolvedShortlinkMitigation({
     ...combinedFeaturesBase,
     trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(combinedFeaturesBase)
-  };
+  }, reusableUrlAnalysis, endpointResult);
   const urlLevelScoring = calculateSafetyScore(urlLevelFeatures);
-  const urlLevelClassification = classifySafetyScore(urlLevelScoring.score);
+  const providerOverride = Boolean(gsbResult.flagged || urlhausResult.flagged);
+  const urlLevelClassification = providerOverride ? "High Risk" : classifySafetyScore(urlLevelScoring.score);
   const scoring = calculateSafetyScore(features);
-  const classification = classifySafetyScore(scoring.score);
+  const endpointResolutionFailed = Boolean(
+    !endpointResult?.effectiveEndpoint ||
+    endpointResult?.resolutionMethod === "missing-url" ||
+    endpointResult?.resolutionMethod === "invalid-url" ||
+    (endpointResult?.endpointConfidence === "low" && !endpointResult?.redirectAnalysis?.resolvedUrl && !endpointResult?.resolvedUrl)
+  );
+  let finalScore = providerOverride ? Math.min(scoring.score, 20) : scoring.score;
+  if (!providerOverride) {
+    if (endpointResolutionFailed) {
+      finalScore = Math.min(finalScore, 74);
+    } else if (endpointResult?.endpointConfidence === "low") {
+      finalScore = Math.min(finalScore, 79);
+    }
+  }
+  const classification = providerOverride ? "High Risk" : classifySafetyScore(finalScore);
   const nextState = features.integrityHashMismatch ? "changed" : "monitored";
   const record = {
     postId,
@@ -257,44 +411,86 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, candidateCon
     analysisUrl,
     rawUrl,
     urlHash: currentHash,
+    postTextHash: currentPostTextHash,
+    normalizedVisiblePostText: normalizedCurrentPostText,
+    previousPostTextHash,
+    currentPostTextHash,
+    baselineFirstSeenAt,
+    detectedAt,
+    hadLinkAtBaseline: Boolean(existingBaseline?.hadLinkAtBaseline === true || existingBaseline?.baselineState === "link"),
+    linkInsertedAfterBaseline,
+    postIntegrityEvent: linkInsertedAfterBaseline ? "link_inserted_after_no_link_baseline" : "",
+    baselineState: compatibleBaseline?.baselineState || existingBaseline?.baselineState || "",
     candidateMode: normalizedCandidateContext.candidateMode,
     dominantDomain: normalizedCandidateContext.dominantDomain,
     candidateDomainCount: normalizedCandidateContext.candidateDomainCount,
     selectedNormalizedTarget: normalizedCandidateContext.selectedNormalizedTarget,
     candidateContext: normalizedCandidateContext,
     classification,
-    safetyScore: scoring.score,
+    safetyScore: finalScore,
     features,
     deductions: scoring.deductions,
+    providerOverride,
     providerResults,
+    technicalDetails: buildTechnicalDetails({
+      endpointResult,
+      redirectAnalysis,
+      urlFeatureAnalysis: enrichedUrlFeatures,
+      analysis: {
+        postIntegrityEvent: linkInsertedAfterBaseline ? "link_inserted_after_no_link_baseline" : "",
+        linkInsertedAfterBaseline,
+        baselineFirstSeenAt,
+        previousPostTextHash,
+        currentPostTextHash
+      }
+    }),
+    endpointConfidence: endpointResult.endpointConfidence,
+    limitations: buildAnalysisLimitations({ endpointResult, providerResults }),
+    postIdentityStable: normalizedCandidateContext.postIdentityStable === true,
+    integrityComparisonStatus: normalizedCandidateContext.postIdentityStable === true ? "checked" : "skipped-unstable-post-identity",
     redirectAnalysis,
     urlFeatureAnalysis: enrichedUrlFeatures,
     lastChecked: Date.now(),
     state: nextState
   };
 
-  const storedRecord = existingBaseline
-    ? await updatePostAnalysis(postId, record)
-    : await setBaseline(postId, record);
+  if (!record.postIdentityStable) {
+    record.limitations = [
+      ...(record.limitations || []),
+      "Post integrity comparison skipped because no stable Facebook post identity was available."
+    ].slice(0, 8);
+  }
+
+  const storedRecord = persist
+    ? existingBaseline
+      ? await updatePostAnalysis(postId, record)
+      : await setBaseline(postId, record)
+    : record;
 
   if (urlLevelClassification === "High Risk" || gsbResult.flagged || urlhausResult.flagged) {
     await markDomainFlagged(domain);
   }
 
-  await appendAnalysisRecord({
-    timestamp: Date.now(),
-    postId,
-    analysisSchemaVersion: CURRENT_ANALYSIS_SCHEMA_VERSION,
-    url: analysisUrl,
-    originalUrl: normalizedUrl,
-    domain,
-    urlHash: currentHash,
-    safetyScore: scoring.score,
-    classification,
-    features,
-    providerResults,
-    state: nextState
-  });
+  if (persist) {
+    await appendAnalysisRecord({
+      timestamp: Date.now(),
+      postId,
+      analysisSchemaVersion: CURRENT_ANALYSIS_SCHEMA_VERSION,
+      url: analysisUrl,
+      originalUrl: normalizedUrl,
+      domain,
+      urlHash: currentHash,
+      safetyScore: finalScore,
+      classification,
+      features,
+      providerResults,
+      endpointResult,
+      endpointConfidence: endpointResult.endpointConfidence,
+      limitations: record.limitations,
+      providerOverride,
+      state: nextState
+    });
+  }
 
   sessionInfo.lastActivityAt = Date.now();
 
@@ -304,7 +500,7 @@ async function performLinkAnalysis({ postId, rawUrl, displayedText, candidateCon
 
   logDebug(`URL analysis reused=${reusableUrlAnalysis.cacheHit} analysisUrl=${analysisUrl}`);
   logDebug(`Provider checks: gsb=${gsbResult.flagged} urlhaus=${urlhausResult.flagged}`);
-  logDebug(`Scoring result for ${postId}: safety=${scoring.score} classification=${classification}`);
+  logDebug(`Scoring result for ${postId}: safety=${finalScore} classification=${classification}`);
 
   return {
     ...storedRecord,
@@ -399,7 +595,8 @@ function buildCandidateContext(candidateContext = {}, fallback = {}) {
     candidateMode,
     dominantDomain,
     candidateDomainCount,
-    selectedNormalizedTarget
+    selectedNormalizedTarget,
+    postIdentityStable: candidateContext.postIdentityStable === true || fallback.postIdentityStable === true
   };
 }
 
@@ -478,7 +675,7 @@ function buildStableUrlHashInput({ analysisUrl, normalizedUrl }) {
   return String(analysisUrl || normalizedUrl || "").trim();
 }
 
-async function getReusableUrlAnalysis(rawUrl, urlFeatures) {
+async function getReusableUrlAnalysis(rawUrl, urlFeatures, endpointResult = null, redirectAnalysis = null) {
   pruneUrlAnalysisCache();
 
   const initialCacheKeys = buildUrlAnalysisCacheKeys(urlFeatures);
@@ -495,7 +692,7 @@ async function getReusableUrlAnalysis(rawUrl, urlFeatures) {
     setUrlAnalysisCacheEntry(aliasKeys, stripUrlAnalysisCacheMetadata(cachedEntry), cachedEntry.cachedAt);
 
     return {
-      ...cachedEntry,
+      ...normalizeReusableUrlAnalysis(cachedEntry),
       cacheHit: true,
       cacheKey
     };
@@ -504,13 +701,14 @@ async function getReusableUrlAnalysis(rawUrl, urlFeatures) {
   const cacheMissKey = initialCacheKeys[0] || normalizeCacheKey(rawUrl) || "unknown-url";
   logDebug(`URL analysis cache miss: ${cacheMissKey}`);
 
-  const redirectAnalysis = await analyzeRedirects(rawUrl);
-  const analysisUrl = resolveAnalysisUrl(urlFeatures, redirectAnalysis);
+  const safeEndpointResult = endpointResult || {};
+  const safeRedirectAnalysis = normalizeRedirectAnalysis(redirectAnalysis || endpointResult?.redirectAnalysis || await analyzeRedirects(rawUrl));
+  const analysisUrl = endpointResult?.effectiveEndpoint || resolveAnalysisUrl(urlFeatures, safeRedirectAnalysis);
   const domain = safeHostname(analysisUrl || urlFeatures.normalizedUrl);
   const analysisUrlFeatures = analyzeUrlFeatures({
     rawUrl: analysisUrl
   });
-  const providerResults = await runThreatIntelligenceChecks(analysisUrl);
+  const providerResults = normalizeProviderResults(await runThreatIntelligenceChecks(analysisUrl));
   const stableUrlFeatureAnalysis = {
     ...analysisUrlFeatures,
     sourceNormalizedUrl: urlFeatures.normalizedUrl,
@@ -518,22 +716,34 @@ async function getReusableUrlAnalysis(rawUrl, urlFeatures) {
     sourceRawComparableUrl: urlFeatures.rawComparableUrl,
     finalAnalysisUrl: analysisUrl,
     finalDomain: domain,
+    endpointConfidence: endpointResult?.endpointConfidence || "",
     shortenedUrl: Boolean(urlFeatures.shortenedUrl || analysisUrlFeatures.shortenedUrl),
     usesKnownWrapper: Boolean(urlFeatures.usesKnownWrapper),
     wrapperChain: urlFeatures.wrapperChain,
     wrapperHosts: urlFeatures.wrapperHosts,
-    wrapperToExternalDestination: Boolean(urlFeatures.wrapperToExternalDestination || redirectAnalysis.wrapperToExternalDestination)
+    wrapperToExternalDestination: shouldApplyWrapperRisk({
+      endpointResult: safeEndpointResult,
+      redirectAnalysis: safeRedirectAnalysis,
+      urlFeatureAnalysis: {
+        ...analysisUrlFeatures,
+        shortenedUrl: Boolean(urlFeatures.shortenedUrl || analysisUrlFeatures.shortenedUrl)
+      },
+      providerResults,
+      textMismatch: false
+    }),
+    facebookWrapperUnwrapped: Boolean(safeEndpointResult.isFacebookWrapper && !safeEndpointResult.isInternalFacebook)
   };
   const urlLevelFeatures = buildUrlLevelFeatures({
-    redirectAnalysis,
+    redirectAnalysis: safeRedirectAnalysis,
     providerResults,
     urlFeatureAnalysis: stableUrlFeatureAnalysis
   });
   const cacheEntry = {
     analysisUrl,
     domain,
-    redirectAnalysis,
+    redirectAnalysis: safeRedirectAnalysis,
     providerResults,
+    endpointResult: safeEndpointResult,
     urlFeatureAnalysis: stableUrlFeatureAnalysis,
     urlLevelFeatures
   };
@@ -541,38 +751,41 @@ async function getReusableUrlAnalysis(rawUrl, urlFeatures) {
   setUrlAnalysisCacheEntry(buildUrlAnalysisCacheKeys(urlFeatures, analysisUrl), cacheEntry);
 
   return {
-    ...getUrlAnalysisCacheEntry(analysisUrl),
+    ...cacheEntry,
     cacheHit: false,
-    cacheKey: analysisUrl
+    cacheKey: normalizeCacheKey(analysisUrl) || analysisUrl
   };
 }
 
 function buildUrlLevelFeatures({ redirectAnalysis, providerResults, urlFeatureAnalysis }) {
-  const gsbResult = providerResults.find((item) => item.provider === "gsb") || createDefaultProviderResult("gsb");
-  const urlhausResult = providerResults.find((item) => item.provider === "urlhaus") || createDefaultProviderResult("urlhaus");
+  const safeProviderResults = normalizeProviderResults(providerResults);
+  const safeRedirectAnalysis = normalizeRedirectAnalysis(redirectAnalysis);
+  const safeUrlFeatureAnalysis = urlFeatureAnalysis || {};
+  const gsbResult = safeProviderResults.find((item) => item.provider === "gsb");
+  const urlhausResult = safeProviderResults.find((item) => item.provider === "urlhaus");
 
   const baseFeatures = {
     googleSafeBrowsingFlagged: gsbResult.flagged,
     urlhausFlagged: urlhausResult.flagged,
     domainPreviouslyFlagged: false,
-    redirectCount: redirectAnalysis.redirectCount,
-    multipleRedirects: redirectAnalysis.multipleRedirects,
-    crossDomainRedirectChain: redirectAnalysis.crossDomainRedirectChain,
-    redirectChainToDifferentRegistrantLikeTarget: redirectAnalysis.redirectChainToDifferentRegistrantLikeTarget,
-    wrapperToExternalDestination: Boolean(urlFeatureAnalysis.wrapperToExternalDestination),
-    suspiciousRedirectPattern: redirectAnalysis.suspiciousPattern,
-    trackingHopToUnrelatedDomain: redirectAnalysis.trackingHopToUnrelatedDomain,
-    shortenerToUnrelatedDomain: redirectAnalysis.shortenerToUnrelatedDomain,
-    shortenedUrl: urlFeatureAnalysis.shortenedUrl,
-    obfuscatedUrl: urlFeatureAnalysis.obfuscatedUrl,
-    suspiciousTld: urlFeatureAnalysis.suspiciousTld,
+    redirectCount: safeRedirectAnalysis.redirectCount,
+    multipleRedirects: safeRedirectAnalysis.multipleRedirects,
+    crossDomainRedirectChain: safeRedirectAnalysis.crossDomainRedirectChain,
+    redirectChainToDifferentRegistrantLikeTarget: safeRedirectAnalysis.redirectChainToDifferentRegistrantLikeTarget,
+    wrapperToExternalDestination: Boolean(safeUrlFeatureAnalysis.wrapperToExternalDestination),
+    suspiciousRedirectPattern: safeRedirectAnalysis.suspiciousPattern,
+    trackingHopToUnrelatedDomain: safeRedirectAnalysis.trackingHopToUnrelatedDomain,
+    shortenerToUnrelatedDomain: safeRedirectAnalysis.shortenerToUnrelatedDomain,
+    shortenedUrl: safeUrlFeatureAnalysis.shortenedUrl,
+    obfuscatedUrl: safeUrlFeatureAnalysis.obfuscatedUrl,
+    suspiciousTld: safeUrlFeatureAnalysis.suspiciousTld,
     textMismatch: false,
-    excessiveQueryComplexity: urlFeatureAnalysis.excessiveQueryComplexity,
-    suspiciousPath: urlFeatureAnalysis.suspiciousPath,
-    excessiveSubdomainDepth: urlFeatureAnalysis.excessiveSubdomainDepth,
-    usernamePasswordTrick: urlFeatureAnalysis.usernamePasswordTrick,
-    trustedEndpoint: Boolean(urlFeatureAnalysis.trustedEndpoint),
-    httpsEndpoint: Boolean(urlFeatureAnalysis.httpsEndpoint),
+    excessiveQueryComplexity: safeUrlFeatureAnalysis.excessiveQueryComplexity,
+    suspiciousPath: safeUrlFeatureAnalysis.suspiciousPath,
+    excessiveSubdomainDepth: safeUrlFeatureAnalysis.excessiveSubdomainDepth,
+    usernamePasswordTrick: safeUrlFeatureAnalysis.usernamePasswordTrick,
+    trustedEndpoint: Boolean(safeUrlFeatureAnalysis.trustedEndpoint),
+    httpsEndpoint: Boolean(safeUrlFeatureAnalysis.httpsEndpoint),
     trustedEndpointMitigationEligible: false,
     integrityHashMismatch: false
   };
@@ -611,6 +824,300 @@ function isTrustedEndpointMitigationEligible(features = {}) {
   }
 
   return true;
+}
+
+function normalizeReusableUrlAnalysis(value = {}) {
+  const safeValue = value && typeof value === "object" ? value : {};
+  return {
+    ...safeValue,
+    providerResults: normalizeProviderResults(safeValue.providerResults),
+    redirectAnalysis: normalizeRedirectAnalysis(safeValue.redirectAnalysis),
+    urlFeatureAnalysis: safeValue.urlFeatureAnalysis && typeof safeValue.urlFeatureAnalysis === "object"
+      ? safeValue.urlFeatureAnalysis
+      : {},
+    endpointResult: safeValue.endpointResult && typeof safeValue.endpointResult === "object"
+      ? safeValue.endpointResult
+      : {}
+  };
+}
+
+function normalizeProviderResults(providerResults) {
+  const values = Array.isArray(providerResults) ? providerResults : [];
+  const gsb = values.find((item) => item?.provider === "gsb") || createDefaultProviderResult("gsb");
+  const urlhaus = values.find((item) => item?.provider === "urlhaus") || createDefaultProviderResult("urlhaus");
+  return [gsb, urlhaus];
+}
+
+function getNormalizedProviderResult(providerResults, providerName) {
+  return normalizeProviderResults(providerResults).find((item) => item.provider === providerName) || createDefaultProviderResult(providerName);
+}
+
+function normalizeRedirectAnalysis(redirectAnalysis = {}) {
+  const safe = redirectAnalysis && typeof redirectAnalysis === "object" ? redirectAnalysis : {};
+  return {
+    redirectCount: Number(safe.redirectCount || 0),
+    redirectChain: Array.isArray(safe.redirectChain) ? safe.redirectChain : Array.isArray(safe.chain) ? safe.chain : [],
+    chain: Array.isArray(safe.chain) ? safe.chain : Array.isArray(safe.redirectChain) ? safe.redirectChain : [],
+    redirectDomains: Array.isArray(safe.redirectDomains) ? safe.redirectDomains : [],
+    uniqueRegistrableDomains: Array.isArray(safe.uniqueRegistrableDomains) ? safe.uniqueRegistrableDomains : [],
+    resolvedUrl: safe.resolvedUrl || "",
+    resolutionMethod: safe.resolutionMethod || "unknown",
+    notes: Array.isArray(safe.notes) ? safe.notes : [],
+    fetchAttempted: Boolean(safe.fetchAttempted),
+    fetchAllowed: Boolean(safe.fetchAllowed),
+    fetchSucceeded: Boolean(safe.fetchSucceeded),
+    suspiciousPattern: Boolean(safe.suspiciousPattern),
+    multipleRedirects: Boolean(safe.multipleRedirects),
+    crossDomainRedirectChain: Boolean(safe.crossDomainRedirectChain),
+    redirectChainToDifferentRegistrantLikeTarget: Boolean(safe.redirectChainToDifferentRegistrantLikeTarget),
+    wrapperToExternalDestination: Boolean(safe.wrapperToExternalDestination),
+    shortenerToUnrelatedDomain: Boolean(safe.shortenerToUnrelatedDomain),
+    trackingHopToUnrelatedDomain: Boolean(safe.trackingHopToUnrelatedDomain)
+  };
+}
+
+function shouldApplyWrapperRisk({ endpointResult = {}, redirectAnalysis = {}, urlFeatureAnalysis = {}, providerResults = [], textMismatch = false } = {}) {
+  const safeProviderResults = normalizeProviderResults(providerResults);
+  const providerFlagged = safeProviderResults.some((item) => item.flagged);
+  const safeRedirectAnalysis = normalizeRedirectAnalysis(redirectAnalysis);
+  const safeFeatures = urlFeatureAnalysis || {};
+  const usesFacebookWrapper = Boolean(endpointResult.isFacebookWrapper || safeFeatures.facebookWrapperUnwrapped);
+
+  if (!usesFacebookWrapper || endpointResult.isInternalFacebook) {
+    return false;
+  }
+
+  const normalResolvedExternalWrapper = Boolean(
+    endpointResult.endpointConfidence !== "low" &&
+    endpointResult.effectiveEndpoint &&
+    endpointResult.effectiveDomain &&
+    !endpointResult.isInternalFacebook &&
+    safeFeatures.httpsEndpoint !== false
+  );
+
+  if (
+    normalResolvedExternalWrapper &&
+    !providerFlagged &&
+    !textMismatch &&
+    !safeRedirectAnalysis.suspiciousPattern &&
+    !safeFeatures.suspiciousPath &&
+    !safeFeatures.usernamePasswordTrick &&
+    !safeFeatures.rawIpHost &&
+    !safeFeatures.suspiciousFileExtension
+  ) {
+    return false;
+  }
+
+  return Boolean(
+    endpointResult.endpointConfidence === "low" ||
+    providerFlagged ||
+    textMismatch ||
+    safeRedirectAnalysis.suspiciousPattern ||
+    safeFeatures.suspiciousPath ||
+    safeFeatures.usernamePasswordTrick ||
+    safeFeatures.rawIpHost ||
+    safeFeatures.suspiciousFileExtension
+  );
+}
+
+function applyMainstreamResolvedShortlinkMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
+  const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
+  const mainstreamDomains = new Set([
+    "tiktok.com",
+    "shopee.ph",
+    "shopee.com",
+    "lazada.com.ph",
+    "lazada.com",
+    "youtube.com",
+    "youtu.be",
+    "instagram.com",
+    "facebook.com",
+    "messenger.com"
+  ]);
+  const confidence = String(endpointResult?.endpointConfidence || "").toLowerCase();
+  const isEligible = Boolean(
+    features.shortenedUrl &&
+    mainstreamDomains.has(finalDomain) &&
+    ["high", "medium"].includes(confidence) &&
+    features.httpsEndpoint &&
+    !features.googleSafeBrowsingFlagged &&
+    !features.urlhausFlagged &&
+    !features.suspiciousPath &&
+    !features.suspiciousTld &&
+    !features.usernamePasswordTrick &&
+    !features.textMismatch &&
+    !features.integrityHashMismatch
+  );
+
+  if (!isEligible) {
+    return features;
+  }
+
+  return {
+    ...features,
+    excessiveQueryComplexity: false,
+    obfuscatedUrl: false,
+    suspiciousRedirectPattern: false,
+    shortenerToUnrelatedDomain: false,
+    trackingHopToUnrelatedDomain: false,
+    crossDomainRedirectChain: false,
+    redirectChainToDifferentRegistrantLikeTarget: false,
+    trustedEndpoint: true,
+    trustedEndpointMitigationEligible: true,
+    mainstreamResolvedShortlink: true
+  };
+}
+
+function buildAnalysisLimitations({ endpointResult, providerResults }) {
+  const limitations = [];
+  const safeProviderResults = normalizeProviderResults(providerResults);
+  const gsb = safeProviderResults.find((item) => item.provider === "gsb");
+  const urlhaus = safeProviderResults.find((item) => item.provider === "urlhaus");
+
+  if (!gsb.configured) {
+    limitations.push("Google Safe Browsing is not configured.");
+  } else if (gsb.details?.status === "error") {
+    limitations.push("Google Safe Browsing lookup returned an error.");
+  }
+
+  if (urlhaus.details?.status === "error") {
+    limitations.push("URLhaus public lookup was unavailable.");
+  } else if (urlhaus.details?.authKeyConfigured === false || urlhaus.details?.authConfigured === false) {
+    limitations.push("URLhaus was checked in public mode.");
+  }
+
+if (!endpointResult?.effectiveEndpoint) {
+  limitations.push("DILI could not confidently resolve the final endpoint.");
+}
+
+  for (const warning of endpointResult?.warnings || []) {
+    if (isNormalWrapperMessage(warning)) {
+      continue;
+    }
+    limitations.push(warning);
+  }
+
+  return [...new Set(limitations)].slice(0, 8);
+}
+
+function isNormalWrapperMessage(message) {
+  return /facebook wrapper concealed|wrapper concealed an external destination|facebook wrapper unwrapped/i.test(String(message || ""));
+}
+
+function buildTechnicalDetails({ endpointResult = {}, redirectAnalysis = {}, urlFeatureAnalysis = {}, analysis = {} } = {}) {
+  const details = [];
+  const effectiveDomain = endpointResult.effectiveDomain || urlFeatureAnalysis.finalDomain || "";
+  const chainDomains = [...new Set((redirectAnalysis.redirectChain || endpointResult.resolutionChain || [])
+    .map((url) => safeHostname(url))
+    .filter(Boolean))];
+
+  if (endpointResult.isFacebookWrapper && effectiveDomain) {
+    details.push(`Facebook wrapper unwrapped to ${effectiveDomain}.`);
+  }
+
+  if (chainDomains.length > 1) {
+    details.push(`Redirect chain: ${chainDomains.join(" -> ")}.`);
+  }
+
+  if (urlFeatureAnalysis.sourceNormalizedUrl && urlFeatureAnalysis.sourceRawComparableUrl && urlFeatureAnalysis.sourceNormalizedUrl !== urlFeatureAnalysis.sourceRawComparableUrl) {
+    details.push("Tracking parameters were stripped for comparison.");
+  }
+
+  if (endpointResult.endpointConfidence) {
+    details.push(`Endpoint confidence: ${endpointResult.endpointConfidence}.`);
+  }
+
+  if (analysis.postIntegrityEvent) {
+    details.push(`Post integrity event: ${String(analysis.postIntegrityEvent).replace(/_/g, " ")}.`);
+  }
+
+  if (analysis.linkInsertedAfterBaseline) {
+    details.push("A link was inserted after a stored no-link baseline.");
+  }
+
+  if (analysis.baselineFirstSeenAt) {
+    details.push(`Baseline first seen: ${new Date(Number(analysis.baselineFirstSeenAt)).toISOString()}.`);
+  }
+
+  if (analysis.previousPostTextHash) {
+    details.push(`Previous post text hash: ${analysis.previousPostTextHash}.`);
+  }
+
+  if (analysis.currentPostTextHash) {
+    details.push(`Current post text hash: ${analysis.currentPostTextHash}.`);
+  }
+
+  return [...new Set(details)].slice(0, 6);
+}
+
+function compactLiveLinkAnalysis(analysis = {}) {
+  return {
+    analysisUrl: analysis.analysisUrl,
+    normalizedUrl: analysis.normalizedUrl,
+    domain: analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
+    safetyScore: analysis.safetyScore,
+    classification: analysis.classification,
+    endpointConfidence: analysis.endpointConfidence,
+    providerOverride: Boolean(analysis.providerOverride),
+    limitations: (analysis.limitations || []).slice(0, 5)
+  };
+}
+
+async function persistPostLevelAnalysis(postId, analysis) {
+  if (!analysis || analysis.analysisMode === "internal-facebook-ignored") {
+    return analysis;
+  }
+
+  try {
+    const existingBaseline = await getBaseline(postId);
+    const storedRecord = existingBaseline
+      ? await updatePostAnalysis(postId, analysis)
+      : await setBaseline(postId, analysis);
+
+    await appendAnalysisRecord({
+      timestamp: Date.now(),
+      postId,
+      analysisSchemaVersion: CURRENT_ANALYSIS_SCHEMA_VERSION,
+      url: analysis.analysisUrl,
+      originalUrl: analysis.normalizedUrl,
+      domain: analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
+      urlHash: analysis.urlHash,
+      postTextHash: analysis.postTextHash,
+      previousPostTextHash: analysis.previousPostTextHash,
+      currentPostTextHash: analysis.currentPostTextHash,
+      baselineFirstSeenAt: analysis.baselineFirstSeenAt,
+      detectedAt: analysis.detectedAt,
+      hadLinkAtBaseline: analysis.hadLinkAtBaseline,
+      linkInsertedAfterBaseline: analysis.linkInsertedAfterBaseline,
+      postIntegrityEvent: analysis.postIntegrityEvent,
+      baselineState: analysis.baselineState,
+      normalizedVisiblePostText: analysis.normalizedVisiblePostText,
+      safetyScore: analysis.safetyScore,
+      classification: analysis.classification,
+      features: analysis.features,
+      providerResults: analysis.providerResults,
+      endpointResult: analysis.endpointResult,
+      endpointConfidence: analysis.endpointConfidence,
+      limitations: analysis.limitations,
+      providerOverride: Boolean(analysis.providerOverride),
+      postIdentityStable: analysis.postIdentityStable === true,
+      integrityComparisonStatus: analysis.integrityComparisonStatus,
+      state: analysis.state
+    });
+
+    return {
+      ...analysis,
+      ...storedRecord
+    };
+  } catch (error) {
+    return {
+      ...analysis,
+      limitations: [
+        ...(analysis.limitations || []),
+        `Storage warning: ${safeErrorMessage(error, "analysis persistence failed")}`
+      ].slice(0, 8)
+    };
+  }
 }
 
 function buildUrlAnalysisCacheKeys(urlFeatures = {}, analysisUrl = "") {
@@ -857,13 +1364,16 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
 }
 
 async function lookupUrlhaus(normalizedUrl) {
-  const config = getRuntimeConfig();
+  const config = await getRuntimeConfig();
   const checkedAt = Date.now();
-  const authKey = String(config.URLHAUS_AUTH_KEY || "").trim();
-  const mode = "public";
+  const authKey = String(config.URLHAUS_AUTH_KEY || config.URLHAUS_API_KEY || "").trim();
+  const mode = authKey ? "authenticated" : "public";
   const headers = {
     "Content-Type": "application/x-www-form-urlencoded"
   };
+  if (authKey) {
+    headers["Auth-Key"] = authKey;
+  }
 
   let response = null;
 
@@ -967,6 +1477,7 @@ async function lookupUrlhaus(normalizedUrl) {
 
 async function buildPopupSummary(tabUrl) {
   await ensureActiveSession("popup-summary");
+  await getRuntimeConfig();
 
   const records = await getAllAnalysisRecords();
   const scanEnabled = await getScanEnabledState();
@@ -999,8 +1510,9 @@ async function buildPopupSummary(tabUrl) {
       .map((record) => ({
         timestamp: record.timestamp,
         postId: record.postId,
-        domain: record.domain,
-        safetyScore: record.safetyScore,
+        finalSite: record.finalSite,
+        domain: record.domain || record.finalSite,
+        safetyScore: record.safetyScore ?? record.score,
         classification: record.classification,
         state: record.state
       }))
@@ -1044,10 +1556,50 @@ async function triggerRescanForActiveTab() {
       message: "Re-scan command sent to the active Facebook tab."
     };
   } catch (error) {
+    await injectContentScript(activeTab.id);
     return {
-      success: false,
-      message: error.message || "Failed to send re-scan message to content script."
+      success: true,
+      message: "Content script was reconnected; scan will start shortly."
     };
+  }
+}
+
+async function notifyActiveFacebookTabScanState(enabled) {
+  const [activeTab] = await chrome.tabs.query({
+    active: true,
+    currentWindow: true
+  });
+
+  if (!activeTab?.id || !isSupportedFacebookUrl(activeTab.url || "")) {
+    return;
+  }
+
+  try {
+    await chrome.tabs.sendMessage(activeTab.id, {
+      type: MESSAGE_TYPES.SET_SCAN_STATE,
+      enabled
+    });
+  } catch {
+    if (enabled) {
+      await injectContentScript(activeTab.id);
+    }
+  }
+}
+
+async function injectContentScript(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        window.__DILI_FORCE_REINIT__ = true;
+      }
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content.js"]
+    });
+  } catch (error) {
+    logDebug(`Content script injection fallback failed: ${safeErrorMessage(error, "unknown error")}`);
   }
 }
 
@@ -1143,18 +1695,58 @@ function normalizeSupportedTabUrl(rawUrl) {
   }
 }
 
-function getRuntimeConfig() {
+async function getRuntimeConfig() {
+  try {
+    const stored = await chromeStorageGet([
+      "dili:config:gsbApiKey",
+      "dili:config:urlhausAuthKey",
+      "dili:config:urlhausApiKey"
+    ]);
+
+    runtimeConfig.GSB_API_KEY = String(stored["dili:config:gsbApiKey"] || GSB_API_KEY || "").trim();
+    runtimeConfig.URLHAUS_AUTH_KEY = String(stored["dili:config:urlhausAuthKey"] || URLHAUS_AUTH_KEY || URLHAUS_API_KEY || "").trim();
+    runtimeConfig.URLHAUS_API_KEY = String(stored["dili:config:urlhausApiKey"] || URLHAUS_API_KEY || "").trim();
+    runtimeConfig.configLoaded = true;
+    runtimeConfig.configSource = hasStoredProviderConfig(stored) ? "chrome.storage.local" : CONFIG_FILE_NAME;
+    runtimeConfig.configError = null;
+  } catch (error) {
+    runtimeConfig.configError = safeErrorMessage(error, "Unable to read runtime provider configuration.");
+  }
+
+  applyConfigDiagnostics(runtimeConfig);
   return runtimeConfig;
 }
 
 function createRuntimeConfig() {
   return {
     GSB_API_KEY: String(GSB_API_KEY || "").trim(),
-    URLHAUS_AUTH_KEY: String(URLHAUS_AUTH_KEY || "").trim(),
+    URLHAUS_AUTH_KEY: String(URLHAUS_AUTH_KEY || URLHAUS_API_KEY || "").trim(),
+    URLHAUS_API_KEY: String(URLHAUS_API_KEY || "").trim(),
     configLoaded: true,
     configSource: CONFIG_FILE_NAME,
     configError: null
   };
+}
+
+function chromeStorageGet(keys) {
+  return new Promise((resolve, reject) => {
+    chrome.storage.local.get(keys, (result) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+
+      resolve(result || {});
+    });
+  });
+}
+
+function hasStoredProviderConfig(stored = {}) {
+  return Boolean(
+    stored["dili:config:gsbApiKey"] ||
+    stored["dili:config:urlhausAuthKey"] ||
+    stored["dili:config:urlhausApiKey"]
+  );
 }
 
 function createInitialProviderHealth() {
@@ -1210,7 +1802,7 @@ function applyConfigDiagnostics(config) {
     providerHealth.gsb.available = providerHealth.gsb.lastStatus !== "error";
   }
 
-  providerHealth.urlhaus.mode = "public";
+  providerHealth.urlhaus.mode = urlhausAuthKeyLoaded ? "authenticated" : "public";
   providerHealth.urlhaus.authKeyConfigured = urlhausAuthKeyLoaded;
   providerHealth.urlhaus.available = providerHealth.urlhaus.lastStatus !== "error";
 

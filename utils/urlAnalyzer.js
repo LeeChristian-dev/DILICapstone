@@ -46,7 +46,15 @@ const TRACKING_PARAMS = new Set([
   "utm_medium",
   "utm_campaign",
   "utm_term",
-  "utm_content"
+  "utm_content",
+  "__cft__",
+  "__tn__",
+  "h",
+  "eid",
+  "paipv",
+  "ref",
+  "refsrc",
+  "mibextid"
 ]);
 
 const REDIRECT_PARAM_NAMES = [
@@ -71,7 +79,9 @@ const REDIRECT_PARAM_NAMES = [
 const FACEBOOK_REDIRECT_HOSTS = new Set([
   "l.facebook.com",
   "lm.facebook.com",
-  "m.facebook.com"
+  "m.facebook.com",
+  "facebook.com",
+  "www.facebook.com"
 ]);
 
 const GENERIC_DISPLAY_TEXT_PATTERNS = [
@@ -135,7 +145,15 @@ const TRUSTED_ENDPOINT_DOMAINS = new Set([
   "monday.com",
   "securitybank.com",
   "shopee.com",
-  "shopee.ph"
+  "shopee.ph",
+  "tiktok.com",
+  "lazada.com.ph",
+  "lazada.com",
+  "youtube.com",
+  "youtu.be",
+  "instagram.com",
+  "facebook.com",
+  "messenger.com"
 ]);
 
 /**
@@ -376,7 +394,7 @@ export function detectDomainMismatch(displayText, rawUrl) {
   const displayAnalysis = analyzeDisplayText(displayText);
   const displayDomain = displayAnalysis.domain;
 
-  if (!displayDomain || !actualDomain || displayAnalysis.genericText) {
+  if (!displayDomain || !actualDomain || displayAnalysis.genericText || isShortenerHost(displayDomain)) {
     return {
       mismatch: false,
       displayDomain,

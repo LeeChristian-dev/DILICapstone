@@ -14,7 +14,9 @@ DILI is a Manifest V3 Chrome extension for Facebook link monitoring. It fingerpr
 - URLhaus integration (public lookup endpoint with optional auth token support)
 - Popup dashboard (`popup.html`, `popup.js`, `popup.css`)
 - CSV export for analysis log records
-- Storage-backed analysis history for demo sessions
+- Compact storage-backed analysis history for demo sessions
+- Multi-link Facebook post analysis with one DILI panel per owning post
+- Endpoint resolution for Facebook wrappers, shorteners, and final redirect destinations
 
 ## File Structure
 
@@ -43,19 +45,23 @@ storage/
 ## Setup Configuration (GSB + URLhaus)
 
 1. Open `config.example.js` for the key template.
-2. Use `config.local.js` for local values.
-3. Paste your real values in `config.local.js`:
+2. `config.local.js` is a committed empty placeholder and must stay empty.
+3. For local development, save provider keys through `chrome.storage.local` using these keys:
 
-- `GSB_API_KEY`
-- `URLHAUS_API_KEY` (optional)
-- `URLHAUS_AUTH_TOKEN` (optional)
+- `dili:config:gsbApiKey`
+- `dili:config:urlhausAuthKey`
+- `dili:config:urlhausApiKey`
 
 Notes:
 
-- `config.local.js` is ignored by git (`.gitignore`) and should not be committed with real secrets.
-- If `config.local.js` is missing, extension fallback behavior is safe:
+- Never commit real provider credentials.
+- If no key is configured, extension fallback behavior is safe:
 - GSB returns `configured: false`, `checked: false`, `flagged: false`
 - URLhaus still attempts public-mode lookup when available
+
+## Host Permissions
+
+DILI requests broad `http://*/*` and `https://*/*` host permissions so the MV3 service worker can resolve shortened URLs that may redirect to any domain. Provider-specific permissions for Google Safe Browsing and URLhaus are kept as explicit entries.
 
 ## Safety Score Model
 
@@ -68,8 +74,9 @@ DILI now computes a Safety Score instead of additive risk:
 Classification:
 
 - `80-100`: Safe
-- `50-79`: Suspicious
-- `0-49`: High Risk
+- `60-79`: Caution
+- `40-59`: Suspicious
+- `0-39`: High Risk
 
 ## Popup Dashboard
 
@@ -78,7 +85,7 @@ Click the extension toolbar icon to open the popup.
 The popup shows:
 
 - **Current tab context** (Facebook vs unsupported / non-scannable URLs)
-- **Session stats:** unique posts scanned, analysis-record count, flagged posts (Suspicious/High risk), total analyses in storage
+- **Session stats:** current page candidates, current page analyses, visible panels, total compact analyses in storage
 - **Session started** timestamp (when the background session began)
 - **Provider chips:** config readiness, Google Safe Browsing, URLhaus compact status
 - **Recent activity** list (latest stored analyses)
@@ -133,7 +140,7 @@ Each row includes:
 ## Current Limitations
 
 - Facebook DOM changes frequently. Selectors in `content.js` may require periodic tuning.
-- MVP currently scores only the first significant external hyperlink in each post.
+- DILI analyzes up to eight meaningful external hyperlinks per post and uses the lowest-scoring successful link as the post result.
 - Redirect analysis remains best-effort and cannot guarantee complete redirect-chain visibility in all cases.
 - Service worker lifecycle affects session counters in popup; historical logs remain in storage.
 
@@ -143,4 +150,4 @@ Each row includes:
 - `icons/icon16.png`
 - `icons/icon48.png`
 - `icons/icon128.png`
-- Paste your real provider credentials into `config.local.js`.
+- Configure real provider credentials in `chrome.storage.local`, not in committed files.

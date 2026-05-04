@@ -18,6 +18,7 @@ const ACTIVE_PROBE_REDIRECT_HOSTS = new Set([
   "bitly.com",
   "tinyurl.com",
   "t.co",
+  "goo.gl",
   "ow.ly",
   "buff.ly",
   "cutt.ly",
@@ -90,7 +91,7 @@ export async function analyzeRedirects(rawUrl) {
     currentUrl = nextCanonical;
   }
 
-  const probeInputUrl = redirectChain[redirectChain.length - 1] || currentUrl;
+  const probeInputUrl = safelyCanonicalize(redirectChain[redirectChain.length - 1] || currentUrl, { stripTracking: true }) || (redirectChain[redirectChain.length - 1] || currentUrl);
   const probeInputHost = safeHostname(probeInputUrl);
   const fetchResolution = await attemptNetworkResolution(probeInputUrl);
   if (fetchResolution.success && fetchResolution.finalUrl && !isSameComparableUrl(fetchResolution.finalUrl, redirectChain[redirectChain.length - 1])) {
@@ -151,6 +152,7 @@ export async function analyzeRedirects(rawUrl) {
     notes,
     fetchAttempted: fetchResolution.fetchAttempted,
     fetchAllowed: fetchResolution.fetchAllowed,
+    fetchSucceeded: fetchResolution.success,
     suspiciousPattern: redirectSummary.suspiciousPattern,
     multipleRedirects: redirectSummary.multipleRedirects,
     crossDomainRedirectChain: redirectSummary.crossDomainRedirectChain,

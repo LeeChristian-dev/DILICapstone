@@ -5,7 +5,8 @@ const MESSAGE_TYPES = {
   GET_ANALYSIS_RECORDS: "DILI_GET_ANALYSIS_RECORDS",
   CLEAR_ANALYSIS_RECORDS: "DILI_CLEAR_ANALYSIS_RECORDS",
   RESET_SESSION: "DILI_RESET_SESSION",
-  RESCAN_CURRENT_TAB: "DILI_RESCAN_CURRENT_TAB"
+  RESCAN_CURRENT_TAB: "DILI_RESCAN_CURRENT_TAB",
+  GET_SCAN_STATUS: "DILI_GET_SCAN_STATUS"
 };
 
 const popupState = {
@@ -124,14 +125,10 @@ function bindActions() {
       popupState.scanEnabled = response?.scanEnabled !== false;
       renderProtectionState();
 
-      if (popupState.summary?.tabSupported && popupState.activeTab?.id) {
-        await chrome.tabs.reload(popupState.activeTab.id);
-      }
-
       setMessage(
         popupState.scanEnabled
-          ? "Protection turned on. Current page refreshed."
-          : "Protection turned off. Current page refreshed."
+          ? "Protection turned on. Current page scan started."
+          : "Protection turned off. DILI panels were removed."
       );
 
       await refreshPopupData();
@@ -207,6 +204,7 @@ async function refreshPopupData() {
 
   popupState.activeTab = activeTab || null;
   popupState.summary = summaryResponse?.summary || {};
+  popupState.summary.scanStatus = await getContentScanStatus(activeTab, popupState.summary);
   popupState.scanEnabled = scanStateResponse?.scanEnabled !== false;
 
   renderProtectionState();
@@ -225,12 +223,28 @@ function renderProtectionState() {
   dashboardShell.classList.toggle("protection-off", !popupState.scanEnabled);
 }
 
+async function getContentScanStatus(activeTab, summary) {
+  if (!summary?.tabSupported || !activeTab?.id) {
+    return null;
+  }
+
+  try {
+    const response = await chrome.tabs.sendMessage(activeTab.id, {
+      type: MESSAGE_TYPES.GET_SCAN_STATUS
+    });
+    return response?.status || null;
+  } catch {
+    return null;
+  }
+}
+
 function renderStats(summary) {
-  statScannedPosts.textContent = String(summary.postsScannedInSession ?? summary.scannedPostsInSession ?? 0);
+  const status = summary.scanStatus || {};
+  statScannedPosts.textContent = String(status.candidatePostsFound ?? summary.postsScannedInSession ?? summary.scannedPostsInSession ?? 0);
   statAnalyzedPosts.textContent = String(
-    summary.analyzedLinksInSession ?? summary.postsAnalyzedInSession ?? 0
+    status.analyzedPosts ?? summary.postsAnalyzedInSession ?? summary.analyzedLinksInSession ?? 0
   );
-  statFlaggedPosts.textContent = String(summary.flaggedPostsInSession ?? 0);
+  statFlaggedPosts.textContent = String(status.visiblePanels ?? summary.flaggedPostsInSession ?? 0);
   statTotalStored.textContent = String(summary.totalStoredAnalyses ?? 0);
 }
 
