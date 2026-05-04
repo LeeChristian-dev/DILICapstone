@@ -54,7 +54,8 @@
     /\breport\b/i,
     /\bhide\b/i
   ];
-  const DOMAIN_TEXT_PATTERN = /\b[a-z0-9.-]+\.(?:ai|app|biz|click|com|dev|info|io|net|org|ph|shop|site|store|xyz)\b/i;
+const DOMAIN_TEXT_PATTERN =
+  /\b(?:www\.)?[a-z0-9][a-z0-9.-]*\.(?:academy|agency|ai|app|biz|click|cloud|co|com|dev|edu|finance|gov|info|io|me|net|online|org|ph|shop|site|store|xyz)\b/i;
   const CTA_TEXT_PATTERNS = [
     /\bsign up\b/i,
     /\bclaim now\b/i,
@@ -122,7 +123,14 @@
 ]);  
   const POST_PROCESS_CONCURRENCY = 4;
   const MAX_LINKS_PER_POST = 8;
+const DILI_UI_SELECTOR =
+  ".dili-panel, .dili-panel-slot, .dili-badge, .dili-details, .dili-warning-overlay, .dili-warning-modal";
 
+const OUTBOUND_CLICK_TARGET_SELECTOR =
+  'a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]';
+
+const UNSAFE_PANEL_ANCESTOR_SELECTOR =
+  'a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]';
   const pendingPosts = new Set();
   const postIdCache = new WeakMap();
   let postSignatureCache = new WeakMap();
@@ -143,28 +151,82 @@
     scrollListenerBound: false,
     extensionContextInvalidated: false
   };
-  const scanStatus = {
-    enabled: true,
-    route: location.href,
-    lastScanAt: null,
-    feedRootsFound: 0,
-    candidatePostsFound: 0,
-    eligibleLinkPostsFound: 0,
-    analyzedPosts: 0,
-    renderedPanels: 0,
-    visiblePanels: 0,
-    queuedPosts: 0,
-    skippedSidebar: 0,
-    skippedInvisible: 0,
-    skippedNoLinks: 0,
-    skippedActionArea: 0,
-    staleResponsesDiscarded: 0,
-    duplicatePanelsRemoved: 0,
-    sponsoredFallbackAttempts: 0,
-    sponsoredFallbackAccepted: 0,
-    lastError: "",
-    lastRenderedDomain: ""
-  };
+const scanStatus = {
+  enabled: true,
+  route: location.href,
+  lastScanAt: null,
+
+  // Post discovery
+  feedRootsFound: 0,
+  candidatePostsFound: 0,
+  lastCandidatePostsFound: 0,
+  eligibleLinkPostsFound: 0,
+  analyzedPosts: 0,
+  renderedPanels: 0,
+  visiblePanels: 0,
+  queuedPosts: 0,
+
+  // Existing skip counters
+  skippedSidebar: 0,
+  skippedInvisible: 0,
+  skippedNoLinks: 0,
+  skippedActionArea: 0,
+  staleResponsesDiscarded: 0,
+  duplicatePanelsRemoved: 0,
+
+  // P1-C diagnostics: analysis pipeline tracking
+  analysisRequestsSent: 0,
+  analysisResponsesReceived: 0,
+  analysisResponsesMissing: 0,
+  analysisRenderedPanels: 0,
+  analysisStaleDiscardedByMissingRequest: 0,
+  analysisStaleDiscardedByRequestId: 0,
+  analysisStaleDiscardedBySignature: 0,
+  analysisStaleDiscardedByFingerprint: 0,
+  analysisStaleDiscardedByTextHash: 0,
+  analysisStaleDiscardedByCurrentRescan: 0,
+  panelRemovedNoLinkState: 0,
+  panelRemovedCollapsedDeferred: 0,
+  cachedPanelRestored: 0,
+  panelPreservedNoLinkRescan: 0,
+  panelPreservedCollapsedRescan: 0,
+  hiddenDomainFallbackSkipped: 0,
+  lastPanelPreservationReason: "",
+  skippedMalformedCandidate: 0,
+  lastAnalysisPipelineState: null,
+
+  // P1 diagnostics: why candidates/posts are skipped
+  skippedImageSource: 0,
+  skippedGenericDomain: 0,
+  skippedHeaderDomain: 0,
+  skippedNoUrl: 0,
+  skippedHidden: 0,
+  skippedNoOwningPost: 0,
+  skippedInternalFacebook: 0,
+  skippedNestedSharedStory: 0,
+  skippedDiliUi: 0,
+
+  // P1 diagnostics: candidate source counts
+  directCandidatesFound: 0,
+  embeddedCandidatesFound: 0,
+  fallbackCandidatesFound: 0,
+  visibleDomainCandidatesFound: 0,
+  sponsoredFallbackCandidatesFound: 0,
+
+  // P1 diagnostics: panel mount behavior
+  panelMountFallbackUsed: 0,
+  panelUnsafeRelocated: 0,
+  panelSlotReused: 0,
+
+  // Existing fallback counters
+  sponsoredFallbackAttempts: 0,
+  sponsoredFallbackAccepted: 0,
+
+  // Last known diagnostic snapshot
+  lastCandidateBreakdown: null,
+  lastError: "",
+  lastRenderedDomain: ""
+};
   let flushTimer = null;
   let rescanTimer = null;
   let observer = null;
@@ -321,42 +383,76 @@
     });
   }
 
-  function getInterceptedClickContext(event) {
-    if (!(event.target instanceof Element) || event.button !== 0) {
-      return null;
-    }
-
-    const targetElement = event.target.closest("a[href], [data-lynx-uri], [data-url]");
-    if (!(targetElement instanceof Element)) {
-      return null;
-    }
-
-    if (targetElement.closest(".dili-panel, .dili-warning-overlay")) {
-      return null;
-    }
-
-    const post = getOwningPostContainer(targetElement);
-    if (!post) {
-      return null;
-    }
-
-    const rawUrl = getCandidateRawUrl(targetElement);
-    if (!isEligibleLink(rawUrl)) {
-      return null;
-    }
-
-    const normalizedTargetUrl = safelyNormalizeComparableUrl(rawUrl);
-    return {
-      anchor: targetElement,
-      post,
-      postId: getStablePostId(post),
-      postPermalink: findPermalink(post),
-      rawUrl,
-      normalizedTargetUrl,
-      displayText: extractAnchorDisplayText(targetElement),
-      intent: deriveNavigationIntent(targetElement, event)
-    };
+function getInterceptedClickContext(event) {
+  if (!(event.target instanceof Element) || event.button !== 0) {
+    return null;
   }
+
+  // Critical: ignore DILI UI before looking for Facebook clickable ancestors.
+  // This prevents a DILI panel placed inside/near a clickable card from being
+  // treated as a Facebook link click.
+  if (event.target.closest(DILI_UI_SELECTOR)) {
+    return null;
+  }
+
+  const targetElement = findClickableUrlElement(event.target);
+  if (!(targetElement instanceof Element)) {
+    return null;
+  }
+
+  const post = getOwningPostContainer(targetElement);
+  if (!post) {
+    return null;
+  }
+
+  const rawUrl = getCandidateRawUrl(targetElement);
+  if (!isEligibleLink(rawUrl)) {
+    return null;
+  }
+
+  const normalizedTargetUrl = safelyNormalizeComparableUrl(rawUrl);
+
+  return {
+    anchor: targetElement,
+    post,
+    postId: getStablePostId(post),
+    postPermalink: findPermalink(post),
+    rawUrl,
+    normalizedTargetUrl,
+    displayText: extractAnchorDisplayText(targetElement),
+    intent: deriveNavigationIntent(targetElement, event)
+  };
+}
+
+function findClickableUrlElement(startElement) {
+  if (!(startElement instanceof Element)) {
+    return null;
+  }
+
+  const primary = startElement.closest(OUTBOUND_CLICK_TARGET_SELECTOR);
+  if (!(primary instanceof Element)) {
+    return null;
+  }
+
+  if (getCandidateRawUrl(primary)) {
+    return primary;
+  }
+
+  // Facebook CTA cards often place the URL on a nested anchor/data-url node.
+  const descendantWithUrl = [...primary.querySelectorAll('a[href], [data-lynx-uri], [data-url]')]
+    .find((element) => getCandidateRawUrl(element));
+
+  if (descendantWithUrl instanceof Element) {
+    return descendantWithUrl;
+  }
+
+  const ancestorWithUrl = primary.closest('a[href], [data-lynx-uri], [data-url]');
+  if (ancestorWithUrl instanceof Element && getCandidateRawUrl(ancestorWithUrl)) {
+    return ancestorWithUrl;
+  }
+
+  return primary;
+}
 
   async function resolveClickAnalysis(clickContext) {
     const currentState = await sendRuntimeMessage({
@@ -501,22 +597,53 @@
     }
   }
 
-  function shouldShowWarningModal(analysis) {
-    const gsb = findProviderResult(analysis.providerResults, "gsb");
-    const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
-
-    if (gsb?.flagged || urlhaus?.flagged) {
-      return true;
-    }
-
-    const classification = String(analysis.classification || "").toLowerCase();
-    if (classification.includes("suspicious") || classification.includes("risk") || classification.includes("danger") || classification.includes("unsafe") || classification.includes("malicious")) {
-      return true;
-    }
-
-    return Number.isFinite(analysis.safetyScore) && analysis.safetyScore < 80;
+function shouldShowWarningModal(analysis) {
+  if (!analysis || typeof analysis !== "object") {
+    return true;
   }
 
+  const gsb = findProviderResult(analysis.providerResults, "gsb");
+  const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
+
+  if (gsb?.flagged || urlhaus?.flagged) {
+    return true;
+  }
+
+  const classification = String(analysis.classification || "").toLowerCase();
+
+  if (
+    classification.includes("unverified") ||
+    classification.includes("suspicious") ||
+    classification.includes("risk") ||
+    classification.includes("danger") ||
+    classification.includes("unsafe") ||
+    classification.includes("malicious")
+  ) {
+    return true;
+  }
+
+  if (String(analysis.endpointConfidence || "").toLowerCase() === "low") {
+    return true;
+  }
+
+  return Number.isFinite(analysis.safetyScore) && analysis.safetyScore < 80;
+}
+function resolveModalDestinationUrl(destinationUrl, clickContext) {
+  const candidates = [
+    destinationUrl,
+    clickContext?.normalizedTargetUrl,
+    unwrapFacebookRedirectUrl(clickContext?.rawUrl || ""),
+    clickContext?.rawUrl
+  ];
+
+  for (const candidate of candidates) {
+    if (isNavigableHttpUrl(candidate)) {
+      return candidate;
+    }
+  }
+
+  return "";
+}
   function pickDestinationUrl(analysis, clickContext) {
     const candidates = [
       analysis?.redirectAnalysis?.resolvedUrl,
@@ -649,8 +776,11 @@
     overlay.className = "dili-warning-overlay";
     overlay.dataset.diliOwned = "true";
 
-    const destinationDomain = safeHostname(destinationUrl) || "unknown-domain";
-    const scoreText = modalConfig.scoreText || (Number.isFinite(analysis?.safetyScore) ? String(analysis.safetyScore) : "Unavailable");
+const safeDestinationUrl = resolveModalDestinationUrl(destinationUrl, clickContext);
+const displayDestinationUrl = safeDestinationUrl || "Unresolved destination";
+const navigationDestinationUrl = safeDestinationUrl || "about:blank";
+
+const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain";    const scoreText = modalConfig.scoreText || (Number.isFinite(analysis?.safetyScore) ? String(analysis.safetyScore) : "Unavailable");
     const classificationText = modalConfig.classificationText || analysis?.classification || "Unknown";
     const titleText = modalConfig.title || "Navigation paused for your safety";
     const explanationText = modalConfig.explanation || buildWarningExplanation(analysis);
@@ -696,7 +826,7 @@
 
           <div class="dili-warning-section">
             <h3>Destination URL</h3>
-            <p class="dili-warning-destination">${escapeHtml(destinationUrl)}</p>
+            <p class="dili-warning-destination">${escapeHtml(displayDestinationUrl)}</p>          
           </div>
 
           <div class="dili-warning-section">
@@ -733,8 +863,14 @@
     });
 
     reportButton?.addEventListener("click", async () => {
-      const reportPayload = buildReportPayload(clickContext, analysis, destinationUrl, reasons, modalConfig.reportPayloadOverrides);
-      const reportText = formatReportText(reportPayload);
+    const reportPayload = buildReportPayload(
+    clickContext,
+    analysis,
+    safeDestinationUrl,
+    reasons,
+    modalConfig.reportPayloadOverrides
+  );      
+  const reportText = formatReportText(reportPayload);
 
       if (previewNode instanceof HTMLTextAreaElement) {
         previewNode.hidden = false;
@@ -757,7 +893,7 @@
 
     proceedButton?.addEventListener("click", () => {
       closeWarningModal({ restoreFocus: false });
-      continueNavigation(destinationUrl, clickContext.intent);
+      continueNavigation(navigationDestinationUrl, clickContext.intent);
     });
 
     clickWarningState.keydownHandler = (event) => {
@@ -988,8 +1124,17 @@
       subtree: true,
       characterData: true,
       attributes: true,
-      attributeFilter: ["href", "data-ft", "aria-label"]
-    });
+attributeFilter: [
+  "href",
+  "data-ft",
+  "aria-label",
+  "aria-expanded",
+  "data-url",
+  "data-lynx-uri",
+  "role",
+  "target"
+] 
+});
   }
 
   function shouldIgnoreMutation(mutation) {
@@ -1026,20 +1171,30 @@
         }
       }
 
-      for (const element of searchRoot.querySelectorAll('a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]')) {
-        if (!(element instanceof Element)) {
-          continue;
-        }
+for (const element of searchRoot.querySelectorAll('a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]')) {
+  if (!(element instanceof Element)) {
+    continue;
+  }
 
-        const owningPost = getOwningPostContainer(element);
-        if (owningPost && isScannablePostContainer(owningPost)) {
-          candidates.add(owningPost);
-        }
-      }
+  const owningPost = getOwningPostContainer(element);
+
+  if (!owningPost) {
+    scanStatus.skippedNoOwningPost += 1;
+    continue;
+  }
+
+  if (isScannablePostContainer(owningPost)) {
+    candidates.add(owningPost);
+  }
+}
     }
 
-    scanStatus.candidatePostsFound = candidates.size;
-    return candidates;
+scanStatus.lastCandidatePostsFound = candidates.size;
+scanStatus.candidatePostsFound = Math.max(
+  Number(scanStatus.candidatePostsFound || 0),
+  candidates.size
+);    
+return candidates;
   }
 
   function getScanRoots(root) {
@@ -1097,6 +1252,19 @@
     }
 
     return getCanonicalPost(element);
+  }
+
+  function getTopLevelPanelOwner(element) {
+    const base = getOwningPostContainer(element) || element;
+
+    if (!(base instanceof Element)) {
+      return base;
+    }
+
+    const ancestors = getArticleAncestors(base)
+      .filter((candidate) => candidate instanceof Element && isScannablePostContainer(candidate));
+
+    return ancestors[0] || base;
   }
 
   function isExcludedSurface(element) {
@@ -1172,13 +1340,18 @@
       return;
     }
 
-    const owningPost = getOwningPostContainer(post) || post;
+    const owningPost = getTopLevelPanelOwner(post);
     if (!owningPost.isConnected || !isScannablePostContainer(owningPost)) {
       return;
     }
 
     const postIdentity = getStablePostIdentity(owningPost);
     const postId = postIdentity.id;
+    console.debug("[DILI] Post identity", {
+      postId,
+      stable: postIdentity.stable,
+      reason: postIdentity.reason
+    });
     const postTextSnapshot = await buildVisiblePostTextSnapshot(owningPost);
     const linkInfo = extractRelevantLinks(owningPost, postId);
     const signature = buildPostSignature(linkInfo);
@@ -1186,31 +1359,51 @@
     if (postSignatureCache.get(owningPost) === signature) {
       const cachedPanel = cachedPanelByPostId.get(postId);
       if (linkInfo && cachedPanel && !owningPost.querySelector(".dili-panel[data-dili-owned='true']")) {
+        scanStatus.cachedPanelRestored += 1;
+        scanStatus.lastAnalysisPipelineState = {
+          stage: "cached-panel-restored",
+          postId,
+          timestamp: Date.now()
+        };
         renderBadge(owningPost, cachedPanel);
         return;
       }
 
-      if (!linkInfo) {
-        const currentState = await sendRuntimeMessage({
-          type: MESSAGE_TYPES.GET_POST_STATE,
-          postId
-        });
-        const storedBaseline = currentState?.baseline || null;
-        const hasOwnedArtifacts = Boolean(
-          owningPost.querySelector(".dili-panel[data-dili-owned='true'], .dili-panel-slot[data-dili-owned='true']") ||
-          cachedPanel
-        );
+if (!linkInfo) {
+  if (isPostCaptionProbablyCollapsed(owningPost)) {
+    if (preserveExistingPanelDuringNoLinkRescan(owningPost, postId, "collapsed-no-link-after-render")) {
+      scanStatus.panelPreservedCollapsedRescan += 1;
+      return;
+    }
 
-        if (
-          !storedBaseline ||
-          storedBaseline.baselineState !== "no_link" ||
-          storedBaseline.postTextHash !== postTextSnapshot.postTextHash ||
-          hasOwnedArtifacts
-        ) {
-          await setNoLinkState(owningPost, postId, postTextSnapshot);
-        }
-      }
+    await deferCollapsedNoLinkPost(owningPost, postId, postTextSnapshot);
+    return;
+  }
 
+  const currentState = await sendRuntimeMessage({
+    type: MESSAGE_TYPES.GET_POST_STATE,
+    postId
+  });
+
+  const storedBaseline = currentState?.baseline || null;
+  const hasOwnedArtifacts = Boolean(
+    owningPost.querySelector(".dili-panel[data-dili-owned='true'], .dili-panel-slot[data-dili-owned='true']") ||
+    cachedPanel
+  );
+
+  if (
+    !storedBaseline ||
+    storedBaseline.baselineState !== "no_link" ||
+    storedBaseline.postTextHash !== postTextSnapshot.postTextHash ||
+    hasOwnedArtifacts
+  ) {
+    if (preserveExistingPanelDuringNoLinkRescan(owningPost, postId, "no-link-after-render")) {
+      return;
+    }
+
+    await setNoLinkState(owningPost, postId, postTextSnapshot, postIdentity);
+  }
+}
       return;
     }
 
@@ -1220,11 +1413,30 @@
       lastSeen: Date.now()
     });
 
-    if (!linkInfo) {
-      scanStatus.skippedNoLinks += 1;
-      await setNoLinkState(owningPost, postId, postTextSnapshot);
+if (!linkInfo) {
+  scanStatus.skippedNoLinks += 1;
+
+  // If the caption is collapsed but there is no visible link/domain/CTA evidence,
+  // do not show a DILI panel. We cannot prove a link exists yet.
+  if (isPostCaptionProbablyCollapsed(owningPost)) {
+    if (preserveExistingPanelDuringNoLinkRescan(owningPost, postId, "collapsed-no-link-after-render")) {
+      scanStatus.panelPreservedCollapsedRescan += 1;
       return;
     }
+
+    await deferCollapsedNoLinkPost(owningPost, postId, postTextSnapshot);
+    return;
+  }
+
+  if (preserveExistingPanelDuringNoLinkRescan(owningPost, postId, "no-link-after-render")) {
+    return;
+  }
+
+  await setNoLinkState(owningPost, postId, postTextSnapshot, postIdentity);
+  return;
+}
+
+    scanStatus.lastPanelPreservationReason = "";
 
     scanStatus.eligibleLinkPostsFound += 1;
     const currentState = await sendRuntimeMessage({
@@ -1253,6 +1465,19 @@
       linkFingerprint,
       postTextHash: postTextSnapshot.postTextHash
     });
+
+    scanStatus.analysisRequestsSent += 1;
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "request-sent",
+      postId,
+      requestId,
+      messageType,
+      signature,
+      linkFingerprint,
+      linkCount: linkInfo.links.length,
+      timestamp: Date.now()
+    };
+
     renderBadge(owningPost, {
       label: "Analyzing",
       safetyScore: null,
@@ -1280,16 +1505,67 @@
       linkFingerprint
     });
 
+    if (response?.analysis) {
+      scanStatus.analysisResponsesReceived += 1;
+      scanStatus.lastAnalysisPipelineState = {
+        stage: "response-received",
+        postId,
+        requestId,
+        hasAnalysis: true,
+        timestamp: Date.now()
+      };
+    } else {
+      scanStatus.analysisResponsesMissing += 1;
+      scanStatus.lastAnalysisPipelineState = {
+        stage: "response-missing",
+        postId,
+        requestId,
+        error: response?.error || "",
+        timestamp: Date.now()
+      };
+    }
+
     const latestRequest = latestRequestByPostId.get(postId);
-    if (
-      !latestRequest ||
-      latestRequest.requestId !== requestId ||
-      latestRequest.signature !== signature ||
-      latestRequest.linkFingerprint !== linkFingerprint ||
-      latestRequest.postTextHash !== postTextSnapshot.postTextHash ||
-      buildPostSignature(extractRelevantLinks(owningPost, postId)) !== signature
-    ) {
+    const currentLinkInfoForStaleCheck = extractRelevantLinks(owningPost, postId, {
+      suppressDiagnostics: true
+    });
+    const currentSignatureForStaleCheck = buildPostSignature(currentLinkInfoForStaleCheck);
+
+    let staleReason = "";
+
+    if (!latestRequest) {
+      staleReason = "missing-request";
+      scanStatus.analysisStaleDiscardedByMissingRequest += 1;
+    } else if (latestRequest.requestId !== requestId) {
+      staleReason = "request-id";
+      scanStatus.analysisStaleDiscardedByRequestId += 1;
+    } else if (latestRequest.signature !== signature) {
+      staleReason = "signature";
+      scanStatus.analysisStaleDiscardedBySignature += 1;
+    } else if (latestRequest.linkFingerprint !== linkFingerprint) {
+      staleReason = "fingerprint";
+      scanStatus.analysisStaleDiscardedByFingerprint += 1;
+    } else if (latestRequest.postTextHash !== postTextSnapshot.postTextHash) {
+      staleReason = "text-hash";
+      scanStatus.analysisStaleDiscardedByTextHash += 1;
+    } else if (currentSignatureForStaleCheck !== signature) {
+      staleReason = "current-rescan";
+      scanStatus.analysisStaleDiscardedByCurrentRescan += 1;
+    }
+
+    if (staleReason) {
       scanStatus.staleResponsesDiscarded += 1;
+      scanStatus.lastAnalysisPipelineState = {
+        stage: "stale-discarded",
+        reason: staleReason,
+        postId,
+        requestId,
+        expectedSignature: signature,
+        currentSignature: currentSignatureForStaleCheck,
+        expectedFingerprint: linkFingerprint,
+        currentFingerprint: currentLinkInfoForStaleCheck?.linkFingerprint || "",
+        timestamp: Date.now()
+      };
       return;
     }
 
@@ -1308,93 +1584,554 @@
     }
 
     scanStatus.analyzedPosts += 1;
-    renderBadge(owningPost, mapAnalysisToViewModel(response.analysis));
-  }
-
-  async function setNoLinkState(post, postId, postTextSnapshot = null) {
-    await sendRuntimeMessage({
-      type: MESSAGE_TYPES.SET_NO_LINK_STATE,
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "rendering-analysis-panel",
       postId,
-      postTextHash: postTextSnapshot?.postTextHash || "",
-      normalizedVisiblePostText: postTextSnapshot?.normalizedVisiblePostText || ""
-    });
-    selectedPostLinkCache.delete(postId);
-    cachedPanelByPostId.delete(postId);
-    removeOwnedPanel(post);
+      requestId,
+      timestamp: Date.now()
+    };
+    renderBadge(owningPost, mapAnalysisToViewModel(response.analysis));
+    scanStatus.analysisRenderedPanels += 1;
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "analysis-panel-rendered",
+      postId,
+      requestId,
+      visiblePanels: document.querySelectorAll(".dili-panel[data-dili-owned='true']").length,
+      timestamp: Date.now()
+    };
   }
 
-  function extractRelevantLinks(post, postId = getStablePostId(post)) {
-    const rememberedSelection = selectedPostLinkCache.get(postId) || null;
-    let candidateElements = [...post.querySelectorAll('a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]')].filter((element) => {
-      return element instanceof Element && isUserFacingOutboundCandidate(element, post);
-    });
-    candidateElements = includeAncestorAnchors(candidateElements, post);
-    const candidates = candidateElements
-      .map((element) => buildRelevantLinkCandidate(element, post))
-      .filter(Boolean);
-    const withSponsoredFallback = candidates.length > 0 ? candidates : findSponsoredFallbackCandidates(post);
-    const candidateSummary = summarizePostLinkCandidates(candidates, rememberedSelection);
+function isPostCaptionProbablyCollapsed(post) {
+  if (!(post instanceof Element)) {
+    return false;
+  }
 
-    if (!candidateSummary?.dominantCandidate && withSponsoredFallback.length === 0) {
-      selectedPostLinkCache.delete(postId);
-      return null;
+  const candidates = [...post.querySelectorAll('[role="button"], span, div')];
+
+  return candidates.some((element) => {
+    if (!(element instanceof Element) || !isProbablyVisible(element)) {
+      return false;
     }
 
-    const sortedCandidates = [...(withSponsoredFallback.length ? withSponsoredFallback : candidates)].sort(compareRelevantLinkCandidates);
-    const uniqueCandidates = dedupeLinkCandidates(sortedCandidates).slice(0, MAX_LINKS_PER_POST);
-    const selectedCandidate = candidateSummary?.dominantCandidate || uniqueCandidates[0];
-    const uniqueDomains = [...new Set(uniqueCandidates.map((candidate) => candidate.registrableDomain).filter(Boolean))];
-    const uniqueTargets = [...new Set(uniqueCandidates.map((candidate) => candidate.normalizedTargetUrl).filter(Boolean))];
-    const candidateMode = uniqueDomains.length <= 1
-      ? uniqueTargets.length <= 1
-        ? "single"
-        : "multi-same-domain"
-      : "multi-mixed";
-    const selectedNormalizedTarget = selectedCandidate.normalizedTargetUrl || selectedCandidate.url;
-    const signature = buildCandidateSummarySignature({
-      candidateMode,
-      dominantDomain: selectedCandidate.registrableDomain || "",
-      selectedNormalizedTarget,
-      uniqueDomains
-    });
+    if (isLikelyActionBarOrControlContainer(element) || isLikelyCommentOrReplyContainer(element)) {
+      return false;
+    }
 
-    selectedPostLinkCache.set(postId, {
-      candidateMode,
-      dominantDomain: selectedCandidate.registrableDomain || "",
-      clusterKey: selectedNormalizedTarget,
-      normalizedTargetUrl: selectedCandidate.normalizedTargetUrl
-    });
+    const text = extractVisiblePostText(element)
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
 
-    return {
-      element: selectedCandidate.element,
-      url: selectedCandidate.url,
-      displayText: selectedCandidate.displayText,
-      normalizedTargetUrl: selectedCandidate.normalizedTargetUrl,
-      links: uniqueCandidates.map((candidate) => ({
-        url: candidate.url,
-        displayText: candidate.displayText,
-        normalizedTargetUrl: candidate.normalizedTargetUrl,
-        candidateContext: {
-          candidateMode,
-          candidateCount: uniqueCandidates.length,
-          candidateDomainCount: uniqueDomains.length,
-          dominantDomain: candidate.registrableDomain || "",
-          selectedNormalizedTarget: candidate.normalizedTargetUrl,
-          signature
-        }
-      })),
-      linkFingerprint: uniqueTargets.sort().join("|"),
+    const aria = String(element.getAttribute("aria-label") || "").toLowerCase();
+
+    return (
+      text === "see more" ||
+      text === "show more" ||
+      text === "more" ||
+      /\bsee more\b/.test(aria) ||
+      /\bshow more\b/.test(aria)
+    );
+  });
+}
+async function deferCollapsedNoLinkPost(post, postId, postTextSnapshot = null) {
+  await sendRuntimeMessage({
+    type: MESSAGE_TYPES.SET_NO_LINK_STATE,
+    postId,
+    baselineState: "truncated_unexpanded",
+    postTextHash: postTextSnapshot?.postTextHash || "",
+    normalizedVisiblePostText: postTextSnapshot?.normalizedVisiblePostText || ""
+  });
+
+  selectedPostLinkCache.delete(postId);
+  cachedPanelByPostId.delete(postId);
+
+  scanStatus.panelRemovedCollapsedDeferred += 1;
+  scanStatus.lastAnalysisPipelineState = {
+    stage: "panel-removed-collapsed-deferred",
+    postId,
+    timestamp: Date.now()
+  };
+
+  // Important:
+  // Do not render a panel here. A collapsed caption is not proof that a link exists.
+  // The post will be rescanned when "See more" mutates the DOM.
+  removeOwnedPanel(post);
+}
+async function setNoLinkState(post, postId, postTextSnapshot = null, postIdentity = null) {
+  const stable = postIdentity?.stable === true;
+
+  await sendRuntimeMessage({
+    type: MESSAGE_TYPES.SET_NO_LINK_STATE,
+    postId,
+    baselineState: stable ? "no_link" : "observed_no_link_unstable",
+    postTextHash: postTextSnapshot?.postTextHash || "",
+    normalizedVisiblePostText: postTextSnapshot?.normalizedVisiblePostText || ""
+  });
+
+  selectedPostLinkCache.delete(postId);
+  cachedPanelByPostId.delete(postId);
+
+  scanStatus.panelRemovedNoLinkState += 1;
+  scanStatus.lastAnalysisPipelineState = {
+    stage: "panel-removed-no-link-state",
+    postId,
+    baselineState: stable ? "no_link" : "observed_no_link_unstable",
+    timestamp: Date.now()
+  };
+  removeOwnedPanel(post);
+}
+function extractRelevantLinks(post, postId = getStablePostId(post), options = {}) {
+  const suppressDiagnostics = options?.suppressDiagnostics === true;
+  const rememberedSelection = selectedPostLinkCache.get(postId) || null;
+
+  let candidateElements = [...post.querySelectorAll(
+    'a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]'
+  )].filter((element) => {
+    return element instanceof Element && isUserFacingOutboundCandidate(element, post);
+  });
+
+  candidateElements = includeAncestorAnchors(candidateElements, post);
+
+const directCandidates = candidateElements
+  .map((element) => buildRelevantLinkCandidate(element, post))
+  .filter(Boolean);
+
+const embeddedCardCandidates = findEmbeddedCardCandidates(post);
+const sponsoredFallbackCandidates = findSponsoredFallbackCandidates(post);
+const visibleDomainFallbackCandidates = findVisibleDomainFallbackCandidates(post);
+
+const fallbackCandidates = [
+  ...sponsoredFallbackCandidates,
+  ...visibleDomainFallbackCandidates
+];
+
+const candidates = dedupeLinkCandidates([
+  ...directCandidates,
+  ...embeddedCardCandidates,
+  ...fallbackCandidates
+]);
+
+if (!suppressDiagnostics) {
+  scanStatus.directCandidatesFound += directCandidates.length;
+  scanStatus.embeddedCandidatesFound += embeddedCardCandidates.length;
+  scanStatus.sponsoredFallbackCandidatesFound += sponsoredFallbackCandidates.length;
+  scanStatus.visibleDomainCandidatesFound += visibleDomainFallbackCandidates.length;
+  scanStatus.fallbackCandidatesFound += fallbackCandidates.length;
+
+  scanStatus.lastCandidateBreakdown = {
+    direct: directCandidates.length,
+    embedded: embeddedCardCandidates.length,
+    sponsoredFallback: sponsoredFallbackCandidates.length,
+    visibleDomainFallback: visibleDomainFallbackCandidates.length,
+    fallback: fallbackCandidates.length,
+    total: candidates.length
+  };
+
+  console.debug("[DILI] Candidate summary", scanStatus.lastCandidateBreakdown);
+}
+
+  const candidateSummary = summarizePostLinkCandidates(candidates, rememberedSelection);
+
+  if (!candidateSummary?.dominantCandidate || candidates.length === 0) {
+    selectedPostLinkCache.delete(postId);
+    return null;
+  }
+
+  const sortedCandidates = [...candidates].sort(compareRelevantLinkCandidates);
+  const uniqueCandidates = dedupeLinkCandidates(sortedCandidates).slice(0, MAX_LINKS_PER_POST);
+  const selectedCandidate = candidateSummary.dominantCandidate || uniqueCandidates[0];
+
+  const uniqueDomains = [...new Set(
+    uniqueCandidates.map((candidate) => candidate.registrableDomain).filter(Boolean)
+  )];
+
+  const uniqueTargets = [...new Set(
+    uniqueCandidates.map((candidate) => candidate.normalizedTargetUrl).filter(Boolean)
+  )];
+
+  const candidateMode = uniqueDomains.length <= 1
+    ? uniqueTargets.length <= 1
+      ? "single"
+      : "multi-same-domain"
+    : "multi-mixed";
+
+  const selectedNormalizedTarget = selectedCandidate.normalizedTargetUrl || selectedCandidate.url;
+
+  const signature = buildCandidateSummarySignature({
+    candidateMode,
+    dominantDomain: selectedCandidate.registrableDomain || "",
+    selectedNormalizedTarget,
+    uniqueDomains
+  });
+
+  selectedPostLinkCache.set(postId, {
+    candidateMode,
+    dominantDomain: selectedCandidate.registrableDomain || "",
+    clusterKey: selectedNormalizedTarget,
+    normalizedTargetUrl: selectedCandidate.normalizedTargetUrl
+  });
+
+  return {
+    element: selectedCandidate.element,
+    url: selectedCandidate.url,
+    displayText: selectedCandidate.displayText,
+    normalizedTargetUrl: selectedCandidate.normalizedTargetUrl,
+    links: uniqueCandidates.map((candidate) => ({
+      url: candidate.url,
+      displayText: candidate.displayText,
+      normalizedTargetUrl: candidate.normalizedTargetUrl,
       candidateContext: {
         candidateMode,
         candidateCount: uniqueCandidates.length,
         candidateDomainCount: uniqueDomains.length,
-        dominantDomain: selectedCandidate.registrableDomain || "",
-        selectedNormalizedTarget,
+        dominantDomain: candidate.registrableDomain || "",
+        selectedNormalizedTarget: candidate.normalizedTargetUrl,
         signature
       }
-    };
+    })),
+    linkFingerprint: uniqueTargets.sort().join("|"),
+    candidateContext: {
+      candidateMode,
+      candidateCount: uniqueCandidates.length,
+      candidateDomainCount: uniqueDomains.length,
+      dominantDomain: selectedCandidate.registrableDomain || "",
+      selectedNormalizedTarget,
+      signature
+    }
+  };
+}
+function findVisibleDomainFallbackCandidates(post) {
+  if (!(post instanceof Element)) {
+    return [];
   }
 
+  const renderedText = extractRenderedVisibleText(post);
+  const text = removeHeaderTextFromRenderedText(post, renderedText);
+  const hasCta = CTA_TEXT_PATTERNS.some((pattern) => pattern.test(text));
+  const hasSponsored = /\bsponsored\b/i.test(text);
+  const hasEmbedOrAttachment = Boolean(
+    post.querySelector(
+      '[data-ad-preview]:not([data-ad-preview="message"]), [data-ad-comet-preview]:not([data-ad-comet-preview="message"]), [role="link"], [role="button"]'
+    )
+  );
+
+  if (!text) {
+    scanStatus.hiddenDomainFallbackSkipped += 1;
+    return [];
+  }
+
+  const domainMatches = [...text.matchAll(new RegExp(DOMAIN_TEXT_PATTERN.source, "gi"))]
+    .map((match) => String(match[0] || "").toLowerCase())
+    .filter(Boolean);
+
+  const postHasClearDestinationIntent = hasClearDestinationIntent(post, text);
+
+  const uniqueDomains = [...new Set(domainMatches)]
+    .filter((domain) => !isIgnoredVisibleDomain(domain))
+    .filter((domain) => {
+      if (!isLikelyImageAttributionDomain(domain)) {
+        return true;
+      }
+
+      // Do not scan image-generator attribution domains unless the post clearly
+      // presents them as a CTA/sponsored destination.
+      return postHasClearDestinationIntent;
+    });
+  if (uniqueDomains.length === 0) {
+    return [];
+  }
+
+  // Avoid treating random organic text as a link.
+  // But allow ads/cards with visible domains even if the href is hidden.
+  if (!hasSponsored && !hasCta && !hasEmbedOrAttachment) {
+    return [];
+  }
+
+  if (!hasSponsored && !hasCta && uniqueDomains.length > 0) {
+    const attachment = findPostAttachmentOrPreview(post);
+    const hasRenderedDomainInAttachment = attachment instanceof Element &&
+      DOMAIN_TEXT_PATTERN.test(extractRenderedVisibleText(attachment));
+
+    if (!hasRenderedDomainInAttachment) {
+      scanStatus.hiddenDomainFallbackSkipped += 1;
+      return [];
+    }
+  }
+
+  const filteredDomains = uniqueDomains.filter((domain) => {
+    if (!domainAppearsOnlyInHeader(domain, post, renderedText)) {
+      return true;
+    }
+
+    scanStatus.skippedHeaderDomain += 1;
+    return false;
+  });
+
+  if (filteredDomains.length === 0) {
+    return [];
+  }
+
+  return filteredDomains
+    .map((domain) => {
+      const normalizedDomain = domain.replace(/^www\./i, "");
+      const url = `https://${domain}`;
+
+      if (!isEligibleLink(url)) {
+        return null;
+      }
+
+      const hostname = safeHostname(url);
+      const registrableDomain = getRegistrableDomain(hostname);
+
+      return {
+        element: post,
+        url,
+        normalizedTargetUrl: safelyNormalizeComparableUrl(url),
+        displayText: domain,
+        hostname,
+        registrableDomain,
+        wrapperOutbound: false,
+        meaningfulText: true,
+        inMainContent: false,
+        inActionArea: false,
+        hasMedia: Boolean(post.querySelector("img, picture, video, svg")),
+        visualArea: 900,
+        textLength: domain.length,
+        urlLength: url.length,
+        domPath: `visible-domain:${normalizedDomain}`,
+        candidateSource: "visible-domain-fallback"
+      };
+    })
+    .filter(Boolean);
+}
+
+function findEmbeddedCardCandidates(post) {
+  if (!(post instanceof Element)) {
+    return [];
+  }
+
+  const cardSelectors = [
+    '[data-ad-preview]:not([data-ad-preview="message"])',
+    '[data-ad-comet-preview]:not([data-ad-comet-preview="message"])',
+    '[role="link"]',
+    '[role="button"]',
+    'a[href]',
+    '[data-url]',
+    '[data-lynx-uri]'
+  ];
+
+  const cards = [];
+
+  for (const selector of cardSelectors) {
+    for (const element of post.querySelectorAll(selector)) {
+      if (!(element instanceof Element) || !post.contains(element)) {
+        continue;
+      }
+
+      if (element.closest(".dili-panel, .dili-panel-slot, .dili-badge, .dili-warning-overlay")) {
+        continue;
+      }
+if (isInsidePostHeaderArea(element, post)) {
+  scanStatus.skippedHeaderDomain += 1;
+  continue;
+}
+      if (isLikelyActionBarOrControlContainer(element) || isLikelyCommentOrReplyContainer(element)) {
+        continue;
+      }
+
+      if (!isProbablyVisible(element)) {
+        continue;
+      }
+
+      cards.push(element);
+    }
+  }
+
+  const candidates = [];
+
+  for (const card of [...new Set(cards)]) {
+    const directCandidate = buildRelevantLinkCandidate(card, post);
+    if (directCandidate) {
+      candidates.push({
+        ...directCandidate,
+        candidateSource: "embedded-card-direct"
+      });
+      continue;
+    }
+
+    const renderedCardText = extractRenderedVisibleText(card);
+    const cardText = [
+      renderedCardText,
+      card.getAttribute("aria-label") || "",
+      card.getAttribute("title") || ""
+    ]
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!renderedCardText && !hasClearDestinationIntent(card, cardText)) {
+      scanStatus.hiddenDomainFallbackSkipped += 1;
+      continue;
+    }
+
+    const cardHasClearDestinationIntent = hasClearDestinationIntent(card, cardText);
+
+    const domainMatches = [...cardText.matchAll(new RegExp(DOMAIN_TEXT_PATTERN.source, "gi"))]
+      .map((match) => String(match[0] || "").toLowerCase())
+      .filter((domain) => domain && !isIgnoredVisibleDomain(domain))
+      .filter((domain) => {
+        if (!isLikelyImageAttributionDomain(domain)) {
+          return true;
+        }
+
+        // Do not convert image/meme attribution domains into embedded-card links
+        // unless the card/post has clear destination intent.
+        return cardHasClearDestinationIntent;
+      });
+
+    const filteredCardDomains = [...new Set(domainMatches)].filter((domain) => {
+      if (!domainAppearsOnlyInHeader(domain, post, cardText)) {
+        return true;
+      }
+
+      scanStatus.skippedHeaderDomain += 1;
+      return false;
+    });
+
+    for (const domain of filteredCardDomains) {
+      const url = `https://${domain}`;
+
+      if (!isEligibleLink(url)) {
+        continue;
+      }
+
+      const hostname = safeHostname(url);
+      const registrableDomain = getRegistrableDomain(hostname);
+
+      candidates.push({
+        element: card,
+        url,
+        normalizedTargetUrl: safelyNormalizeComparableUrl(url),
+        displayText: domain,
+        hostname,
+        registrableDomain,
+        wrapperOutbound: false,
+        meaningfulText: true,
+        inMainContent: false,
+        inActionArea: false,
+        hasMedia: Boolean(card.querySelector("img, picture, video, svg")),
+        visualArea: 1200,
+        textLength: domain.length,
+        urlLength: url.length,
+        domPath: `embedded-card-domain:${domain.replace(/^www\./i, "")}`,
+        candidateSource: "embedded-card-visible-domain"
+      });
+    }
+  }
+
+  return dedupeLinkCandidates(candidates);
+}
+
+function isBarePublicSuffixLikeDomain(domain) {
+  const normalized = String(domain || "")
+    .toLowerCase()
+    .replace(/^www\./, "")
+    .replace(/\.$/, "");
+
+  const parts = normalized.split(".").filter(Boolean);
+
+  if (parts.length < 2) {
+    return true;
+  }
+
+  // Common Philippine second-level category domains.
+  // These are not specific user-facing destinations by themselves.
+  const phSecondLevelCategories = new Set([
+    "com.ph",
+    "net.ph",
+    "org.ph",
+    "edu.ph",
+    "gov.ph",
+    "mil.ph"
+  ]);
+
+  if (phSecondLevelCategories.has(normalized)) {
+    return true;
+  }
+
+  // Keep this explicit for readability and future maintenance.
+  if (normalized === "edu.ph" || normalized === "gov.ph") {
+    return true;
+  }
+
+  return false;
+}
+
+function isRepeatedTokenDomainLikeValue(value, token) {
+  const normalized = String(value || "")
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/[^a-z0-9.]+/g, "")
+    .replace(/\.+/g, ".");
+
+  const hostLike = normalized.split(/[/?#]/)[0] || normalized;
+  const compact = hostLike.replace(/\./g, "");
+
+  if (!compact || !token) {
+    return false;
+  }
+
+  const repeatedPattern = new RegExp(`^(?:${token}){2,}(?:com|net|org)?$`, "i");
+  return repeatedPattern.test(compact);
+}
+
+function isMalformedRepeatedFacebookCandidate(value) {
+  const source = String(value || "").toLowerCase();
+
+  if (!source) {
+    return false;
+  }
+
+  if (isRepeatedTokenDomainLikeValue(source, "facebook")) {
+    return true;
+  }
+
+  try {
+    const url = new URL(source, location.href);
+    const host = url.hostname.toLowerCase();
+    const compactHost = host.replace(/^www\./, "").replace(/\./g, "");
+
+    return /^(?:facebook){2,}(?:com)?$/i.test(compactHost);
+  } catch {
+    return /(?:facebook){3,}/i.test(source.replace(/[^a-z]/g, ""));
+  }
+}
+
+function isIgnoredVisibleDomain(domain) {
+  const normalized = String(domain || "")
+    .toLowerCase()
+    .replace(/^www\./, "")
+    .replace(/\.$/, "");
+
+  if (isMalformedRepeatedFacebookCandidate(normalized)) {
+    scanStatus.skippedMalformedCandidate += 1;
+    return true;
+  }
+
+  if (isBarePublicSuffixLikeDomain(normalized)) {
+    scanStatus.skippedGenericDomain += 1;
+    return true;
+  }
+
+  return (
+    normalized === "facebook.com" ||
+    normalized === "fb.com" ||
+    normalized === "fbcdn.net" ||
+    normalized.endsWith(".fbcdn.net") ||
+    normalized === "messenger.com"
+  );
+}
   function includeAncestorAnchors(elements, post) {
     const result = new Set(elements);
     for (const element of elements) {
@@ -1442,16 +2179,20 @@
         ...Array.from(container.querySelectorAll?.('a[href], [data-lynx-uri], [data-url]') || [])
       ];
 
-      for (const element of elements) {
-        if (!(element instanceof Element)) {
-          continue;
-        }
+for (const element of elements) {
+  if (!(element instanceof Element)) {
+    continue;
+  }
 
-        const candidate = buildRelevantLinkCandidate(element, post);
-        if (candidate) {
-          candidates.push(candidate);
-        }
-      }
+  if (!isUserFacingOutboundCandidate(element, post)) {
+    continue;
+  }
+
+  const candidate = buildRelevantLinkCandidate(element, post);
+  if (candidate) {
+    candidates.push(candidate);
+  }
+}
     }
 
     const unique = dedupeLinkCandidates(candidates);
@@ -1462,19 +2203,35 @@
     return unique;
   }
 
-  function hasSponsoredFallbackSignals(post) {
-    const text = String(post.textContent || "").replace(/\s+/g, " ").trim();
-    const hasSponsored = /\bsponsored\b/i.test(text);
-    const hasCta = CTA_TEXT_PATTERNS.some((pattern) => pattern.test(text));
-    const hasPreviewDomain = DOMAIN_TEXT_PATTERN.test(text);
-    return hasSponsored && hasCta && hasPreviewDomain;
+function hasSponsoredFallbackSignals(post) {
+  const text = extractRenderedVisibleText(post).replace(/\s+/g, " ").trim();
+  const hasSponsored = /\bsponsored\b/i.test(text);
+  const hasCta = CTA_TEXT_PATTERNS.some((pattern) => pattern.test(text));
+  const hasPreviewDomain = DOMAIN_TEXT_PATTERN.test(text);
+  return hasSponsored && hasCta && hasPreviewDomain;
+}
+
+function buildRelevantLinkCandidate(element, post) {
+  if (isInsidePostHeaderArea(element, post)) {
+    scanStatus.skippedHeaderDomain += 1;
+    return null;
   }
 
-  function buildRelevantLinkCandidate(element, post) {
-    const rawUrl = getCandidateRawUrl(element);
-    if (!isEligibleLink(rawUrl)) {
-      return null;
-    }
+  const rawUrl = getCandidateRawUrl(element);
+
+  if (isMalformedRepeatedFacebookCandidate(rawUrl)) {
+    scanStatus.skippedMalformedCandidate += 1;
+    return null;
+  }
+
+  if (!isEligibleLink(rawUrl)) {
+    return null;
+  }
+
+  if (isLikelyImageSourceCandidate(element, rawUrl)) {
+    scanStatus.skippedImageSource += 1;
+    return null;
+  }
 
     const displayText = extractAnchorDisplayText(element);
     const normalizedTargetUrl = safelyNormalizeComparableUrl(rawUrl);
@@ -1505,35 +2262,67 @@
     };
   }
 
-  function getCandidateRawUrl(element) {
-    if (!(element instanceof Element)) {
-      return "";
-    }
-
-    const candidates = [
-      element.getAttribute("data-lynx-uri"),
-      element.getAttribute("data-url")
-    ];
-
-    if (element instanceof HTMLAnchorElement) {
-      candidates.push(element.href || element.getAttribute("href") || "");
-    }
-
-    for (const candidate of candidates) {
-      if (candidate && candidate.trim() && isEligibleLink(candidate.trim())) {
-        return candidate.trim();
-      }
-    }
-
-    for (const candidate of candidates) {
-      if (candidate && candidate.trim()) {
-        return candidate.trim();
-      }
-    }
-
+function getCandidateRawUrl(element) {
+  if (!(element instanceof Element)) {
     return "";
   }
 
+  const direct = readCandidateRawUrlFromElement(element);
+  if (direct) {
+    return direct;
+  }
+
+  const nested = element.querySelector?.('a[href], [data-lynx-uri], [data-url]');
+  if (nested instanceof Element) {
+    const nestedUrl = readCandidateRawUrlFromElement(nested);
+    if (nestedUrl) {
+      return nestedUrl;
+    }
+  }
+
+  const ancestor = element.closest?.('a[href], [data-lynx-uri], [data-url]');
+  if (ancestor instanceof Element && ancestor !== element) {
+    const ancestorUrl = readCandidateRawUrlFromElement(ancestor);
+    if (ancestorUrl) {
+      return ancestorUrl;
+    }
+  }
+
+  return "";
+}
+
+function readCandidateRawUrlFromElement(element) {
+  if (!(element instanceof Element)) {
+    return "";
+  }
+
+  const candidates = [
+    element.getAttribute("data-lynx-uri"),
+    element.getAttribute("data-url")
+  ];
+
+  if (element instanceof HTMLAnchorElement) {
+    candidates.push(element.href || element.getAttribute("href") || "");
+  } else {
+    candidates.push(element.getAttribute("href") || "");
+  }
+
+  for (const candidate of candidates) {
+    const value = String(candidate || "").trim();
+    if (value && isEligibleLink(value)) {
+      return value;
+    }
+  }
+
+  for (const candidate of candidates) {
+    const value = String(candidate || "").trim();
+    if (value) {
+      return value;
+    }
+  }
+
+  return "";
+}
   function summarizePostLinkCandidates(candidates, rememberedSelection) {
     if (!Array.isArray(candidates) || candidates.length === 0) {
       return null;
@@ -1616,6 +2405,14 @@
   function buildRelevantLinkScore(candidate) {
     let score = 0;
 
+    if (candidate.candidateSource === "embedded-card-direct") {
+      score += 35;
+    }
+
+    if (candidate.candidateSource === "embedded-card-visible-domain") {
+      score += 28;
+    }
+
     if (candidate.inMainContent) {
       score += 45;
     }
@@ -1643,34 +2440,61 @@
     return score;
   }
 
-  function isUserFacingOutboundCandidate(element, post) {
-    if (!(element instanceof Element) || !post.contains(element)) {
-      return false;
-    }
-
-    if (element.closest(".dili-badge, .dili-panel, .dili-warning-overlay")) {
-      return false;
-    }
-
-    if (isFacebookInAppFormElement(element) || isInternalFacebookMediaOrActionUrl(getCandidateRawUrl(element))) {
-      return false;
-    }
-
-    if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true") {
-      return false;
-    }
-
-    if (!isRenderedCandidateElement(element)) {
-      return false;
-    }
-
-    if (isElementInActionArea(element, post) || isElementInsideExcludedControlArea(element)) {
-      scanStatus.skippedActionArea += 1;
-      return false;
-    }
-
-    return hasMeaningfulCandidateSurface(element);
+function isUserFacingOutboundCandidate(element, post) {
+  if (!(element instanceof Element) || !post.contains(element)) {
+    scanStatus.skippedNoOwningPost += 1;
+    return false;
   }
+
+  if (element.closest(".dili-badge, .dili-panel, .dili-warning-overlay")) {
+    scanStatus.skippedDiliUi += 1;
+    return false;
+  }
+
+  if (isInsidePostHeaderArea(element, post)) {
+    scanStatus.skippedHeaderDomain += 1;
+    return false;
+  }
+
+  if (isInsideNestedSharedStory(element, post)) {
+    scanStatus.skippedNestedSharedStory += 1;
+    console.debug("[DILI] Skipping nested shared-story candidate.");
+    return false;
+  }
+
+  const rawUrl = getCandidateRawUrl(element);
+
+  if (!rawUrl) {
+    scanStatus.skippedNoUrl += 1;
+    return false;
+  }
+
+  if (
+    isFacebookInAppFormElement(element) ||
+    isInternalFacebookMediaOrActionUrl(rawUrl) ||
+    isFacebookMediaCdnOrViewerUrl(rawUrl)
+  ) {
+    scanStatus.skippedInternalFacebook += 1;
+    return false;
+  }
+
+  if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true") {
+    scanStatus.skippedHidden += 1;
+    return false;
+  }
+
+  if (!isRenderedCandidateElement(element)) {
+    scanStatus.skippedHidden += 1;
+    return false;
+  }
+
+  if (isElementInActionArea(element, post) || isElementInsideExcludedControlArea(element)) {
+    scanStatus.skippedActionArea += 1;
+    return false;
+  }
+
+  return hasMeaningfulCandidateSurface(element);
+}
 
   function isFacebookInAppFormElement(element) {
     const text = buildCandidateUtilityText(element);
@@ -1888,6 +2712,35 @@
     }
   }
 
+  function hasRenderedOrCachedPanel(post, postId) {
+    if (!(post instanceof Element)) {
+      return false;
+    }
+
+    return Boolean(
+      post.querySelector(".dili-panel[data-dili-owned='true']") ||
+      post.querySelector(".dili-panel-slot[data-dili-owned='true']") ||
+      cachedPanelByPostId.has(postId)
+    );
+  }
+
+  function preserveExistingPanelDuringNoLinkRescan(post, postId, reason) {
+    if (!hasRenderedOrCachedPanel(post, postId)) {
+      return false;
+    }
+
+    scanStatus.panelPreservedNoLinkRescan += 1;
+    scanStatus.lastPanelPreservationReason = reason || "no-link-rescan";
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "panel-preserved-no-link-rescan",
+      reason: reason || "no-link-rescan",
+      postId,
+      timestamp: Date.now()
+    };
+
+    return true;
+  }
+
   function removeAllOwnedPanels() {
     for (const artifact of document.querySelectorAll(".dili-panel[data-dili-owned='true'], .dili-panel-slot[data-dili-owned='true']")) {
       artifact.remove();
@@ -1971,6 +2824,15 @@
       }
 
       const url = new URL(rawUrl, location.href);
+
+      if (isMalformedRepeatedFacebookCandidate(rawUrl) || isMalformedRepeatedFacebookCandidate(url.hostname)) {
+        return false;
+      }
+
+      if (isFacebookMediaCdnOrViewerUrl(url.toString())) {
+        return false;
+      }
+
       if (!["http:", "https:"].includes(url.protocol)) {
         return false;
       }
@@ -2011,30 +2873,36 @@
     }
   }
 
-  function renderBadge(post, viewModel) {
-    const owningPost = getOwningPostContainer(post) || post;
-    const mountPoint = getBadgeMountPoint(owningPost);
-    const panels = [...owningPost.querySelectorAll(".dili-panel[data-dili-owned='true']")];
-    if (panels.length > 1) {
-      for (const extraPanel of panels.slice(1)) {
-        extraPanel.remove();
-        scanStatus.duplicatePanelsRemoved += 1;
-      }
-    }
+function renderBadge(post, viewModel) {
+  const owningPost = getTopLevelPanelOwner(post);
+  const mountPoint = getBadgeMountPoint(owningPost);
+  const panels = [...owningPost.querySelectorAll(".dili-panel[data-dili-owned='true']")];
 
-    let badge = owningPost.querySelector(".dili-panel[data-dili-owned='true']");
-    if (!badge) {
-      badge = document.createElement("div");
-      badge.className = "dili-panel";
-      badge.dataset.diliOwned = "true";
+  if (panels.length > 1) {
+    for (const extraPanel of panels.slice(1)) {
+      extraPanel.remove();
+      scanStatus.duplicatePanelsRemoved += 1;
     }
+  }
 
-    if (badge.parentElement !== mountPoint) {
-      mountPoint.appendChild(badge);
-    }
+  let badge = owningPost.querySelector(".dili-panel[data-dili-owned='true']");
+  if (!badge) {
+    badge = document.createElement("div");
+    badge.className = "dili-panel";
+    badge.dataset.diliOwned = "true";
+  }
 
-    const severityLevel = normalizeInlineSeverityLevel(viewModel);
-    const severityClass = sanitizeClassToken(severityLevel);
+  badge.style.width = "100%";
+  badge.style.maxWidth = "100%";
+  badge.style.boxSizing = "border-box";
+  badge.style.alignSelf = "stretch";
+
+  if (badge.parentElement !== mountPoint) {
+    mountPoint.appendChild(badge);
+  }
+
+  const severityLevel = normalizeInlineSeverityLevel(viewModel);
+  const severityClass = sanitizeClassToken(severityLevel);
     const scoreText = viewModel.scoreLabel || buildInlineScoreLabel(viewModel, severityLevel);
     const statusLabel = viewModel.label || getDefaultInlineLabel(severityLevel);
     const summaryLine = viewModel.summaryLine || buildInlineSummaryLine(viewModel, severityLevel);
@@ -2718,6 +3586,44 @@ if (
     return Boolean(element.matches('[data-ad-preview]:not([data-ad-preview="message"]), [data-ad-comet-preview]:not([data-ad-comet-preview="message"])'));
   }
 
+  function isNestedSharedStoryContainer(candidate, owningPost) {
+    if (!(candidate instanceof Element) || !(owningPost instanceof Element)) {
+      return false;
+    }
+
+    if (candidate === owningPost || !owningPost.contains(candidate)) {
+      return false;
+    }
+
+    if (!isPostContainerCandidate(candidate)) {
+      return false;
+    }
+
+    const rect = candidate.getBoundingClientRect();
+    const postRect = owningPost.getBoundingClientRect();
+
+    return (
+      rect.top > postRect.top + 80 &&
+      hasPostAuthorHeader(candidate) &&
+      hasPostBodyOrAttachment(candidate)
+    );
+  }
+
+  function isInsideNestedSharedStory(element, owningPost) {
+    if (!(element instanceof Element) || !(owningPost instanceof Element)) {
+      return false;
+    }
+
+    const nestedPost = element.closest('div[role="article"], article, [aria-posinset]');
+
+    return Boolean(
+      nestedPost &&
+      nestedPost !== owningPost &&
+      owningPost.contains(nestedPost) &&
+      isNestedSharedStoryContainer(nestedPost, owningPost)
+    );
+  }
+
   function isLikelyActionBarOrControlContainer(element) {
     if (!(element instanceof Element)) {
       return false;
@@ -2853,103 +3759,578 @@ if (
     return null;
   }
 
-  function findPostCaption(post) {
-    if (!(post instanceof Element)) {
-      return null;
+  function isInsidePostHeaderArea(element, post) {
+    if (!(element instanceof Element) || !(post instanceof Element) || !post.contains(element)) {
+      return false;
     }
 
-    for (const selector of MAIN_POST_CONTENT_SELECTORS) {
-      const match = [...post.querySelectorAll(selector)].find((element) => {
-        if (!(element instanceof Element) || !post.contains(element) || !isProbablyVisible(element)) {
-          return false;
-        }
-
-        if (isLikelyActionBarOrControlContainer(element) || isLikelyCommentOrReplyContainer(element)) {
-          return false;
-        }
-
-        return extractVisiblePostText(element).length >= 2;
-      });
-
-      if (match) {
-        return match;
-      }
+    const header = findPostHeader(post);
+    if (header instanceof Element && header.contains(element)) {
+      return true;
     }
 
-    return null;
-  }
-
-  function findPostAttachmentOrPreview(post) {
-    if (!(post instanceof Element)) {
-      return null;
-    }
-
-    const selectors = [
-      '[data-ad-preview]',
-      '[data-ad-comet-preview]',
-      'img',
-      'video',
-      'picture',
-      '[aria-label*="carousel"]',
-      '[aria-label*="preview"]',
-      '[role="link"]'
-    ];
-
-    for (const selector of selectors) {
-      const match = [...post.querySelectorAll(selector)].find((element) => {
-        if (!(element instanceof Element) || !post.contains(element) || !isProbablyVisible(element)) {
-          return false;
-        }
-
-        if (isLikelyActionBarOrControlContainer(element) || isLikelyCommentOrReplyContainer(element)) {
-          return false;
-        }
-
-        if (selector === '[role="link"]' && extractVisiblePostText(element).length < 2 && !element.querySelector('img, video, picture, svg')) {
-          return false;
-        }
-
-        return true;
-      });
-
-      if (match) {
-        return match;
-      }
-    }
-
-    return null;
-  }
-
-  function findPanelInsertionPoint(post) {
     const headerBlock = findPostHeaderBlock(post);
-    if (headerBlock?.parentElement instanceof Element) {
-      return {
-        parent: headerBlock.parentElement,
-        beforeNode: headerBlock.nextSibling || null
-      };
+    if (headerBlock instanceof Element && headerBlock.contains(element)) {
+      return true;
     }
 
-    const caption = findPostCaption(post);
-    if (caption?.parentElement instanceof Element) {
-      return {
-        parent: caption.parentElement,
-        beforeNode: caption
-      };
+    const utilityText = buildCandidateUtilityText(element);
+    const rect = element.getBoundingClientRect();
+    const postRect = post.getBoundingClientRect();
+
+    const appearsNearTop = rect.top <= postRect.top + Math.max(90, postRect.height * 0.12);
+
+    const looksLikeIdentityOrMetadata =
+      /\b(profile|page|author|posted|sponsored|follow|verified|timestamp|public|friends)\b/i.test(utilityText) ||
+      Boolean(element.closest('h1, h2, h3, strong, time, abbr, [role="heading"]'));
+
+    return appearsNearTop && looksLikeIdentityOrMetadata;
+  }
+
+  function removeHeaderTextFromRenderedText(post, renderedText) {
+    if (!(post instanceof Element)) {
+      return String(renderedText || "").replace(/\s+/g, " ").trim();
     }
 
-    const attachment = findPostAttachmentOrPreview(post);
-    if (attachment?.parentElement instanceof Element) {
-      return {
-        parent: attachment.parentElement,
-        beforeNode: attachment
-      };
+    const headerTexts = [];
+
+    const header = findPostHeader(post);
+    if (header instanceof Element) {
+      headerTexts.push(extractRenderedVisibleText(header));
     }
 
+    const headerBlock = findPostHeaderBlock(post);
+    if (headerBlock instanceof Element) {
+      headerTexts.push(extractRenderedVisibleText(headerBlock));
+    }
+
+    let text = String(renderedText || "").replace(/\s+/g, " ").trim();
+
+    for (const headerText of headerTexts) {
+      const normalizedHeader = String(headerText || "").replace(/\s+/g, " ").trim();
+      if (!normalizedHeader) {
+        continue;
+      }
+
+      if (text.startsWith(normalizedHeader)) {
+        text = text.slice(normalizedHeader.length).replace(/\s+/g, " ").trim();
+        continue;
+      }
+
+      text = text.replace(normalizedHeader, " ").replace(/\s+/g, " ").trim();
+    }
+
+    return text;
+  }
+
+  function domainAppearsOnlyInHeader(domain, post, candidateText = "") {
+    const normalizedDomain = String(domain || "")
+      .toLowerCase()
+      .replace(/^www\./, "")
+      .replace(/\.$/, "");
+
+    if (!normalizedDomain || !(post instanceof Element)) {
+      return false;
+    }
+
+    const fullText = String(candidateText || extractRenderedVisibleText(post))
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const bodyText = removeHeaderTextFromRenderedText(post, fullText)
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const header = findPostHeader(post);
+    const headerBlock = findPostHeaderBlock(post);
+
+    const headerText = [
+      header instanceof Element ? extractRenderedVisibleText(header) : "",
+      headerBlock instanceof Element ? extractRenderedVisibleText(headerBlock) : ""
+    ]
+      .join(" ")
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .trim();
+
+    return (
+      headerText.includes(normalizedDomain) &&
+      !bodyText.includes(normalizedDomain)
+    );
+  }
+
+function findPostCaption(post) {
+  if (!(post instanceof Element)) {
+    return null;
+  }
+
+  // Prefer real Facebook caption/message containers only.
+  const primarySelectors = [
+    '[data-ad-preview="message"]',
+    '[data-ad-comet-preview="message"]',
+    '[data-testid="post_message"]'
+  ];
+
+  for (const selector of primarySelectors) {
+    const match = [...post.querySelectorAll(selector)].find((element) => {
+      return isValidCaptionCandidate(element, post);
+    });
+
+    if (match) {
+      return match;
+    }
+  }
+
+  // Fallback for organic posts where Facebook only exposes caption text as dir="auto".
+  // This fallback must not select text inside embeds, previews, CTAs, or media cards.
+  const fallbackCandidates = [...post.querySelectorAll('[dir="auto"]')]
+    .filter((element) => isValidCaptionCandidate(element, post))
+    .sort((left, right) => {
+      const leftRect = left.getBoundingClientRect();
+      const rightRect = right.getBoundingClientRect();
+      return leftRect.top - rightRect.top;
+    });
+
+  return fallbackCandidates[0] || null;
+}
+function isForbiddenPanelMountSurface(element, owningPost) {
+  if (!(element instanceof Element) || !(owningPost instanceof Element)) {
+    return true;
+  }
+
+  if (!owningPost.contains(element)) {
+    return true;
+  }
+
+  if (isElementInsideUnsafeClickableSurface(element, owningPost)) {
+    return true;
+  }
+
+  const forbiddenAncestor = element.closest(
+    'a[href], [data-url], [data-lynx-uri], [role="link"], [role="button"], [data-ad-preview]:not([data-ad-preview="message"]), [data-ad-comet-preview]:not([data-ad-comet-preview="message"])'
+  );
+
+  return Boolean(
+    forbiddenAncestor &&
+    forbiddenAncestor !== owningPost &&
+    owningPost.contains(forbiddenAncestor)
+  );
+}
+function isValidCaptionCandidate(element, post) {
+  if (!(element instanceof Element) || !post.contains(element) || !isProbablyVisible(element)) {
+    return false;
+  }
+
+  if (element.closest(".dili-panel, .dili-panel-slot, .dili-badge, .dili-warning-overlay")) {
+    return false;
+  }
+
+  if (isLikelyActionBarOrControlContainer(element) || isLikelyCommentOrReplyContainer(element)) {
+    return false;
+  }
+
+  // Critical: do not treat embed/card text as the caption.
+  if (element.closest('[role="link"], a[href], [data-url], [data-lynx-uri]')) {
+    return false;
+  }
+
+  if (element.closest('[data-ad-preview]:not([data-ad-preview="message"]), [data-ad-comet-preview]:not([data-ad-comet-preview="message"])')) {
+    return false;
+  }
+
+  const text = extractVisiblePostText(element);
+  if (text.length < 2) {
+    return false;
+  }
+
+  // Captions are usually above the media/attachment. Reject text that is clearly
+  // inside or below the first media/card block.
+  const attachment = findPostAttachmentOrPreview(post);
+  if (attachment instanceof Element && attachment !== element) {
+    const elementRect = element.getBoundingClientRect();
+    const attachmentRect = attachment.getBoundingClientRect();
+
+    if (elementRect.top >= attachmentRect.top - 4 && attachment.contains(element)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+function findPostAttachmentOrPreview(post) {
+  if (!(post instanceof Element)) {
+    return null;
+  }
+
+  const selectors = [
+    '[data-ad-preview]:not([data-ad-preview="message"])',
+    '[data-ad-comet-preview]:not([data-ad-comet-preview="message"])',
+    '[role="link"]:has(img), [role="link"]:has(video), [role="link"]:has(picture)',
+    '[role="button"]:has(img), [role="button"]:has(video), [role="button"]:has(picture)',
+    'a[href]:has(img), a[href]:has(video), a[href]:has(picture)',
+    '[aria-label*="carousel"]',
+    '[aria-label*="preview"]',
+    'video',
+    'picture',
+    'img'
+  ];
+
+  for (const selector of selectors) {
+    let matches = [];
+
+    try {
+      matches = [...post.querySelectorAll(selector)];
+    } catch {
+      continue;
+    }
+
+    const match = matches.find((element) => {
+      if (!(element instanceof Element) || !post.contains(element) || !isProbablyVisible(element)) {
+        return false;
+      }
+
+      if (element.closest(".dili-panel, .dili-panel-slot, .dili-badge")) {
+        return false;
+      }
+
+      if (isLikelyActionBarOrControlContainer(element) || isLikelyCommentOrReplyContainer(element)) {
+        return false;
+      }
+
+      return true;
+    });
+
+    if (match) {
+      return match;
+    }
+  }
+
+  return null;
+}
+function findPanelInsertionPoint(post) {
+  const fallbackPoint = getSafePanelFallbackPoint(post);
+
+  // Desired layout:
+  // Header
+  // DILI panel
+  // Caption
+  // Media / embedded card
+  const caption = findPostCaption(post);
+  if (caption instanceof Element) {
+    const captionPoint = buildSafeInsertionBeforeElement(post, caption);
+    if (captionPoint) {
+      return captionPoint;
+    }
+  }
+
+  const attachment = findPostAttachmentOrPreview(post);
+  if (attachment instanceof Element) {
+    const attachmentPoint = buildSafeInsertionBeforeElement(post, attachment);
+    if (attachmentPoint) {
+      return attachmentPoint;
+    }
+  }
+
+  const headerBlock = findPostHeaderBlock(post);
+  if (headerBlock instanceof Element) {
+    const headerPoint = buildSafeInsertionAfterElement(post, headerBlock);
+    if (headerPoint) {
+      return headerPoint;
+    }
+  }
+
+  return fallbackPoint;
+}
+function isFacebookMediaCdnOrViewerUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl, location.href);
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname.toLowerCase();
+
+    if (
+      host.endsWith("fbcdn.net") ||
+      host.includes("scontent.") ||
+      host.includes("fbsbx.com")
+    ) {
+      return true;
+    }
+
+    if (isFacebookHost(host)) {
+      return (
+        path.startsWith("/photo") ||
+        path.includes("/photo/") ||
+        path.includes("/photos/") ||
+        path.startsWith("/watch") ||
+        path.includes("/videos/") ||
+        path.startsWith("/reel") ||
+        path.includes("/reel/")
+      );
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+function isLikelyImageAssetUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl, location.href);
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname.toLowerCase();
+
+    if (/\.(?:png|jpe?g|gif|webp|avif|bmp|svg)(?:$|[?#])/.test(path)) {
+      return true;
+    }
+
+    return (
+      host.startsWith("i.") ||
+      host.startsWith("img.") ||
+      host.startsWith("image.") ||
+      host.startsWith("images.") ||
+      host.includes("cdn") && /\.(?:png|jpe?g|gif|webp|avif|bmp|svg)(?:$|[?#])/.test(rawUrl)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isLikelyImageAttributionDomain(domain) {
+  const normalized = String(domain || "")
+    .toLowerCase()
+    .replace(/^www\./, "");
+
+  return (
+    normalized === "imgflip.com" ||
+    normalized === "i.imgflip.com" ||
+    normalized === "memegenerator.net" ||
+    normalized === "makeameme.org" ||
+    normalized === "kapwing.com"
+  );
+}
+
+function hasClearDestinationIntent(element, text = "") {
+  const utilityText = element instanceof Element ? buildCandidateUtilityText(element) : "";
+  const anchorText = element instanceof Element ? extractAnchorDisplayText(element) : "";
+  const combinedText = `${text} ${anchorText} ${utilityText}`.replace(/\s+/g, " ").trim();
+
+  const hasCta = CTA_TEXT_PATTERNS.some((pattern) => pattern.test(combinedText));
+  const hasSponsored = /\bsponsored\b/i.test(combinedText);
+  const hasExplicitCardMetadata = Boolean(
+    element instanceof Element &&
+    (
+      element.matches('[data-ad-preview]:not([data-ad-preview="message"]), [data-ad-comet-preview]:not([data-ad-comet-preview="message"])') ||
+      element.closest('[data-ad-preview]:not([data-ad-preview="message"]), [data-ad-comet-preview]:not([data-ad-comet-preview="message"])')
+    )
+  );
+
+  return hasCta || hasSponsored || hasExplicitCardMetadata;
+}
+
+function isLikelyImageSourceCandidate(element, rawUrl) {
+  if (!(element instanceof Element)) {
+    return false;
+  }
+
+  const text = extractAnchorDisplayText(element);
+  const utilityText = buildCandidateUtilityText(element);
+  const combinedText = `${text} ${utilityText}`.replace(/\s+/g, " ").trim();
+
+  const hasMedia = Boolean(
+    element.matches("img, picture, video, svg") ||
+    element.querySelector("img, picture, video, svg")
+  );
+
+  if (!hasMedia) {
+    return false;
+  }
+
+  // Real ad/link cards should still be scanned.
+  if (hasClearDestinationIntent(element, combinedText)) {
+    return false;
+  }
+
+  const host = safeHostname(rawUrl);
+  const registrableDomain = getRegistrableDomain(host);
+
+  return (
+    isLikelyImageAssetUrl(rawUrl) ||
+    isLikelyImageAttributionDomain(host) ||
+    isLikelyImageAttributionDomain(registrableDomain)
+  );
+}
+function getSafePanelFallbackPoint(post) {
+  if (!(post instanceof Element)) {
     return {
-      parent: post,
-      beforeNode: post.firstElementChild || null
+      parent: document.body,
+      beforeNode: null
     };
   }
+
+  const headerBlock = findPostHeaderBlock(post);
+  if (headerBlock instanceof Element && headerBlock.parentElement instanceof Element) {
+    return {
+      parent: headerBlock.parentElement,
+      beforeNode: headerBlock.nextSibling || null
+    };
+  }
+
+  return {
+    parent: post,
+    beforeNode: post.firstElementChild || null
+  };
+}
+function buildSafeInsertionBeforeElement(post, target) {
+  if (!(post instanceof Element) || !(target instanceof Element) || !post.contains(target)) {
+    return null;
+  }
+
+  let node = target;
+
+  while (node.parentElement instanceof Element && node.parentElement !== post) {
+    const parent = node.parentElement;
+
+    if (isUnsafePanelMountParent(parent, post)) {
+      node = parent;
+      continue;
+    }
+
+    if (isLikelyActionBarOrControlContainer(parent) || isLikelyCommentOrReplyContainer(parent)) {
+      node = parent;
+      continue;
+    }
+
+    if (isPanelMountGeometrySafe(parent, post)) {
+      return {
+        parent,
+        beforeNode: node
+      };
+    }
+
+    node = parent;
+  }
+
+  if (node instanceof Element && node.parentElement === post) {
+    return {
+      parent: post,
+      beforeNode: node
+    };
+  }
+
+  return null;
+}
+
+function buildSafeInsertionAfterElement(post, target) {
+  if (!(post instanceof Element) || !(target instanceof Element) || !post.contains(target)) {
+    return null;
+  }
+
+  let node = target;
+
+  while (node.parentElement instanceof Element && node.parentElement !== post) {
+    const parent = node.parentElement;
+
+    if (isUnsafePanelMountParent(parent, post)) {
+      node = parent;
+      continue;
+    }
+
+    if (isLikelyActionBarOrControlContainer(parent) || isLikelyCommentOrReplyContainer(parent)) {
+      node = parent;
+      continue;
+    }
+
+    if (isPanelMountGeometrySafe(parent, post)) {
+      return {
+        parent,
+        beforeNode: node.nextSibling || null
+      };
+    }
+
+    node = parent;
+  }
+
+  if (node instanceof Element && node.parentElement === post) {
+    return {
+      parent: post,
+      beforeNode: node.nextSibling || null
+    };
+  }
+
+  return null;
+}
+
+function isPanelMountGeometrySafe(parent, post) {
+  if (!(parent instanceof Element) || !(post instanceof Element)) {
+    return false;
+  }
+
+  const parentRect = parent.getBoundingClientRect();
+  const postRect = post.getBoundingClientRect();
+
+  if (parentRect.width <= 0 || postRect.width <= 0) {
+    return false;
+  }
+
+  if (parentRect.width < postRect.width * 0.72) {
+    return false;
+  }
+
+  if (parentRect.left < postRect.left - 12 || parentRect.right > postRect.right + 12) {
+    return false;
+  }
+
+  return true;
+}
+
+function normalizePanelInsertionPoint(post, preferredPoint, fallbackPoint) {
+  if (
+    !preferredPoint?.parent ||
+    !(preferredPoint.parent instanceof Element) ||
+    !post.contains(preferredPoint.parent)
+  ) {
+    return fallbackPoint;
+  }
+
+  if (isUnsafePanelMountParent(preferredPoint.parent, post)) {
+    return fallbackPoint;
+  }
+
+  if (!isPanelMountGeometrySafe(preferredPoint.parent, post)) {
+    return fallbackPoint;
+  }
+
+  return preferredPoint;
+}
+
+function isUnsafePanelMountParent(parent, owningPost) {
+  if (!(parent instanceof Element)) {
+    return true;
+  }
+
+  const clickableAncestor = parent.closest(UNSAFE_PANEL_ANCESTOR_SELECTOR);
+
+  return Boolean(
+    clickableAncestor &&
+    clickableAncestor !== owningPost &&
+    owningPost.contains(clickableAncestor)
+  );
+}
+
+function isElementInsideUnsafeClickableSurface(element, owningPost) {
+  if (!(element instanceof Element)) {
+    return false;
+  }
+
+  const clickableAncestor = element.closest(UNSAFE_PANEL_ANCESTOR_SELECTOR);
+
+  return Boolean(
+    clickableAncestor &&
+    clickableAncestor !== owningPost &&
+    owningPost.contains(clickableAncestor)
+  );
+}
 
   function findPostHeaderBlock(post) {
     const header = findPostHeader(post);
@@ -2975,33 +4356,93 @@ if (
     return block;
   }
 
-  function ensurePanelSlot(post) {
-    const ownedSlots = [...post.querySelectorAll(".dili-panel-slot[data-dili-owned='true']")];
-    let slot = ownedSlots[0] || null;
+function ensurePanelSlot(post) {
+const ownedSlots = [...post.querySelectorAll(".dili-panel-slot[data-dili-owned='true']")];
+let slot = ownedSlots[0] || null;
 
-    for (const extraSlot of ownedSlots.slice(1)) {
-      extraSlot.remove();
-      scanStatus.duplicatePanelsRemoved += 1;
-    }
-
-    if (!slot) {
-      slot = document.createElement("div");
-      slot.className = "dili-panel-slot";
-      slot.dataset.diliOwned = "true";
-    }
-
-    const insertionPoint = findPanelInsertionPoint(post);
-    if (slot.parentElement !== insertionPoint.parent || slot.nextSibling !== insertionPoint.beforeNode) {
-      if (insertionPoint.beforeNode instanceof Node) {
-        insertionPoint.parent.insertBefore(slot, insertionPoint.beforeNode);
-      } else {
-        insertionPoint.parent.appendChild(slot);
-      }
-    }
-
-    cleanupDuplicatePanelArtifacts(post, slot);
-    return slot;
+  for (const extraSlot of ownedSlots.slice(1)) {
+    extraSlot.remove();
+    scanStatus.duplicatePanelsRemoved += 1;
   }
+
+if (slot && isExistingPanelSlotStillSafe(slot, post)) {
+  scanStatus.panelSlotReused += 1;
+  cleanupDuplicatePanelArtifacts(post, slot);
+  return slot;
+}
+
+  if (!slot) {
+    slot = document.createElement("div");
+    slot.className = "dili-panel-slot";
+    slot.dataset.diliOwned = "true";
+  }
+
+  slot.style.width = "100%";
+  slot.style.maxWidth = "100%";
+  slot.style.boxSizing = "border-box";
+  slot.style.alignSelf = "stretch";
+
+  let insertionPoint = findPanelInsertionPoint(post);
+
+if (
+  !insertionPoint?.parent ||
+  !(insertionPoint.parent instanceof Element) ||
+  isForbiddenPanelMountSurface(insertionPoint.parent, post)
+) {
+  scanStatus.panelMountFallbackUsed += 1;
+  insertionPoint = getSafePanelFallbackPoint(post);
+}
+  if (slot.parentElement !== insertionPoint.parent || slot.nextSibling !== insertionPoint.beforeNode) {
+    if (insertionPoint.beforeNode instanceof Node) {
+      insertionPoint.parent.insertBefore(slot, insertionPoint.beforeNode);
+    } else {
+      insertionPoint.parent.appendChild(slot);
+    }
+  }
+
+  // Final assertion: if Facebook DOM still placed this inside a clickable/card
+  // surface, force the slot to the top-level post container.
+if (isForbiddenPanelMountSurface(slot, post)) {
+  scanStatus.panelUnsafeRelocated += 1;
+
+  const fallbackPoint = {
+    parent: post,
+    beforeNode: post.firstElementChild || null
+  };
+
+  if (fallbackPoint.beforeNode instanceof Node) {
+    fallbackPoint.parent.insertBefore(slot, fallbackPoint.beforeNode);
+  } else {
+    fallbackPoint.parent.appendChild(slot);
+  }
+}
+
+  cleanupDuplicatePanelArtifacts(post, slot);
+  return slot;
+}
+
+function isExistingPanelSlotStillSafe(slot, post) {
+  if (!(slot instanceof Element) || !(post instanceof Element)) {
+    return false;
+  }
+
+  if (!post.contains(slot)) {
+    return false;
+  }
+
+  if (isForbiddenPanelMountSurface(slot, post)) {
+    return false;
+  }
+
+  const rect = slot.getBoundingClientRect();
+  const postRect = post.getBoundingClientRect();
+
+  if (rect.width <= 0 || postRect.width <= 0) {
+    return false;
+  }
+
+  return rect.width >= postRect.width * 0.72;
+}
 
   function cleanupDuplicatePanelArtifacts(post, activeSlot) {
     const activePanel = activeSlot?.querySelector(".dili-panel[data-dili-owned='true']") || null;
@@ -3027,6 +4468,12 @@ if (
     }
 
     const clone = post.cloneNode(true);
+    for (const nested of [...clone.querySelectorAll('div[role="article"], article, [aria-posinset]')]) {
+      if (nested !== clone) {
+        nested.remove();
+      }
+    }
+
     for (const selector of [".dili-panel", ".dili-panel-slot", ".dili-badge", ".dili-details", ".dili-warning-overlay", ".dili-warning-modal", "script", "style", "noscript"]) {
       for (const element of clone.querySelectorAll(selector)) {
         element.remove();
@@ -3036,6 +4483,59 @@ if (
     return String(clone.textContent || "")
       .replace(/\s+/g, " ")
       .trim();
+  }
+
+  function extractRenderedVisibleText(element) {
+    if (!(element instanceof Element)) {
+      return "";
+    }
+
+    const parts = [];
+    const walker = document.createTreeWalker(
+      element,
+      NodeFilter.SHOW_TEXT,
+      {
+        acceptNode(node) {
+          const text = String(node.nodeValue || "").replace(/\s+/g, " ").trim();
+          if (!text) {
+            return NodeFilter.FILTER_REJECT;
+          }
+
+          const parent = node.parentElement;
+          if (!(parent instanceof Element)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+
+          if (!element.contains(parent)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+
+          if (parent.closest(DILI_UI_SELECTOR)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+
+          if (parent.closest("script, style, noscript")) {
+            return NodeFilter.FILTER_REJECT;
+          }
+
+          if (parent.hasAttribute("hidden") || parent.getAttribute("aria-hidden") === "true") {
+            return NodeFilter.FILTER_REJECT;
+          }
+
+          if (!isProbablyVisible(parent)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      }
+    );
+
+    while (walker.nextNode()) {
+      parts.push(String(walker.currentNode.nodeValue || "").replace(/\s+/g, " ").trim());
+    }
+
+    return parts.join(" ").replace(/\s+/g, " ").trim();
   }
 
   async function buildVisiblePostTextSnapshot(post) {
@@ -3069,23 +4569,43 @@ if (
       .replace(/\b([a-z])/g, (match) => match.toUpperCase());
   }
 
-  function findActionBar(post) {
-    const actionSelectors = [
-      '[role="group"]',
-      '[aria-label*="Like"]',
-      '[aria-label*="Comment"]',
-      '[aria-label*="Share"]'
-    ];
-
-    for (const selector of actionSelectors) {
-      const match = post.querySelector(selector);
-      if (match instanceof Element && !match.closest(".dili-panel")) {
-        return match;
-      }
-    }
-
+function findActionBar(post) {
+  if (!(post instanceof Element)) {
     return null;
   }
+
+  const groups = [...post.querySelectorAll('[role="group"], [aria-label]')]
+    .filter((element) => element instanceof Element && !element.closest(".dili-panel"));
+
+  const postRect = post.getBoundingClientRect();
+
+  for (const group of groups) {
+    const text = buildCandidateUtilityText(group);
+    const visibleText = extractVisiblePostText(group).toLowerCase();
+    const combined = `${text} ${visibleText}`;
+
+    const looksLikeReactionBar =
+      /\blike\b/i.test(combined) &&
+      /\bcomment\b/i.test(combined) &&
+      /\bshare\b/i.test(combined);
+
+    if (!looksLikeReactionBar) {
+      continue;
+    }
+
+    const rect = group.getBoundingClientRect();
+
+    // Reaction bars are normally near the lower part of the post.
+    // This avoids classifying CTA cards or link previews as the action bar.
+    if (rect.top < postRect.top + postRect.height * 0.45) {
+      continue;
+    }
+
+    return group;
+  }
+
+  return null;
+}
 
   function shouldInsertBeforeActionBar(mountPoint, post) {
     return mountPoint instanceof Element && mountPoint === findActionBar(post) && mountPoint.parentElement instanceof Element;
@@ -3443,12 +4963,12 @@ if (
     return `${parts[0]}-${parts[1]}-${parts[2]}-${parts[3]}-${parts[4]}-${parts[5]}`;
   }
 
-  function escapeHtml(value) {
-    return String(value)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-  }
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 })();

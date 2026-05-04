@@ -37,6 +37,35 @@ const statAnalyzedPosts = document.getElementById("stat-analyzed-posts");
 const statFlaggedPosts = document.getElementById("stat-flagged-posts");
 const statTotalStored = document.getElementById("stat-total-stored");
 const sessionSinceEl = document.getElementById("session-since");
+const diagNoUrl = document.getElementById("diag-no-url");
+const diagHidden = document.getElementById("diag-hidden");
+const diagActionArea = document.getElementById("diag-action-area");
+const diagNoOwner = document.getElementById("diag-no-owner");
+const diagInternalFacebook = document.getElementById("diag-internal-facebook");
+const diagImageSource = document.getElementById("diag-image-source");
+const diagGenericDomain = document.getElementById("diag-generic-domain");
+const diagHeaderDomain = document.getElementById("diag-header-domain");
+const diagNestedShared = document.getElementById("diag-nested-shared");
+const diagDirectCandidates = document.getElementById("diag-direct-candidates");
+const diagEmbeddedCandidates = document.getElementById("diag-embedded-candidates");
+const diagFallbackCandidates = document.getElementById("diag-fallback-candidates");
+const diagVisibleDomain = document.getElementById("diag-visible-domain");
+const diagPanelFallback = document.getElementById("diag-panel-fallback");
+const diagPanelRelocated = document.getElementById("diag-panel-relocated");
+const diagAnalysisRequests = document.getElementById("diag-analysis-requests");
+const diagAnalysisResponses = document.getElementById("diag-analysis-responses");
+const diagAnalysisMissing = document.getElementById("diag-analysis-missing");
+const diagAnalysisRendered = document.getElementById("diag-analysis-rendered");
+const diagStaleSignature = document.getElementById("diag-stale-signature");
+const diagStaleFingerprint = document.getElementById("diag-stale-fingerprint");
+const diagStaleText = document.getElementById("diag-stale-text");
+const diagStaleRescan = document.getElementById("diag-stale-rescan");
+const diagPanelRemoved = document.getElementById("diag-panel-removed");
+const diagPanelPreserved = document.getElementById("diag-panel-preserved");
+const diagHiddenDomain = document.getElementById("diag-hidden-domain");
+const diagMalformedCandidate = document.getElementById("diag-malformed-candidate");
+const diagPipeline = document.getElementById("diag-pipeline");
+const diagBreakdown = document.getElementById("diag-breakdown");
 const providerChipsEl = document.getElementById("provider-chips");
 const recentActivityList = document.getElementById("recent-activity-list");
 const recentEmptyEl = document.getElementById("recent-empty");
@@ -207,12 +236,13 @@ async function refreshPopupData() {
   popupState.summary.scanStatus = await getContentScanStatus(activeTab, popupState.summary);
   popupState.scanEnabled = scanStateResponse?.scanEnabled !== false;
 
-  renderProtectionState();
-  renderTabContext(popupState.activeTab, popupState.summary);
-  renderStats(popupState.summary);
-  renderSessionSince(popupState.summary);
-  renderProviderChips(popupState.summary.providerSummary);
-  renderRecentActivity(popupState.summary.recentActivity);
+renderProtectionState();
+renderTabContext(popupState.activeTab, popupState.summary);
+renderStats(popupState.summary);
+renderDiagnostics(popupState.summary);
+renderSessionSince(popupState.summary);
+renderProviderChips(popupState.summary.providerSummary);
+renderRecentActivity(popupState.summary.recentActivity);
 }
 
 function renderProtectionState() {
@@ -237,17 +267,117 @@ async function getContentScanStatus(activeTab, summary) {
     return null;
   }
 }
-
 function renderStats(summary) {
   const status = summary.scanStatus || {};
-  statScannedPosts.textContent = String(status.candidatePostsFound ?? summary.postsScannedInSession ?? summary.scannedPostsInSession ?? 0);
-  statAnalyzedPosts.textContent = String(
-    status.analyzedPosts ?? summary.postsAnalyzedInSession ?? summary.analyzedLinksInSession ?? 0
-  );
-  statFlaggedPosts.textContent = String(status.visiblePanels ?? summary.flaggedPostsInSession ?? 0);
+
+  const visibleCandidates =
+    Number(status.candidatePostsFound || 0) > 0
+      ? status.candidatePostsFound
+      : summary.postsScannedInSession ?? summary.scannedPostsInSession ?? 0;
+
+  const pageAnalyses =
+    Number(status.analyzedPosts || 0) > 0
+      ? status.analyzedPosts
+      : summary.postsAnalyzedInSession ?? summary.analyzedLinksInSession ?? 0;
+
+  const visiblePanels =
+    Number(status.visiblePanels || 0) > 0
+      ? status.visiblePanels
+      : summary.flaggedPostsInSession ?? 0;
+
+  statScannedPosts.textContent = String(visibleCandidates);
+  statAnalyzedPosts.textContent = String(pageAnalyses);
+  statFlaggedPosts.textContent = String(visiblePanels);
   statTotalStored.textContent = String(summary.totalStoredAnalyses ?? 0);
 }
+function renderDiagnostics(summary) {
+  const status = summary.scanStatus || {};
 
+  setDiagnosticValue(diagNoUrl, status.skippedNoUrl);
+  setDiagnosticValue(diagHidden, status.skippedHidden);
+  setDiagnosticValue(diagActionArea, status.skippedActionArea);
+  setDiagnosticValue(diagNoOwner, status.skippedNoOwningPost);
+  setDiagnosticValue(diagInternalFacebook, status.skippedInternalFacebook);
+  setDiagnosticValue(diagImageSource, status.skippedImageSource);
+  setDiagnosticValue(diagGenericDomain, status.skippedGenericDomain);
+  setDiagnosticValue(diagHeaderDomain, status.skippedHeaderDomain);
+  setDiagnosticValue(diagNestedShared, status.skippedNestedSharedStory);
+
+  setDiagnosticValue(diagAnalysisRequests, status.analysisRequestsSent);
+  setDiagnosticValue(diagAnalysisResponses, status.analysisResponsesReceived);
+  setDiagnosticValue(diagAnalysisMissing, status.analysisResponsesMissing);
+  setDiagnosticValue(diagAnalysisRendered, status.analysisRenderedPanels);
+
+  setDiagnosticValue(
+    diagStaleSignature,
+    Number(status.analysisStaleDiscardedBySignature || 0) +
+      Number(status.analysisStaleDiscardedByRequestId || 0) +
+      Number(status.analysisStaleDiscardedByMissingRequest || 0)
+  );
+
+  setDiagnosticValue(diagStaleFingerprint, status.analysisStaleDiscardedByFingerprint);
+  setDiagnosticValue(diagStaleText, status.analysisStaleDiscardedByTextHash);
+  setDiagnosticValue(diagStaleRescan, status.analysisStaleDiscardedByCurrentRescan);
+
+  setDiagnosticValue(
+    diagPanelRemoved,
+    Number(status.panelRemovedNoLinkState || 0) +
+      Number(status.panelRemovedCollapsedDeferred || 0)
+  );
+
+  setDiagnosticValue(
+    diagPanelPreserved,
+    Number(status.panelPreservedNoLinkRescan || 0) +
+      Number(status.panelPreservedCollapsedRescan || 0)
+  );
+
+  setDiagnosticValue(diagHiddenDomain, status.hiddenDomainFallbackSkipped);
+
+  setDiagnosticValue(diagMalformedCandidate, status.skippedMalformedCandidate);
+
+  setDiagnosticValue(diagDirectCandidates, status.directCandidatesFound);
+  setDiagnosticValue(diagEmbeddedCandidates, status.embeddedCandidatesFound);
+  setDiagnosticValue(diagFallbackCandidates, status.fallbackCandidatesFound);
+  setDiagnosticValue(diagVisibleDomain, status.visibleDomainCandidatesFound);
+
+  setDiagnosticValue(diagPanelFallback, status.panelMountFallbackUsed);
+  setDiagnosticValue(diagPanelRelocated, status.panelUnsafeRelocated);
+
+  const breakdown = status.lastCandidateBreakdown;
+  if (diagBreakdown) {
+    if (breakdown && typeof breakdown === "object") {
+      diagBreakdown.textContent =
+        `Last candidates: direct ${Number(breakdown.direct || 0)}, ` +
+        `embedded ${Number(breakdown.embedded || 0)}, ` +
+        `sponsored ${Number(breakdown.sponsoredFallback || 0)}, ` +
+        `visible-domain ${Number(breakdown.visibleDomainFallback || 0)}, ` +
+        `total ${Number(breakdown.total || 0)}.`;
+    } else {
+      diagBreakdown.textContent = "No candidate breakdown yet.";
+    }
+  }
+
+  const pipeline = status.lastAnalysisPipelineState;
+  if (diagPipeline) {
+    if (pipeline && typeof pipeline === "object") {
+      const stage = String(pipeline.stage || "unknown");
+      const reason = pipeline.reason ? ` · ${pipeline.reason}` : "";
+      const postId = pipeline.postId ? ` · ${String(pipeline.postId).slice(0, 24)}${String(pipeline.postId).length > 24 ? "…" : ""}` : "";
+      diagPipeline.textContent = `Pipeline: ${stage}${reason}${postId}`;
+    } else {
+      diagPipeline.textContent = "No pipeline state yet.";
+    }
+  }
+}
+
+function setDiagnosticValue(element, value) {
+  if (!element) {
+    return;
+  }
+
+  const number = Number(value || 0);
+  element.textContent = String(Number.isFinite(number) ? number : 0);
+}
 function renderTabContext(activeTab, summary) {
   const url = String(activeTab?.url || "").trim();
   const tabSupported = summary.tabSupported === true;
