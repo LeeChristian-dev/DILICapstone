@@ -603,9 +603,10 @@ function shouldShowWarningModal(analysis) {
   }
 
   const gsb = findProviderResult(analysis.providerResults, "gsb");
+  const phishtank = findProviderResult(analysis.providerResults, "phishtank");
   const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
 
-  if (gsb?.flagged || urlhaus?.flagged) {
+  if (gsb?.flagged || phishtank?.flagged || urlhaus?.flagged) {
     return true;
   }
 
@@ -688,11 +689,16 @@ function resolveModalDestinationUrl(destinationUrl, clickContext) {
     const reasons = [];
     const features = analysis?.features || {};
     const gsb = findProviderResult(analysis?.providerResults, "gsb");
+    const phishtank = findProviderResult(analysis?.providerResults, "phishtank");
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
     const redirectCount = Number(analysis?.redirectAnalysis?.redirectCount ?? features.redirectCount ?? 0);
 
     if (gsb?.flagged) {
       reasons.push("Google Safe Browsing flagged this destination as unsafe.");
+    }
+
+    if (phishtank?.flagged) {
+      reasons.push("PhishTank verified this URL as a phishing site.");
     }
 
     if (urlhaus?.flagged) {
@@ -744,11 +750,12 @@ function resolveModalDestinationUrl(destinationUrl, clickContext) {
 
   function buildWarningExplanation(analysis) {
     const gsb = findProviderResult(analysis?.providerResults, "gsb");
+    const phishtank = findProviderResult(analysis?.providerResults, "phishtank");
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
     const classification = String(analysis?.classification || "").toLowerCase();
     const score = Number(analysis?.safetyScore);
 
-    if (gsb?.flagged || urlhaus?.flagged) {
+    if (gsb?.flagged || phishtank?.flagged || urlhaus?.flagged) {
       return "DILI paused navigation because this destination was flagged by a threat-intelligence provider and may expose you to phishing, malware, or other unsafe behavior.";
     }
 
@@ -785,6 +792,7 @@ function resolveModalDestinationUrl(destinationUrl, clickContext) {
           safetyScore: null,
           providerFlags: {
             googleSafeBrowsing: false,
+            phishTank: false,
             urlhaus: false
           },
           integrityMismatch: false
@@ -963,10 +971,12 @@ const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain"; 
 
   function buildReportPayload(clickContext, analysis, destinationUrl, reasons, overrides = {}) {
     const gsb = findProviderResult(analysis?.providerResults, "gsb");
+    const phishtank = findProviderResult(analysis?.providerResults, "phishtank");
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
     const features = analysis?.features || {};
     const providerFlags = overrides.providerFlags || {
       googleSafeBrowsing: Boolean(gsb?.flagged),
+      phishTank: Boolean(phishtank?.flagged),
       urlhaus: Boolean(urlhaus?.flagged)
     };
 
@@ -1008,6 +1018,7 @@ const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain"; 
       "Main reasons:",
       reasonLines,
       `Google Safe Browsing flagged: ${payload.providerFlags?.googleSafeBrowsing ? "Yes" : "No"}`,
+      `PhishTank flagged: ${payload.providerFlags?.phishTank ? "Yes" : "No"}`,
       `URLhaus flagged: ${payload.providerFlags?.urlhaus ? "Yes" : "No"}`,
       `Integrity mismatch detected: ${payload.integrityMismatch ? "Yes" : "No"}`,
       `Redirect count: ${payload.redirectCount ?? 0}`,
@@ -2944,6 +2955,9 @@ function renderBadge(post, viewModel) {
       .join("");
 
     badge.className = `dili-panel dili-panel-${severityClass} dili-state-${safeState}`;
+    const reportHtml = viewModel.reportSections
+  ? renderPanelReportSections(viewModel.reportSections)
+  : `<ul class="dili-detail-list">${detailItems || "<li>No detailed indicators recorded.</li>"}</ul>`;
     badge.innerHTML = `
       <div class="dili-badge" aria-label="${escapeHtml(compactSummary)}">
         <div class="dili-badge-top">
@@ -2958,10 +2972,10 @@ function renderBadge(post, viewModel) {
         </div>
         ${actionHint ? `<p class="dili-action-hint">${escapeHtml(actionHint)}</p>` : ""}
       </div>
-      <details class="dili-details">
-        <summary>${escapeHtml(detailsSummary)}</summary>
-        <ul class="dili-detail-list">${detailItems || "<li>No detailed indicators recorded.</li>"}</ul>
-      </details>
+ <details class="dili-details">
+  <summary>${escapeHtml(detailsSummary)}</summary>
+  ${reportHtml}
+</details>
     `;
 
     cachedPanelByPostId.set(getStablePostId(owningPost), viewModel);
@@ -2969,8 +2983,74 @@ function renderBadge(post, viewModel) {
     scanStatus.visiblePanels = document.querySelectorAll(".dili-panel[data-dili-owned='true']").length;
     scanStatus.lastRenderedDomain = viewModel.finalDomain || viewModel.domain || "";
   }
+function renderPanelReportSections(report = {}) {
+  const reasonItems = (report.reasons || [])
+    .map((reason) => `<li>${escapeHtml(reason)}</li>`)
+    .join("");
+
+  const verificationItems = (report.verificationNotes || [])
+    .map((note) => `<li>${escapeHtml(note)}</li>`)
+    .join("");
+
+  const technicalItems = (report.technicalDetails || [])
+    .map((detail) => `<li>${escapeHtml(detail)}</li>`)
+    .join("");
+
+  const technicalSectionHtml =
+    verificationItems || technicalItems
+      ? `
+        <details class="dili-technical-details">
+          <summary>Show technical details</summary>
+
+          ${
+            verificationItems
+              ? `
+                <p><strong>Verification notes:</strong></p>
+                <ul class="dili-detail-list">${verificationItems}</ul>
+              `
+              : ""
+          }
+
+          ${
+            technicalItems
+              ? `
+                <p><strong>Technical details:</strong></p>
+                <ul class="dili-detail-list">${technicalItems}</ul>
+              `
+              : ""
+          }
+        </details>
+      `
+      : "";
+
+  return `
+    <div class="dili-report-simple">
+      <p><strong>Result:</strong> ${escapeHtml(report.resultLine || "DILI completed the scan.")}</p>
+
+      <p><strong>What DILI checked:</strong> ${escapeHtml(
+        report.checkedLine || "DILI checked the link and its final destination."
+      )}</p>
+
+      <p><strong>Why DILI gave this result:</strong></p>
+      <ul class="dili-detail-list">
+        ${reasonItems || "<li>No major warning signs were found.</li>"}
+      </ul>
+
+      <p><strong>What you should do:</strong> ${escapeHtml(
+        report.recommendation || "Continue only if the link and website make sense."
+      )}</p>
+
+      ${technicalSectionHtml}
+    </div>
+  `;
+}
+function buildPlainResultLine(classification, score, finalDomain) {
+  const scoreText = Number.isFinite(score) ? ` with a safety score of ${score}` : "";
+  return `${classification}${scoreText} for ${finalDomain}.`;
+}
 
   function mapAnalysisToViewModel(analysis) {
+    const reportSections = buildPanelReportSections(analysis);
     const severityLevel = normalizeInlineSeverityLevel({
       label: analysis.classification,
       state: analysis.state,
@@ -2980,6 +3060,8 @@ function renderBadge(post, viewModel) {
 
     return {
       label: analysis.classification || "Unknown",
+      reportSections,
+      details,
       safetyScore: analysis.safetyScore,
       state: analysis.state,
       severityLevel,
@@ -3006,14 +3088,13 @@ function renderBadge(post, viewModel) {
         },
         severityLevel
       ),
-      detailsSummary: buildInlineDetailsSummary(
-        {
-          label: analysis.classification || "Unknown",
-          state: analysis.state
-        },
-        severityLevel
-      ),
-      details
+detailsSummary: buildInlineDetailsSummary(
+  {
+    label: analysis.classification || "Unknown",
+    state: analysis.state
+  },
+  severityLevel
+)
     };
   }
 
@@ -3078,7 +3159,127 @@ function renderBadge(post, viewModel) {
 
     return details;
   }
+function buildPanelReportSections(analysis = {}) {
+  const finalDomain =
+    analysis.endpointResult?.effectiveDomain ||
+    analysis.urlFeatureAnalysis?.finalDomain ||
+    safeHostname(analysis.analysisUrl) ||
+    "unknown site";
 
+  const originalDomain =
+    safeHostname(analysis.rawUrl || analysis.normalizedUrl) ||
+    analysis.endpointResult?.effectiveDomain ||
+    "unknown link";
+
+  const classification = analysis.classification || "Unverified";
+  const severityLevel = normalizeInlineSeverityLevel({
+    label: classification,
+    state: analysis.state,
+    safetyScore: analysis.safetyScore
+  });
+
+  const reasons = buildEndUserRiskReasons(analysis, severityLevel);
+  const verificationNotes = buildEndUserVerificationNotes(analysis);
+  const technicalDetails = buildTechnicalDetails(analysis);
+
+  return {
+    resultLine: buildPlainResultLine(classification, analysis.safetyScore, finalDomain),
+    checkedLine: `DILI checked where the link starts and where it finally leads. The original link appears to be ${originalDomain}, and the final site appears to be ${finalDomain}.`,
+    reasons,
+    recommendation: buildEndUserRecommendation(analysis, severityLevel),
+    verificationNotes,
+    technicalDetails
+  };
+}
+function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
+  const features = analysis.features || {};
+  const reasons = [];
+
+  const gsb = findProviderResult(analysis.providerResults, "gsb");
+  const phishtank = findProviderResult(analysis.providerResults, "phishtank");
+  const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
+
+  if (gsb?.flagged) {
+    reasons.push("Google Safe Browsing flagged this destination as unsafe.");
+  }
+
+  if (phishtank?.flagged) {
+    reasons.push("PhishTank verified this URL as a phishing site.");
+  }
+
+  if (urlhaus?.flagged) {
+    reasons.push("URLhaus flagged this destination as suspicious or malicious.");
+  }
+
+  if (features.integrityHashMismatch || analysis.linkInsertedAfterBaseline) {
+    reasons.push("The link appears to have changed after DILI first observed the post.");
+  }
+
+  if (features.shortenedUrl) {
+    reasons.push("The link uses a shortened URL, so the final website is hidden at first.");
+  }
+
+  if (features.shortenerToUnrelatedDomain || features.crossDomainRedirectChain) {
+    reasons.push("The link redirects to a different website before reaching the final destination.");
+  }
+
+  if (features.textMismatch) {
+    reasons.push("The visible link text does not match the final website.");
+  }
+
+  if (features.obfuscatedUrl) {
+    reasons.push("The URL contains encoded or unusual text that can make the destination harder to read.");
+  }
+
+  if (features.suspiciousTld || features.suspiciousPath || features.usernamePasswordTrick) {
+    reasons.push("The destination contains patterns often seen in suspicious links.");
+  }
+
+  if (features.domainPreviouslyFlagged) {
+    reasons.push("This website was previously marked during an earlier DILI scan.");
+  }
+
+  if (reasons.length === 0) {
+    if (severityLevel === "safe") {
+      reasons.push("DILI did not find major warning signs in the link structure or configured threat checks.");
+    } else if (severityLevel === "unverified") {
+      reasons.push("DILI could not fully verify the destination, but it did not find enough evidence to mark it suspicious.");
+    } else {
+      reasons.push("DILI found minor uncertainty, but no configured threat provider confirmed this link as malicious.");
+    }
+  }
+
+  return [...new Set(reasons)].slice(0, 4);
+}
+function buildEndUserVerificationNotes(analysis = {}) {
+  const notes = [];
+
+  for (const limitation of analysis.limitations || []) {
+    const text = String(limitation || "");
+
+    if (/phishtank/i.test(text)) {
+      notes.push("PhishTank could not complete its check for this link.");
+      continue;
+    }
+
+    if (/urlhaus/i.test(text)) {
+      notes.push("URLhaus could not complete its malware-database check for this link.");
+      continue;
+    }
+
+    if (/google safe browsing/i.test(text)) {
+      notes.push("Google Safe Browsing could not complete its check for this link.");
+      continue;
+    }
+
+    if (/could not confidently resolve|endpoint/i.test(text)) {
+      notes.push("DILI could not fully confirm the final destination.");
+      continue;
+    }
+  }
+
+  return [...new Set(notes)].slice(0, 3);
+}
   function buildMainRiskReasons(analysis = {}) {
     const reasons = [];
     for (const item of analysis.deductions || []) {
