@@ -73,10 +73,22 @@ DILI now computes a Safety Score instead of additive risk:
 
 Classification:
 
-- `80-100`: Safe
-- `60-79`: Caution
-- `40-59`: Suspicious
-- `0-39`: High Risk
+- `90-100`: Safe - no major warning signs
+- `75-89`: Low Caution - minor uncertainty, no hard navigation pause by default
+- `60-74`: Caution - review the destination, no hard navigation pause by default unless combined with strong risk signs
+- `40-59`: Suspicious - navigation pause/interception recommended
+- `0-39`: High Risk - strong warning/interception recommended
+- `Unverified`: DILI could not fully verify the destination; this is separate from suspicious unless other risk signs are present
+
+### Interception Policy
+
+DILI only pauses navigation by default when:
+
+- a provider flags the URL,
+- classification is Suspicious or High Risk,
+- score is below `60`,
+- a post-integrity change is combined with a score below `75`,
+- or an unverified destination also has other risk indicators.
 
 ## Popup Dashboard
 
@@ -122,6 +134,12 @@ Each row includes:
 - `displayedDomainMismatch`
 - `integrityMismatch`
 - `state`
+- `verificationState`
+- `interceptionRecommended`
+- `manualVerdict`
+- `expectedClassification`
+- `isCorrect`
+- `accuracyNotes`
 
 ## Provider Caveats
 

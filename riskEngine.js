@@ -20,25 +20,25 @@ const DEDUCTION_RULES = [
   {
     id: "wrapperToExternalDestination",
     category: "endpoint_resolution",
-    deduction: 12,
+    deduction: 6,
     label: "A Facebook or tracking wrapper concealed an external destination."
   },
   {
     id: "shortenedUrl",
     category: "endpoint_resolution",
-    deduction: 16,
+    deduction: 8,
     label: "The URL uses a shortening service."
   },
   {
     id: "shortenerToUnrelatedDomain",
     category: "redirect_behavior",
-    deduction: 14,
+    deduction: 8,
     label: "A shortened URL redirects to an unrelated external domain."
   },
   {
     id: "obfuscatedUrl",
     category: "obfuscation",
-    deduction: 14,
+    deduction: 10,
     label: "The URL contains encoded or obfuscated indicators."
   },
   {
@@ -50,13 +50,13 @@ const DEDUCTION_RULES = [
   {
     id: "suspiciousTld",
     category: "technical_security",
-    deduction: 20,
+    deduction: 12,
     label: "The URL uses a TLD often abused in phishing campaigns."
   },
   {
     id: "textMismatch",
     category: "display_mismatch",
-    deduction: 15,
+    deduction: 12,
     label: "The visible link text suggests a different destination domain."
   },
   {
@@ -68,13 +68,13 @@ const DEDUCTION_RULES = [
   {
     id: "excessiveQueryComplexity",
     category: "technical_security",
-    deduction: 8,
+    deduction: 4,
     label: "The destination URL uses an unusually complex query string."
   },
   {
     id: "excessiveSubdomainDepth",
     category: "technical_security",
-    deduction: 8,
+    deduction: 5,
     label: "The destination uses unusually deep subdomains."
   },
   {
@@ -86,13 +86,13 @@ const DEDUCTION_RULES = [
   {
     id: "redirectChainToDifferentRegistrantLikeTarget",
     category: "redirect_behavior",
-    deduction: 10,
+    deduction: 6,
     label: "The redirect chain ends on a different registrable domain than it started on."
   },
   {
     id: "trackingHopToUnrelatedDomain",
     category: "redirect_behavior",
-    deduction: 10,
+    deduction: 6,
     label: "A tracking or wrapper hop leads to a different external domain."
   },
   {
@@ -111,13 +111,13 @@ const DEDUCTION_RULES = [
 
 const CATEGORY_CAPS = {
   provider_reputation: 90,
-  endpoint_resolution: 30,
-  redirect_behavior: 30,
+  endpoint_resolution: 20,
+  redirect_behavior: 25,
   obfuscation: 30,
   display_mismatch: 25,
   post_integrity: 60,
   content_context: 20,
-  technical_security: 20
+  technical_security: 15
 };
 
 const COMBINATION_RULES = [
@@ -180,6 +180,13 @@ const MITIGATION_RULES = [
     }
   }
 ];
+
+export const SAFETY_SCORE_BANDS = {
+  SAFE_MIN: 90,
+  LOW_CAUTION_MIN: 75,
+  CAUTION_MIN: 60,
+  SUSPICIOUS_MIN: 40
+};
 
 /**
  * Calculate a transparent weighted safety score from collected link features.
@@ -285,18 +292,28 @@ export function calculateSafetyScore(features = {}) {
 /**
  * Convert a numeric score into the extension's safety classification.
  * @param {number} score
- * @returns {"Safe" | "Caution" | "Suspicious" | "High Risk"}
+ * @returns {"Safe" | "Low Caution" | "Caution" | "Suspicious" | "High Risk" | "Unverified"}
  */
 export function classifySafetyScore(score) {
-  if (score >= 80) {
+  const value = Number(score);
+
+  if (!Number.isFinite(value)) {
+    return "Unverified";
+  }
+
+  if (value >= SAFETY_SCORE_BANDS.SAFE_MIN) {
     return "Safe";
   }
 
-  if (score >= 60) {
+  if (value >= SAFETY_SCORE_BANDS.LOW_CAUTION_MIN) {
+    return "Low Caution";
+  }
+
+  if (value >= SAFETY_SCORE_BANDS.CAUTION_MIN) {
     return "Caution";
   }
 
-  if (score >= 40) {
+  if (value >= SAFETY_SCORE_BANDS.SUSPICIOUS_MIN) {
     return "Suspicious";
   }
 

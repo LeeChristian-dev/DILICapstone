@@ -609,12 +609,13 @@ function shouldShowWarningModal(analysis) {
     return true;
   }
 
+  const score = Number(analysis.safetyScore);
   const classification = String(analysis.classification || "").toLowerCase();
+  const features = analysis.features || {};
+  const verificationState = String(analysis.verificationState || "").toLowerCase();
 
   if (
-    classification.includes("unverified") ||
-    classification.includes("suspicious") ||
-    classification.includes("risk") ||
+    classification.includes("high risk") ||
     classification.includes("danger") ||
     classification.includes("unsafe") ||
     classification.includes("malicious")
@@ -622,11 +623,32 @@ function shouldShowWarningModal(analysis) {
     return true;
   }
 
-  if (String(analysis.endpointConfidence || "").toLowerCase() === "low") {
+  if (classification.includes("suspicious")) {
     return true;
   }
 
-  return Number.isFinite(analysis.safetyScore) && analysis.safetyScore < 80;
+  if (Number.isFinite(score) && score < 60) {
+    return true;
+  }
+
+  if (features.integrityHashMismatch && Number.isFinite(score) && score < 75) {
+    return true;
+  }
+
+  if (
+    verificationState === "unverified" &&
+    (
+      features.shortenedUrl ||
+      features.textMismatch ||
+      features.obfuscatedUrl ||
+      features.suspiciousRedirectPattern ||
+      features.usernamePasswordTrick
+    )
+  ) {
+    return true;
+  }
+
+  return false;
 }
 function resolveModalDestinationUrl(destinationUrl, clickContext) {
   const candidates = [
@@ -724,6 +746,7 @@ function resolveModalDestinationUrl(destinationUrl, clickContext) {
     const gsb = findProviderResult(analysis?.providerResults, "gsb");
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
     const classification = String(analysis?.classification || "").toLowerCase();
+    const score = Number(analysis?.safetyScore);
 
     if (gsb?.flagged || urlhaus?.flagged) {
       return "DILI paused navigation because this destination was flagged by a threat-intelligence provider and may expose you to phishing, malware, or other unsafe behavior.";
@@ -733,7 +756,11 @@ function resolveModalDestinationUrl(destinationUrl, clickContext) {
       return "DILI paused navigation because this link shows several warning signs commonly seen in malicious redirects, scam campaigns, or deceptive destination changes.";
     }
 
-    return "DILI paused navigation because this link appears suspicious and may not be safe to open without extra caution.";
+    if (classification.includes("suspicious") || (Number.isFinite(score) && score < 60)) {
+      return "DILI paused navigation because this link has enough warning signs that you should review it before opening.";
+    }
+
+    return "DILI paused navigation because this link could not be verified together with other warning signs.";
   }
 
   function showVerificationUnavailableModal({ clickContext, destinationUrl }) {
@@ -2990,33 +3017,62 @@ function renderBadge(post, viewModel) {
     };
   }
 
+  function buildEndUserRecommendation(analysis = {}, severityLevel = "unverified") {
+    if (severityLevel === "safe") {
+      return "You can open this link normally, but still avoid entering passwords or payment information unless you trust the site.";
+    }
+
+    if (severityLevel === "caution") {
+      return "Open with care. Check the final website address before entering personal information.";
+    }
+
+    if (severityLevel === "suspicious") {
+      return "Avoid entering passwords, payment details, or personal information unless you can independently verify the site.";
+    }
+
+    if (severityLevel === "high-risk") {
+      return "Do not continue unless you are certain this destination is legitimate.";
+    }
+
+    return "Treat this as not fully verified. Continue only if the source and destination make sense.";
+  }
+
   function buildPanelDetails(analysis = {}) {
     const details = [];
     const seenDetails = new Set();
     const finalDomain = analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || safeHostname(analysis.analysisUrl) || "unknown site";
     const originalDomain = safeHostname(analysis.rawUrl || analysis.normalizedUrl) || analysis.endpointResult?.effectiveDomain || "unknown link";
-    const linkType = describeLinkType(analysis);
     const scoreLabel = Number.isFinite(analysis.safetyScore) ? `score ${analysis.safetyScore}` : "no score";
+    const classification = analysis.classification || "Unverified";
+    const severityLevel = normalizeInlineSeverityLevel({
+      label: classification,
+      state: analysis.state,
+      safetyScore: analysis.safetyScore
+    });
 
-    pushUniqueAnalysisDetail(details, seenDetails, `Summary: Final site: ${finalDomain}.`);
-    pushUniqueAnalysisDetail(details, seenDetails, `Summary: Original link: ${originalDomain}.`);
-    pushUniqueAnalysisDetail(details, seenDetails, `Summary: Link type: ${linkType}.`);
-    pushUniqueAnalysisDetail(details, seenDetails, `Summary: Risk level: ${analysis.classification || "Unknown"} (${scoreLabel}).`);
+    pushUniqueAnalysisDetail(details, seenDetails, `Result: ${classification} (${scoreLabel}) for ${finalDomain}.`);
+    pushUniqueAnalysisDetail(details, seenDetails, `What DILI checked: The visible/original link was ${originalDomain}, and the final site appears to be ${finalDomain}.`);
 
-    const mainReasons = buildMainRiskReasons(analysis).slice(0, 5);
+    const mainReasons = buildMainRiskReasons(analysis).slice(0, 4);
     if (mainReasons.length > 0) {
       for (const reason of mainReasons) {
-        pushUniqueAnalysisDetail(details, seenDetails, `Reason: ${reason}`);
+        pushUniqueAnalysisDetail(details, seenDetails, `Why this result was given: ${reason}`);
       }
+    } else if (severityLevel === "safe") {
+      pushUniqueAnalysisDetail(details, seenDetails, "Why this result was given: DILI did not find major warning signs from the link structure or configured threat checks.");
+    } else if (severityLevel === "unverified") {
+      pushUniqueAnalysisDetail(details, seenDetails, "Why this result was given: DILI could not fully verify the destination, but it did not find enough evidence to mark it suspicious.");
     } else {
-      pushUniqueAnalysisDetail(details, seenDetails, "Reason: No major risk reasons were found.");
+      pushUniqueAnalysisDetail(details, seenDetails, "Why this result was given: DILI found minor uncertainty but no confirmed threat provider flag.");
     }
 
-    for (const limitation of buildLimitations(analysis).slice(0, 5)) {
-      pushUniqueAnalysisDetail(details, seenDetails, `Limitation: ${limitation}`);
+    pushUniqueAnalysisDetail(details, seenDetails, `What you should do: ${buildEndUserRecommendation(analysis, severityLevel)}`);
+
+    for (const limitation of buildLimitations(analysis).slice(0, 3)) {
+      pushUniqueAnalysisDetail(details, seenDetails, `Verification note: ${limitation}`);
     }
 
-    for (const detail of buildTechnicalDetails(analysis).slice(0, 6)) {
+    for (const detail of buildTechnicalDetails(analysis).slice(0, 4)) {
       pushUniqueAnalysisDetail(details, seenDetails, `Technical: ${detail}`);
     }
 
@@ -3215,7 +3271,11 @@ function renderBadge(post, viewModel) {
 
   function normalizeInlineSeverityLevel(viewModel = {}) {
     const explicit = String(viewModel.severityLevel || "").toLowerCase();
-    if (["safe", "caution", "suspicious", "high-risk", "unverified", "no-link"].includes(explicit)) {
+    if (["safe", "caution", "suspicious", "high-risk", "unverified", "no-link", "low-caution"].includes(explicit)) {
+      if (explicit === "low-caution") {
+        return "caution";
+      }
+
       return explicit;
     }
 
@@ -3223,13 +3283,13 @@ function renderBadge(post, viewModel) {
       return "no-link";
     }
 
-    if (String(viewModel.state || "").toLowerCase() === "changed") {
-      return "high-risk";
-    }
+if (String(viewModel.state || "").toLowerCase() === "changed") {
+  return Number(viewModel.safetyScore) < 40 ? "high-risk" : "suspicious";
+}
 
     const score = Number(viewModel.safetyScore);
     if (Number.isFinite(score)) {
-      if (score >= 80) {
+      if (score >= 90) {
         return "safe";
       }
 
@@ -3262,8 +3322,16 @@ function renderBadge(post, viewModel) {
       return "high-risk";
     }
 
+    if (sourceText.includes("low caution")) {
+      return "caution";
+    }
+
     if (sourceText.includes("caution")) {
       return "caution";
+    }
+
+    if (sourceText.includes("unverified")) {
+      return "unverified";
     }
 
     if (sourceText.includes("suspicious") || sourceText.includes("warning")) {
@@ -3345,17 +3413,26 @@ function renderBadge(post, viewModel) {
   }
 
   function buildInlineActionHint(viewModel = {}, severityLevel = normalizeInlineSeverityLevel(viewModel)) {
-    switch (severityLevel) {
-      case "suspicious":
-      case "caution":
-        return "Clicking this link may trigger a warning before navigation.";
-      case "high-risk":
-        return "DILI will pause navigation before opening this link.";
-      case "unverified":
-        return "DILI may pause navigation until you decide whether to proceed.";
-      default:
-        return "";
+    const score = Number(viewModel.safetyScore);
+    const label = String(viewModel.label || "").toLowerCase();
+
+    if (severityLevel === "high-risk" || severityLevel === "suspicious") {
+      return "DILI will pause navigation before opening this link.";
     }
+
+    if (severityLevel === "caution") {
+      if (Number.isFinite(score) && score >= 60) {
+        return "DILI will show this warning in the post, but will not block navigation by default.";
+      }
+
+      return "Clicking this link may trigger a warning before navigation.";
+    }
+
+    if (severityLevel === "unverified" || label.includes("unverified")) {
+      return "DILI could not fully verify this link. It will only pause navigation if other risk signs are present.";
+    }
+
+    return "";
   }
 
   function buildInlineDetailsSummary(viewModel = {}, severityLevel = normalizeInlineSeverityLevel(viewModel)) {

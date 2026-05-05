@@ -174,18 +174,29 @@ async function setNoLinkState(message) {
   const now = Date.now();
   const firstSeenAt = Number(baseline?.firstSeenAt || baseline?.baselineFirstSeenAt || now);
   const postTextHash = String(message.postTextHash || baseline?.postTextHash || "");
-  const normalizedVisiblePostText = String(message.normalizedVisiblePostText || baseline?.normalizedVisiblePostText || "");
+  const normalizedVisiblePostText = String(
+    message.normalizedVisiblePostText || baseline?.normalizedVisiblePostText || ""
+  );
+
+  const baselineState =
+    message.baselineState === "truncated_unexpanded"
+      ? "truncated_unexpanded"
+      : message.baselineState === "observed_no_link_unstable"
+        ? "observed_no_link_unstable"
+        : "no_link";
+
+  const isConfirmedNoLink = baselineState === "no_link";
 
   return updatePostAnalysis(message.postId, {
     analysisSchemaVersion: CURRENT_ANALYSIS_SCHEMA_VERSION,
-    baselineState: "no_link",
-    hadLinkAtBaseline: false,
+    baselineState,
+    hadLinkAtBaseline: isConfirmedNoLink ? false : null,
     firstSeenAt,
     baselineFirstSeenAt: firstSeenAt,
     lastSeenAt: now,
     lastChecked: now,
-    state: "no_link",
-    classification: "No Link",
+    state: isConfirmedNoLink ? "no_link" : "truncated",
+    classification: isConfirmedNoLink ? "No Link" : "Caption Collapsed",
     safetyScore: null,
     urlHash: "",
     normalizedUrl: "",
@@ -203,7 +214,8 @@ async function setNoLinkState(message) {
     endpointConfidence: "",
     providerOverride: false,
     features: {
-      noLinkBaseline: true,
+      noLinkBaseline: isConfirmedNoLink,
+      truncatedUnexpanded: !isConfirmedNoLink,
       linkInsertedAfterBaseline: false,
       integrityHashMismatch: false
     },
@@ -212,7 +224,6 @@ async function setNoLinkState(message) {
     postId: message.postId
   });
 }
-
 async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candidateContext, postTextHash, normalizedVisiblePostText, isReanalysis }) {
   const linkInputs = Array.isArray(links) && links.length > 0
     ? links.slice(0, 8)
@@ -332,13 +343,25 @@ async function performSingleLinkAnalysis({ postId, rawUrl, displayedText, candid
   const urlhausResult = getNormalizedProviderResult(providerResults, "urlhaus");
   const detectedAt = Date.now();
   const baselineFirstSeenAt = Number(existingBaseline?.baselineFirstSeenAt || existingBaseline?.firstSeenAt || detectedAt);
-  const currentPostTextHash = String(postTextHash || "");
-  const normalizedCurrentPostText = String(normalizedVisiblePostText || "").replace(/\s+/g, " ").trim();
-  const hadNoLinkBaseline = Boolean(
-    (compatibleBaseline?.baselineState || existingBaseline?.baselineState) === "no_link" ||
-    existingBaseline?.hadLinkAtBaseline === false
-  );
-  const linkInsertedAfterBaseline = Boolean(isReanalysis && hadNoLinkBaseline);
+const currentPostTextHash = String(postTextHash || "");
+const normalizedCurrentPostText = String(normalizedVisiblePostText || "")
+  .replace(/\s+/g, " ")
+  .trim();
+
+const previousBaselineState =
+  compatibleBaseline?.baselineState ||
+  existingBaseline?.baselineState ||
+  "";
+
+const canUseNoLinkInjectionBaseline = Boolean(
+  isReanalysis &&
+  previousBaselineState === "no_link" &&
+  compatibleBaseline?.postIdentityStable === true &&
+  normalizedCandidateContext.postIdentityStable === true &&
+  normalizedCandidateContext.candidateMode === "single"
+);
+
+  const linkInsertedAfterBaseline = Boolean(canUseNoLinkInjectionBaseline);
   const previousPostTextHash = String(existingBaseline?.postTextHash || existingBaseline?.currentPostTextHash || "");
   const postContextFeatures = {
     domainPreviouslyFlagged,
@@ -394,15 +417,48 @@ async function performSingleLinkAnalysis({ postId, rawUrl, displayedText, candid
     endpointResult?.resolutionMethod === "invalid-url" ||
     (endpointResult?.endpointConfidence === "low" && !endpointResult?.redirectAnalysis?.resolvedUrl && !endpointResult?.resolvedUrl)
   );
+  const concreteRiskSignals = Boolean(
+    providerOverride ||
+    features.integrityHashMismatch ||
+    features.googleSafeBrowsingFlagged ||
+    features.urlhausFlagged ||
+    features.usernamePasswordTrick ||
+    features.suspiciousRedirectPattern ||
+    features.shortenerToUnrelatedDomain ||
+    features.trackingHopToUnrelatedDomain ||
+    features.crossDomainRedirectChain ||
+    features.textMismatch ||
+    features.suspiciousTld ||
+    features.suspiciousPath ||
+    features.obfuscatedUrl
+  );
+  const verificationState = endpointResolutionFailed
+    ? "unverified"
+    : endpointResult?.endpointConfidence === "low"
+      ? "low-confidence"
+      : "verified";
+  const verificationOnlyUnknown = Boolean(
+    !providerOverride &&
+    verificationState !== "verified" &&
+    !concreteRiskSignals
+  );
   let finalScore = providerOverride ? Math.min(scoring.score, 20) : scoring.score;
-  if (!providerOverride) {
-    if (endpointResolutionFailed) {
-      finalScore = Math.min(finalScore, 74);
-    } else if (endpointResult?.endpointConfidence === "low") {
-      finalScore = Math.min(finalScore, 79);
-    }
+  if (!providerOverride && concreteRiskSignals && verificationState === "unverified") {
+    finalScore = Math.min(finalScore, 74);
+  } else if (!providerOverride && concreteRiskSignals && verificationState === "low-confidence") {
+    finalScore = Math.min(finalScore, 79);
   }
-  const classification = providerOverride ? "High Risk" : classifySafetyScore(finalScore);
+  const classification = providerOverride
+    ? "High Risk"
+    : verificationOnlyUnknown
+      ? "Unverified"
+      : classifySafetyScore(finalScore);
+  const interceptionRecommended = shouldRecommendInterceptionForStoredAnalysis({
+    classification,
+    safetyScore: finalScore,
+    features,
+    providerResults
+  });
   const nextState = features.integrityHashMismatch ? "changed" : "monitored";
   const record = {
     postId,
@@ -428,6 +484,10 @@ async function performSingleLinkAnalysis({ postId, rawUrl, displayedText, candid
     candidateContext: normalizedCandidateContext,
     classification,
     safetyScore: finalScore,
+    verificationState,
+    verificationOnlyUnknown,
+    concreteRiskSignals,
+    interceptionRecommended,
     features,
     deductions: scoring.deductions,
     providerOverride,
@@ -482,6 +542,10 @@ async function performSingleLinkAnalysis({ postId, rawUrl, displayedText, candid
       urlHash: currentHash,
       safetyScore: finalScore,
       classification,
+      verificationState,
+      verificationOnlyUnknown,
+      concreteRiskSignals,
+      interceptionRecommended,
       features,
       providerResults,
       endpointResult,
@@ -986,9 +1050,9 @@ function buildAnalysisLimitations({ endpointResult, providerResults }) {
     limitations.push("URLhaus was checked in public mode.");
   }
 
-if (!endpointResult?.effectiveEndpoint) {
-  limitations.push("DILI could not confidently resolve the final endpoint.");
-}
+  if (!endpointResult?.effectiveEndpoint) {
+    limitations.push("DILI could not confidently resolve the final endpoint.");
+  }
 
   for (const warning of endpointResult?.warnings || []) {
     if (isNormalWrapperMessage(warning)) {
@@ -1050,6 +1114,33 @@ function buildTechnicalDetails({ endpointResult = {}, redirectAnalysis = {}, url
   return [...new Set(details)].slice(0, 6);
 }
 
+function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
+  const features = analysis.features || {};
+  const score = Number(analysis.safetyScore);
+  const classification = String(analysis.classification || "").toLowerCase();
+  const providerResults = normalizeProviderResults(analysis.providerResults || []);
+  const gsb = providerResults.find((item) => item.provider === "gsb");
+  const urlhaus = providerResults.find((item) => item.provider === "urlhaus");
+
+  if (gsb?.flagged || urlhaus?.flagged) {
+    return true;
+  }
+
+  if (classification.includes("high risk") || classification.includes("suspicious")) {
+    return true;
+  }
+
+  if (Number.isFinite(score) && score < 60) {
+    return true;
+  }
+
+  if (features.integrityHashMismatch && Number.isFinite(score) && score < 75) {
+    return true;
+  }
+
+  return false;
+}
+
 function compactLiveLinkAnalysis(analysis = {}) {
   return {
     analysisUrl: analysis.analysisUrl,
@@ -1059,6 +1150,8 @@ function compactLiveLinkAnalysis(analysis = {}) {
     classification: analysis.classification,
     endpointConfidence: analysis.endpointConfidence,
     providerOverride: Boolean(analysis.providerOverride),
+    verificationState: analysis.verificationState,
+    interceptionRecommended: analysis.interceptionRecommended,
     limitations: (analysis.limitations || []).slice(0, 5)
   };
 }
@@ -1100,6 +1193,10 @@ async function persistPostLevelAnalysis(postId, analysis) {
       endpointConfidence: analysis.endpointConfidence,
       limitations: analysis.limitations,
       providerOverride: Boolean(analysis.providerOverride),
+      verificationState: analysis.verificationState,
+      verificationOnlyUnknown: analysis.verificationOnlyUnknown,
+      concreteRiskSignals: analysis.concreteRiskSignals,
+      interceptionRecommended: analysis.interceptionRecommended,
       postIdentityStable: analysis.postIdentityStable === true,
       integrityComparisonStatus: analysis.integrityComparisonStatus,
       state: analysis.state
@@ -1604,7 +1701,7 @@ async function injectContentScript(tabId) {
 }
 
 async function restartSession() {
-  await resetSession("manual");
+  await resetSession("manual", { clearRecords: true });
 
   return {
     success: true,
@@ -1617,12 +1714,15 @@ async function ensureActiveSession(reason) {
     return false;
   }
 
-  await resetSession(`${reason}-expired`);
+  await resetSession(`${reason}-expired`, { clearRecords: false });
   return true;
 }
+async function resetSession(reason, options = {}) {
+  const shouldClearRecords = options.clearRecords === true;
 
-async function resetSession(reason) {
-  await clearAnalysisRecords();
+  if (shouldClearRecords) {
+    await clearAnalysisRecords();
+  }
 
   const now = Date.now();
   sessionInfo.id = createSessionId(now);
@@ -1631,7 +1731,11 @@ async function resetSession(reason) {
   sessionInfo.lastResetAt = now;
   sessionInfo.lastResetReason = reason || "manual";
 
-  logDebug(`Session reset: ${sessionInfo.lastResetReason}`);
+  logDebug(
+    `Session reset: ${sessionInfo.lastResetReason}${
+      shouldClearRecords ? " with cleared analysis records" : " without clearing analysis records"
+    }`
+  );
 }
 
 function createSessionState(now = Date.now()) {
@@ -1682,7 +1786,7 @@ async function handleSupportedTopLevelNavigation(details) {
       ? "page-navigation"
       : "page-load";
 
-  await resetSession(reason);
+await resetSession(reason, { clearRecords: false });
 }
 
 function normalizeSupportedTabUrl(rawUrl) {
