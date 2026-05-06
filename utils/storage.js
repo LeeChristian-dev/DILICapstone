@@ -8,6 +8,8 @@ const DEDUPE_WINDOW_MS = 10 * 60 * 1000;
 const STORED_TEXT_LIMIT = 260;
 const PROTECTED_KEYS = new Set([
   "dili:config:gsbApiKey",
+  "dili:config:phishtankAppKey",
+  "dili:config:phishtankEnabled",
   "dili:config:urlhausAuthKey",
   "dili:config:urlhausApiKey",
   "dili:scan:enabled"
@@ -146,7 +148,23 @@ export async function clearAnalysisRecords() {
     [ANALYSIS_LOG_KEY]: []
   });
 }
+/**
+ * Clear locally flagged domain records.
+ * This is useful for testing because locally flagged domains can otherwise
+ * affect future scoring even after the analysis log is cleared.
+ * @returns {Promise<number>}
+ */
+export async function clearDomainFlagRecords() {
+  const allValues = await storageGet(null);
+  const domainKeys = Object.keys(allValues).filter((key) => key.startsWith(DOMAIN_PREFIX));
 
+  if (domainKeys.length === 0) {
+    return 0;
+  }
+
+  await storageRemove(domainKeys);
+  return domainKeys.length;
+}
 /**
  * Read the global scan-enabled state. Defaults to true when unset.
  * @returns {Promise<boolean>}

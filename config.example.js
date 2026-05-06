@@ -3,6 +3,9 @@
 
 export const GSB_API_KEY = "";
 
+export const PHISHTANK_APP_KEY = "";
+export const PHISHTANK_ENABLED = true;
+
 // URLhaus supports public lookups; optional auth can be provided here.
 export const URLHAUS_API_KEY = "";
 export const URLHAUS_AUTH_TOKEN = "";

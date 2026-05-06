@@ -42,13 +42,14 @@ icons/
 storage/
 ```
 
-## Setup Configuration (GSB + URLhaus)
+## Setup Configuration (GSB + PhishTank + URLhaus)
 
 1. Open `config.example.js` for the key template.
-2. `config.local.js` is a committed empty placeholder and must stay empty.
+2. Copy `config.example.js` to `config.local.js` and add your own values.
 3. For local development, save provider keys through `chrome.storage.local` using these keys:
 
 - `dili:config:gsbApiKey`
+- `dili:config:phishtankAppKey`
 - `dili:config:urlhausAuthKey`
 - `dili:config:urlhausApiKey`
 
@@ -57,11 +58,12 @@ Notes:
 - Never commit real provider credentials.
 - If no key is configured, extension fallback behavior is safe:
 - GSB returns `configured: false`, `checked: false`, `flagged: false`
+- PhishTank can still attempt a public lookup when enabled, but an app key improves rate limits.
 - URLhaus still attempts public-mode lookup when available
 
 ## Host Permissions
 
-DILI requests broad `http://*/*` and `https://*/*` host permissions so the MV3 service worker can resolve shortened URLs that may redirect to any domain. Provider-specific permissions for Google Safe Browsing and URLhaus are kept as explicit entries.
+DILI requests broad `http://*/*` and `https://*/*` host permissions so the MV3 service worker can resolve shortened URLs that may redirect to any domain. Google Safe Browsing and URLhaus still appear as explicit provider entries, and PhishTank is covered by the broad HTTPS/HTTP permissions.
 
 ## Safety Score Model
 
@@ -79,6 +81,18 @@ Classification:
 - `40-59`: Suspicious - navigation pause/interception recommended
 - `0-39`: High Risk - strong warning/interception recommended
 - `Unverified`: DILI could not fully verify the destination; this is separate from suspicious unless other risk signs are present
+- Provider-flagged URLs from Google Safe Browsing, PhishTank, or URLhaus should become High Risk.
+- Provider errors and rate limits do not deduct score by themselves.
+
+### Local domain memory
+
+DILI only stores a local flagged-domain memory when an external provider, such as Google Safe Browsing, PhishTank, or URLhaus, flags the destination. Heuristic-only High Risk results do not permanently flag a domain.
+
+Clearing session logs also clears local flagged-domain records so test runs are not contaminated by earlier false positives.
+
+### Shortened marketing links
+
+Shortened links are treated as caution signals, not automatic malicious signals. A shortened link is escalated more strongly only when combined with stronger warning signs such as provider flags, suspicious paths, suspicious TLDs, visible-domain mismatch, post-integrity changes, or very long redirect chains.
 
 ### Interception Policy
 
@@ -99,7 +113,7 @@ The popup shows:
 - **Current tab context** (Facebook vs unsupported / non-scannable URLs)
 - **Session stats:** current page candidates, current page analyses, visible panels, total compact analyses in storage
 - **Session started** timestamp (when the background session began)
-- **Provider chips:** config readiness, Google Safe Browsing, URLhaus compact status
+- **Provider chips:** config readiness, Google Safe Browsing, PhishTank, and URLhaus compact status
 - **Recent activity** list (latest stored analyses)
 - Action buttons:
 - Export CSV
@@ -125,6 +139,8 @@ Each row includes:
 - `classification`
 - `gsbConfigured`
 - `gsbFlagged`
+- `phishtankConfigured`
+- `phishtankFlagged`
 - `urlhausConfigured`
 - `urlhausFlagged`
 - `redirectCount`
@@ -144,7 +160,10 @@ Each row includes:
 ## Provider Caveats
 
 - Google Safe Browsing requires an API key and is subject to quota and provider policies.
+- PhishTank is phishing-specific and works best with an app key; the app key is optional but improves rate limits.
+- PhishTank requires a descriptive User-Agent, but direct Chrome extension fetch calls may not reliably set a custom User-Agent header. If lookups are rate-limited or blocked, a backend proxy or local database approach may be needed.
 - URLhaus is malware-oriented telemetry, not purely phishing classification.
+- URLhaus remains a malware-oriented supplement and may be skipped when Google Safe Browsing and PhishTank complete cleanly, depending on lookup policy.
 - External lookups can fail due to network, CORS, quota, or endpoint changes. DILI logs failures and continues with local heuristics.
 
 ## Loading Unpacked Extension

@@ -6,17 +6,23 @@ const DEDUCTION_RULES = [
     label: "Google Safe Browsing flagged the URL."
   },
   {
+    id: "phishtankFlagged",
+    category: "provider_reputation",
+    deduction: 70,
+    label: "PhishTank verified this URL as phishing."
+  },
+  {
     id: "urlhausFlagged",
     category: "provider_reputation",
     deduction: 60,
     label: "URLhaus flagged the URL as malicious or suspicious."
   },
-  {
-    id: "domainPreviouslyFlagged",
-    category: "provider_reputation",
-    deduction: 10,
-    label: "This domain was flagged locally in an earlier analysis."
-  },
+{
+  id: "domainPreviouslyFlagged",
+  category: "provider_reputation",
+  deduction: 6,
+  label: "This domain matched a previous provider-flagged result in this browser."
+},
   {
     id: "wrapperToExternalDestination",
     category: "endpoint_resolution",
@@ -77,12 +83,12 @@ const DEDUCTION_RULES = [
     deduction: 5,
     label: "The destination uses unusually deep subdomains."
   },
-  {
-    id: "crossDomainRedirectChain",
-    category: "redirect_behavior",
-    deduction: 16,
-    label: "The redirect chain hands the user across different domains."
-  },
+{
+  id: "crossDomainRedirectChain",
+  category: "redirect_behavior",
+  deduction: 10,
+  label: "The link passes through more than one website before reaching the final destination."
+},
   {
     id: "redirectChainToDifferentRegistrantLikeTarget",
     category: "redirect_behavior",
@@ -95,12 +101,12 @@ const DEDUCTION_RULES = [
     deduction: 6,
     label: "A tracking or wrapper hop leads to a different external domain."
   },
-  {
-    id: "suspiciousRedirectPattern",
-    category: "redirect_behavior",
-    deduction: 18,
-    label: "The redirect chain uses a pattern commonly seen in deceptive links."
-  },
+{
+  id: "suspiciousRedirectPattern",
+  category: "redirect_behavior",
+  deduction: 12,
+  label: "The redirect pattern makes the final destination harder to verify."
+},
   {
     id: "integrityHashMismatch",
     category: "post_integrity",
@@ -122,20 +128,28 @@ const CATEGORY_CAPS = {
 
 const COMBINATION_RULES = [
   {
-    id: "shortenerRedirectCombo",
-    deduction: 10,
-    label: "A shortened URL is combined with suspicious redirect behavior.",
-    when(features) {
-      return Boolean(
-        features.shortenedUrl &&
-        (
-          features.suspiciousRedirectPattern ||
-          features.shortenerToUnrelatedDomain ||
-          (features.multipleRedirects && Number(features.redirectCount || 0) >= 4)
-        )
-      );
-    }
-  },
+  id: "shortenerRedirectCombo",
+  deduction: 8,
+  label: "A shortened URL is combined with stronger warning signs.",
+  when(features) {
+    const redirectCount = Number(features.redirectCount || 0);
+
+    return Boolean(
+      features.shortenedUrl &&
+      (
+        features.googleSafeBrowsingFlagged ||
+        features.phishtankFlagged ||
+        features.urlhausFlagged ||
+        features.textMismatch ||
+        features.suspiciousTld ||
+        features.suspiciousPath ||
+        features.usernamePasswordTrick ||
+        features.integrityHashMismatch ||
+        redirectCount >= 4
+      )
+    );
+  }
+},
   {
     id: "wrapperMismatchCombo",
     deduction: 10,
@@ -149,7 +163,17 @@ const COMBINATION_RULES = [
     deduction: 10,
     label: "Threat-intelligence flags are reinforced by suspicious redirect behavior.",
     when(features) {
-      return Boolean((features.googleSafeBrowsingFlagged || features.urlhausFlagged) && (features.crossDomainRedirectChain || features.suspiciousRedirectPattern));
+      return Boolean(
+        (
+          features.googleSafeBrowsingFlagged ||
+          features.phishtankFlagged ||
+          features.urlhausFlagged
+        ) &&
+        (
+          features.crossDomainRedirectChain ||
+          features.suspiciousRedirectPattern
+        )
+      );
     }
   },
   {

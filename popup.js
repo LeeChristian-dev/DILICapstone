@@ -235,7 +235,7 @@ async function refreshPopupData() {
   popupState.summary = summaryResponse?.summary || {};
   popupState.summary.scanStatus = await getContentScanStatus(activeTab, popupState.summary);
   popupState.scanEnabled = scanStateResponse?.scanEnabled !== false;
-
+logPerformanceDiagnostics(popupState.summary);
 renderProtectionState();
 renderTabContext(popupState.activeTab, popupState.summary);
 renderStats(popupState.summary);
@@ -369,7 +369,44 @@ function renderDiagnostics(summary) {
     }
   }
 }
+function logPerformanceDiagnostics(summary = {}) {
+  const status = summary.scanStatus || {};
+  const bg = summary.performanceStats || {};
 
+  if (!status && !bg) {
+    return;
+  }
+
+  console.debug("[DILI][Performance]", {
+    content: {
+      collectMs: status.perfLastCollectMs || 0,
+      queueSize: status.perfLastQueueSize || 0,
+      batchSize: status.perfLastBatchSize || 0,
+      batchMs: status.perfLastBatchMs || 0,
+      postMs: status.perfLastPostMs || 0,
+      extractMs: status.perfLastExtractMs || 0,
+      backgroundRoundTripMs: status.perfLastBackgroundRoundTripMs || 0,
+      renderMs: status.perfLastRenderMs || 0,
+      maxPostMs: status.perfMaxPostMs || 0,
+      maxBackgroundRoundTripMs: status.perfMaxBackgroundRoundTripMs || 0,
+      maxRenderMs: status.perfMaxRenderMs || 0
+    },
+    background: {
+      totalMs: bg.lastTotalAnalysisMs || 0,
+      endpointMs: bg.lastEndpointMs || 0,
+      reusableAnalysisMs: bg.lastReusableAnalysisMs || 0,
+      providerMs: bg.lastProviderMs || 0,
+      scoringMs: bg.lastScoringMs || 0,
+      storageMs: bg.lastStorageMs || 0,
+      maxTotalMs: bg.maxTotalAnalysisMs || 0,
+      maxEndpointMs: bg.maxEndpointMs || 0,
+      maxProviderMs: bg.maxProviderMs || 0,
+      maxStorageMs: bg.maxStorageMs || 0,
+      cacheHit: Boolean(bg.lastCacheHit),
+      domain: bg.lastAnalyzedDomain || ""
+    }
+  });
+}
 function setDiagnosticValue(element, value) {
   if (!element) {
     return;
@@ -434,7 +471,7 @@ function renderProviderChips(providerSummary) {
     return;
   }
 
-  const order = ["config", "gsb", "urlhaus"];
+  const order = ["config", "gsb", "phishtank", "urlhaus"];
   for (const key of order) {
     const entry = providerSummary[key];
     if (!entry || typeof entry !== "object") {
@@ -537,6 +574,8 @@ function convertRecordsToCsv(records) {
     "classification",
     "gsbConfigured",
     "gsbFlagged",
+    "phishtankConfigured",
+    "phishtankFlagged",
     "urlhausConfigured",
     "urlhausFlagged",
     "redirectCount",
@@ -556,6 +595,7 @@ function convertRecordsToCsv(records) {
 
   const rows = records.map((record) => {
     const gsb = findProviderResult(record.providerResults, "gsb");
+    const phishtank = findProviderResult(record.providerResults, "phishtank");
     const urlhaus = findProviderResult(record.providerResults, "urlhaus");
     const features = record.features || {};
     return [
@@ -568,6 +608,8 @@ function convertRecordsToCsv(records) {
       record.classification || "",
       gsb?.configured ?? "",
       gsb?.flagged ?? "",
+      phishtank?.configured ?? "",
+      phishtank?.flagged ?? "",
       urlhaus?.configured ?? "",
       urlhaus?.flagged ?? "",
       features.redirectCount ?? "",
@@ -596,9 +638,10 @@ function inferInterceptionRecommended(record = {}) {
   const score = Number(record.safetyScore);
   const classification = String(record.classification || "").toLowerCase();
   const gsb = findProviderResult(record.providerResults, "gsb");
+  const phishtank = findProviderResult(record.providerResults, "phishtank");
   const urlhaus = findProviderResult(record.providerResults, "urlhaus");
 
-  if (gsb?.flagged || urlhaus?.flagged) {
+  if (gsb?.flagged || phishtank?.flagged || urlhaus?.flagged) {
     return true;
   }
 

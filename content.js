@@ -138,6 +138,10 @@ const UNSAFE_PANEL_ANCESTOR_SELECTOR =
   const observedPostIds = new Map();
   const latestRequestByPostId = new Map();
   const cachedPanelByPostId = new Map();
+  const noLinkRescanCountsByPostId = new Map();
+const NO_LINK_PANEL_REMOVAL_CONFIRMATION_COUNT = 3;
+  const clickAnalysisCache = new Map();
+const CLICK_ANALYSIS_CACHE_TTL_MS = 10 * 60 * 1000;
   const clickWarningState = {
     activeToken: 0,
     overlay: null,
@@ -194,7 +198,18 @@ const scanStatus = {
   lastPanelPreservationReason: "",
   skippedMalformedCandidate: 0,
   lastAnalysisPipelineState: null,
-
+  // P3-A diagnostics: timing/performance
+  perfLastCollectMs: 0,
+  perfLastQueueSize: 0,
+  perfLastBatchSize: 0,
+  perfLastBatchMs: 0,
+  perfLastPostMs: 0,
+  perfLastExtractMs: 0,
+  perfLastBackgroundRoundTripMs: 0,
+  perfLastRenderMs: 0,
+  perfMaxPostMs: 0,
+  perfMaxBackgroundRoundTripMs: 0,
+  perfMaxRenderMs: 0,
   // P1 diagnostics: why candidates/posts are skipped
   skippedImageSource: 0,
   skippedGenericDomain: 0,
@@ -331,36 +346,55 @@ const scanStatus = {
     initialScan();
   }
 
-  async function handleDocumentClickCapture(event) {
-    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated || event.defaultPrevented) {
-      return;
-    }
+async function handleDocumentClickCapture(event) {
+  if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated || event.defaultPrevented) {
+    return;
+  }
 
-    const clickContext = getInterceptedClickContext(event);
-    if (!clickContext) {
-      return;
-    }
+  const clickContext = getInterceptedClickContext(event);
+  if (!clickContext) {
+    return;
+  }
 
-    event.preventDefault();
-    event.stopPropagation();
-    if (typeof event.stopImmediatePropagation === "function") {
-      event.stopImmediatePropagation();
-    }
+  const cachedAnalysis = getCachedClickAnalysisSync(clickContext);
 
-    const verificationToken = ++clickWarningState.activeToken;
-    clickContext.intent.pendingWindow = preparePendingWindow(clickContext.intent);
-    closeWarningModal({ restoreFocus: false });
+  // Important:
+  // If this exact clicked link was already analyzed and does not require a warning,
+  // do not intercept at all. Let Facebook/browser navigation proceed normally.
+  // This prevents the repeated "DILI link check" tab/window.
+  if (cachedAnalysis && !shouldShowWarningModal(cachedAnalysis)) {
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "click-allowed-from-cache",
+      postId: clickContext.postId,
+      timestamp: Date.now()
+    };
+    return;
+  }
 
-    const analysis = await resolveClickAnalysis(clickContext);
+  event.preventDefault();
+  event.stopPropagation();
+  if (typeof event.stopImmediatePropagation === "function") {
+    event.stopImmediatePropagation();
+  }
+
+  const verificationToken = ++clickWarningState.activeToken;
+  closeWarningModal({ restoreFocus: false });
+
+  try {
+    const analysis = cachedAnalysis || await resolveClickAnalysis(clickContext);
+
     if (verificationToken !== clickWarningState.activeToken) {
       closePendingWindow(clickContext.intent.pendingWindow);
       return;
     }
 
+    if (analysis) {
+      rememberClickAnalysis(clickContext, analysis);
+    }
+
     const destinationUrl = pickDestinationUrl(analysis, clickContext);
+
     if (!isUsableClickAnalysis(analysis)) {
-      closePendingWindow(clickContext.intent.pendingWindow);
-      clickContext.intent.pendingWindow = null;
       showVerificationUnavailableModal({
         clickContext,
         destinationUrl
@@ -369,19 +403,33 @@ const scanStatus = {
     }
 
     if (!shouldShowWarningModal(analysis)) {
-      continueNavigation(destinationUrl, clickContext.intent);
+      const continued = continueNavigation(destinationUrl, clickContext.intent);
+
+      if (!continued) {
+        showVerificationUnavailableModal({
+          clickContext,
+          destinationUrl
+        });
+      }
+
       return;
     }
 
-    closePendingWindow(clickContext.intent.pendingWindow);
-    clickContext.intent.pendingWindow = null;
     showWarningModal({
       clickContext,
       analysis,
       destinationUrl,
       reasons: buildWarningReasons(analysis)
     });
+  } catch (error) {
+    console.warn("[DILI] Click link verification failed", error);
+
+    showVerificationUnavailableModal({
+      clickContext,
+      destinationUrl: normalizeNavigationCandidate(clickContext.normalizedTargetUrl || clickContext.rawUrl)
+    });
   }
+}
 
 function getInterceptedClickContext(event) {
   if (!(event.target instanceof Element) || event.button !== 0) {
@@ -461,9 +509,10 @@ function findClickableUrlElement(startElement) {
     });
     const baseline = currentState?.baseline || null;
 
-    if (analysisMatchesTarget(baseline, clickContext.normalizedTargetUrl)) {
-      return baseline;
-    }
+if (analysisMatchesTarget(baseline, clickContext.normalizedTargetUrl)) {
+  rememberClickAnalysis(clickContext, baseline);
+  return baseline;
+}
 
     const clickPostId = buildClickAnalysisPostId(clickContext.postId, clickContext.normalizedTargetUrl);
     const cachedClickState = await sendRuntimeMessage({
@@ -472,9 +521,10 @@ function findClickableUrlElement(startElement) {
     });
     const cachedClickAnalysis = cachedClickState?.baseline || null;
 
-    if (analysisMatchesTarget(cachedClickAnalysis, clickContext.normalizedTargetUrl)) {
-      return cachedClickAnalysis;
-    }
+if (analysisMatchesTarget(cachedClickAnalysis, clickContext.normalizedTargetUrl)) {
+  rememberClickAnalysis(clickContext, cachedClickAnalysis);
+  return cachedClickAnalysis;
+}
 
     const messageType = cachedClickAnalysis?.urlHash ? MESSAGE_TYPES.REANALYZE_LINK : MESSAGE_TYPES.ANALYZE_LINK;
     const response = await sendRuntimeMessage({
@@ -484,16 +534,51 @@ function findClickableUrlElement(startElement) {
       displayedText: clickContext.displayText
     });
 
-    return response?.analysis || null;
+const analysis = response?.analysis || null;
+
+if (analysis) {
+  rememberClickAnalysis(clickContext, analysis);
+}
+
+return analysis;
   }
 
-  function analysisMatchesTarget(analysis, normalizedTargetUrl) {
-    if (!analysis || !normalizedTargetUrl) {
-      return false;
+function analysisMatchesTarget(analysis, normalizedTargetUrl) {
+  if (!analysis || !normalizedTargetUrl) {
+    return false;
+  }
+
+  const target = String(normalizedTargetUrl || "").trim();
+
+  const candidates = [
+    analysis.normalizedUrl,
+    analysis.rawUrl,
+    analysis.analysisUrl,
+    analysis.redirectAnalysis?.resolvedUrl,
+    analysis.endpointResult?.effectiveEndpoint
+  ];
+
+  for (const item of analysis.linkAnalyses || []) {
+    candidates.push(
+      item.normalizedUrl,
+      item.analysisUrl,
+      item.redirectAnalysis?.resolvedUrl
+    );
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
     }
 
-    return String(analysis.normalizedUrl || "").trim() === String(normalizedTargetUrl).trim();
+    const normalizedCandidate = safelyNormalizeComparableUrl(candidate);
+    if (normalizedCandidate && normalizedCandidate === target) {
+      return true;
+    }
   }
+
+  return false;
+}
 
   function isUsableClickAnalysis(analysis) {
     if (!analysis || typeof analysis !== "object") {
@@ -514,7 +599,69 @@ function findClickableUrlElement(startElement) {
 
     return false;
   }
+function getClickAnalysisCacheKey(postId, normalizedTargetUrl) {
+  return `${postId || "unknown-post"}::${String(normalizedTargetUrl || "").trim()}`;
+}
 
+function getCachedClickAnalysisSync(clickContext) {
+  const key = getClickAnalysisCacheKey(clickContext.postId, clickContext.normalizedTargetUrl);
+  const entry = clickAnalysisCache.get(key);
+
+  if (!entry) {
+    return null;
+  }
+
+  if (Number(entry.expiresAt || 0) <= Date.now()) {
+    clickAnalysisCache.delete(key);
+    return null;
+  }
+
+  if (!analysisMatchesTarget(entry.analysis, clickContext.normalizedTargetUrl)) {
+    clickAnalysisCache.delete(key);
+    return null;
+  }
+
+  return entry.analysis;
+}
+
+function setClickAnalysisCacheEntry(postId, normalizedTargetUrl, analysis) {
+  if (!postId || !normalizedTargetUrl || !analysis) {
+    return;
+  }
+
+  clickAnalysisCache.set(getClickAnalysisCacheKey(postId, normalizedTargetUrl), {
+    analysis,
+    expiresAt: Date.now() + CLICK_ANALYSIS_CACHE_TTL_MS
+  });
+}
+
+function rememberClickAnalysis(clickContext, analysis) {
+  if (!clickContext || !analysis) {
+    return;
+  }
+
+  setClickAnalysisCacheEntry(clickContext.postId, clickContext.normalizedTargetUrl, analysis);
+}
+
+function rememberAnalysisForLinkInfo(postId, linkInfo, analysis) {
+  if (!postId || !linkInfo || !analysis) {
+    return;
+  }
+
+  for (const link of linkInfo.links || []) {
+    const normalizedTargetUrl =
+      link.normalizedTargetUrl ||
+      safelyNormalizeComparableUrl(link.url || "");
+
+    if (normalizedTargetUrl) {
+      setClickAnalysisCacheEntry(postId, normalizedTargetUrl, analysis);
+    }
+  }
+
+  if (linkInfo.normalizedTargetUrl) {
+    setClickAnalysisCacheEntry(postId, linkInfo.normalizedTargetUrl, analysis);
+  }
+}
   function buildClickAnalysisPostId(postId, normalizedTargetUrl) {
     return `${postId}::click::${hashString(normalizedTargetUrl || postId)}`;
   }
@@ -559,30 +706,38 @@ function findClickableUrlElement(startElement) {
     }
   }
 
-  function continueNavigation(destinationUrl, intent) {
-    const safeDestination = destinationUrl || "about:blank";
+function continueNavigation(destinationUrl, intent) {
+  const safeDestination = normalizeNavigationCandidate(destinationUrl);
+
+  if (!safeDestination) {
+    console.warn("[DILI] Navigation blocked because no valid HTTP/HTTPS destination was available.", {
+      destinationUrl
+    });
+    return false;
+  }
 
     if (intent?.opensNewContext) {
       const pendingWindow = intent.pendingWindow && !intent.pendingWindow.closed ? intent.pendingWindow : null;
 
-      if (pendingWindow) {
-        try {
-          pendingWindow.location.replace(safeDestination);
-          pendingWindow.focus();
-          return;
-        } catch {
-          closePendingWindow(pendingWindow);
-        }
-      }
+if (pendingWindow) {
+  try {
+    pendingWindow.location.replace(safeDestination);
+    pendingWindow.focus();
+    return true;
+  } catch {
+    closePendingWindow(pendingWindow);
+  }
+}
 
       const features = intent.opensNewWindow ? "popup=yes,width=1180,height=800" : "";
       const openedWindow = window.open(safeDestination, intent.targetName || "_blank", features);
-      if (openedWindow) {
-        return;
-      }
+if (openedWindow) {
+  return true;
+}
     }
 
     window.location.assign(safeDestination);
+    return true;
   }
 
   function closePendingWindow(pendingWindow) {
@@ -660,9 +815,30 @@ function resolveModalDestinationUrl(destinationUrl, clickContext) {
   ];
 
   for (const candidate of candidates) {
-    if (isNavigableHttpUrl(candidate)) {
-      return candidate;
+    const resolved = normalizeNavigationCandidate(candidate);
+    if (resolved) {
+      return resolved;
     }
+  }
+
+  return "";
+}
+
+function normalizeNavigationCandidate(candidate) {
+  const value = String(candidate || "").trim();
+
+  if (!value || value === "about:blank") {
+    return "";
+  }
+
+  try {
+    const url = new URL(value, location.href);
+
+    if (url.protocol === "http:" || url.protocol === "https:") {
+      return url.toString();
+    }
+  } catch {
+    return "";
   }
 
   return "";
@@ -682,7 +858,7 @@ function resolveModalDestinationUrl(destinationUrl, clickContext) {
       }
     }
 
-    return clickContext?.rawUrl || "about:blank";
+return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
   }
 
   function buildWarningReasons(analysis) {
@@ -813,7 +989,7 @@ function resolveModalDestinationUrl(destinationUrl, clickContext) {
 
 const safeDestinationUrl = resolveModalDestinationUrl(destinationUrl, clickContext);
 const displayDestinationUrl = safeDestinationUrl || "Unresolved destination";
-const navigationDestinationUrl = safeDestinationUrl || "about:blank";
+const navigationDestinationUrl = safeDestinationUrl;
 
 const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain";    const scoreText = modalConfig.scoreText || (Number.isFinite(analysis?.safetyScore) ? String(analysis.safetyScore) : "Unavailable");
     const classificationText = modalConfig.classificationText || analysis?.classification || "Unknown";
@@ -926,10 +1102,18 @@ const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain"; 
       }
     });
 
-    proceedButton?.addEventListener("click", () => {
-      closeWarningModal({ restoreFocus: false });
-      continueNavigation(navigationDestinationUrl, clickContext.intent);
-    });
+proceedButton?.addEventListener("click", () => {
+  if (!navigationDestinationUrl) {
+    if (statusNode) {
+      statusNode.textContent =
+        "DILI could not find a valid destination URL to open. Stay on Facebook or copy the report instead.";
+    }
+    return;
+  }
+
+  closeWarningModal({ restoreFocus: false });
+  continueNavigation(navigationDestinationUrl, clickContext.intent);
+});
 
     clickWarningState.keydownHandler = (event) => {
       if (event.key === "Escape") {
@@ -1095,20 +1279,27 @@ const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain"; 
     }, delayMs);
   }
 
-  function scanAndQueueVisiblePosts(root = document) {
-    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
-      return;
-    }
-
-    scanStatus.lastScanAt = Date.now();
-    scanStatus.route = location.href;
-
-    for (const post of collectCandidatePosts(root)) {
-      enqueuePost(post);
-    }
-
-    scheduleFlush();
+function scanAndQueueVisiblePosts(root = document) {
+  if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
+    return;
   }
+
+  const startedAt = nowMs();
+
+  scanStatus.lastScanAt = Date.now();
+  scanStatus.route = location.href;
+
+  const posts = collectCandidatePosts(root);
+
+  for (const post of posts) {
+    enqueuePost(post);
+  }
+
+  scanStatus.perfLastCollectMs = elapsedMs(startedAt);
+  scanStatus.perfLastQueueSize = pendingPosts.size;
+
+  scheduleFlush();
+}
 
   function observeFeed() {
     if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
@@ -1356,289 +1547,329 @@ return candidates;
     }, 250);
   }
 
-  async function processPostBatch(batch) {
-    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
-      return;
-    }
+async function processPostBatch(batch) {
+  if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
+    return;
+  }
 
-    for (let index = 0; index < batch.length; index += POST_PROCESS_CONCURRENCY) {
-      const slice = batch.slice(index, index + POST_PROCESS_CONCURRENCY);
-      const results = await Promise.allSettled(slice.map((post) => processPost(post)));
+  const batchStartedAt = nowMs();
+  scanStatus.perfLastBatchSize = Array.isArray(batch) ? batch.length : 0;
 
-      for (const result of results) {
-        if (result.status === "rejected") {
-          console.warn("[DILI] Post processing failed", result.reason);
-        }
+  for (let index = 0; index < batch.length; index += POST_PROCESS_CONCURRENCY) {
+    const slice = batch.slice(index, index + POST_PROCESS_CONCURRENCY);
+    const results = await Promise.allSettled(slice.map((post) => processPost(post)));
+
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.warn("[DILI] Post processing failed", result.reason);
       }
     }
   }
 
-  async function processPost(post) {
-    if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
+  scanStatus.perfLastBatchMs = elapsedMs(batchStartedAt);
+}
+
+async function processPost(post) {
+  if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated) {
+    return;
+  }
+
+  const postStartedAt = nowMs();
+  const owningPost = getTopLevelPanelOwner(post);
+
+  if (!owningPost?.isConnected || !isScannablePostContainer(owningPost)) {
+    return;
+  }
+
+  const postIdentity = getStablePostIdentity(owningPost);
+  const postId = postIdentity.id;
+
+  console.debug("[DILI] Post identity", {
+    postId,
+    stable: postIdentity.stable,
+    reason: postIdentity.reason
+  });
+
+  const extractStartedAt = nowMs();
+  const postTextSnapshot = await buildVisiblePostTextSnapshot(owningPost);
+  const linkInfo = extractRelevantLinks(owningPost, postId);
+  scanStatus.perfLastExtractMs = elapsedMs(extractStartedAt);
+
+  const signature = buildPostSignature(linkInfo);
+
+  if (linkInfo) {
+    resetNoLinkRescanCount(postId);
+  }
+
+  if (postSignatureCache.get(owningPost) === signature) {
+    const cachedPanel = cachedPanelByPostId.get(postId);
+
+    if (linkInfo && cachedPanel && !owningPost.querySelector(".dili-panel[data-dili-owned='true']")) {
+      scanStatus.cachedPanelRestored += 1;
+      scanStatus.lastAnalysisPipelineState = {
+        stage: "cached-panel-restored",
+        postId,
+        timestamp: Date.now()
+      };
+
+      renderBadge(owningPost, cachedPanel);
       return;
     }
 
-    const owningPost = getTopLevelPanelOwner(post);
-    if (!owningPost.isConnected || !isScannablePostContainer(owningPost)) {
-      return;
-    }
+    if (!linkInfo) {
+      if (isPostCaptionProbablyCollapsed(owningPost)) {
+        if (shouldDelayNoLinkPanelRemoval(owningPost, postId, "collapsed-no-link-awaiting-confirmation")) {
+          scanStatus.panelPreservedCollapsedRescan += 1;
+          return;
+        }
 
-    const postIdentity = getStablePostIdentity(owningPost);
-    const postId = postIdentity.id;
-    console.debug("[DILI] Post identity", {
-      postId,
-      stable: postIdentity.stable,
-      reason: postIdentity.reason
-    });
-    const postTextSnapshot = await buildVisiblePostTextSnapshot(owningPost);
-    const linkInfo = extractRelevantLinks(owningPost, postId);
-    const signature = buildPostSignature(linkInfo);
-
-    if (postSignatureCache.get(owningPost) === signature) {
-      const cachedPanel = cachedPanelByPostId.get(postId);
-      if (linkInfo && cachedPanel && !owningPost.querySelector(".dili-panel[data-dili-owned='true']")) {
-        scanStatus.cachedPanelRestored += 1;
-        scanStatus.lastAnalysisPipelineState = {
-          stage: "cached-panel-restored",
-          postId,
-          timestamp: Date.now()
-        };
-        renderBadge(owningPost, cachedPanel);
+        await deferCollapsedNoLinkPost(owningPost, postId, postTextSnapshot);
         return;
       }
 
-if (!linkInfo) {
-  if (isPostCaptionProbablyCollapsed(owningPost)) {
-    if (preserveExistingPanelDuringNoLinkRescan(owningPost, postId, "collapsed-no-link-after-render")) {
-      scanStatus.panelPreservedCollapsedRescan += 1;
+      const currentState = await sendRuntimeMessage({
+        type: MESSAGE_TYPES.GET_POST_STATE,
+        postId
+      });
+
+      const storedBaseline = currentState?.baseline || null;
+      const hasOwnedArtifacts = Boolean(
+        owningPost.querySelector(".dili-panel[data-dili-owned='true'], .dili-panel-slot[data-dili-owned='true']") ||
+        cachedPanel
+      );
+
+      if (
+        !storedBaseline ||
+        storedBaseline.baselineState !== "no_link" ||
+        storedBaseline.postTextHash !== postTextSnapshot.postTextHash ||
+        hasOwnedArtifacts
+      ) {
+        if (shouldDelayNoLinkPanelRemoval(owningPost, postId, "no-link-awaiting-confirmation")) {
+          return;
+        }
+
+        await setNoLinkState(owningPost, postId, postTextSnapshot, postIdentity);
+      }
+
       return;
     }
 
-    await deferCollapsedNoLinkPost(owningPost, postId, postTextSnapshot);
     return;
   }
+
+  postSignatureCache.set(owningPost, signature);
+  observedPostIds.set(postId, {
+    signature,
+    lastSeen: Date.now()
+  });
+
+  if (!linkInfo) {
+    scanStatus.skippedNoLinks += 1;
+
+    if (isPostCaptionProbablyCollapsed(owningPost)) {
+      if (shouldDelayNoLinkPanelRemoval(owningPost, postId, "collapsed-no-link-awaiting-confirmation")) {
+        scanStatus.panelPreservedCollapsedRescan += 1;
+        return;
+      }
+
+      await deferCollapsedNoLinkPost(owningPost, postId, postTextSnapshot);
+      return;
+    }
+
+    if (shouldDelayNoLinkPanelRemoval(owningPost, postId, "no-link-awaiting-confirmation")) {
+      return;
+    }
+
+    await setNoLinkState(owningPost, postId, postTextSnapshot, postIdentity);
+    return;
+  }
+
+  scanStatus.lastPanelPreservationReason = "";
+  scanStatus.eligibleLinkPostsFound += 1;
 
   const currentState = await sendRuntimeMessage({
     type: MESSAGE_TYPES.GET_POST_STATE,
     postId
   });
 
-  const storedBaseline = currentState?.baseline || null;
-  const hasOwnedArtifacts = Boolean(
-    owningPost.querySelector(".dili-panel[data-dili-owned='true'], .dili-panel-slot[data-dili-owned='true']") ||
-    cachedPanel
+  const baseline = currentState?.baseline || null;
+
+  const hasPriorBaseline = Boolean(
+    baseline?.urlHash ||
+    baseline?.baselineState === "no_link" ||
+    baseline?.hadLinkAtBaseline === false ||
+    baseline?.postTextHash
   );
 
-  if (
-    !storedBaseline ||
-    storedBaseline.baselineState !== "no_link" ||
-    storedBaseline.postTextHash !== postTextSnapshot.postTextHash ||
-    hasOwnedArtifacts
-  ) {
-    if (preserveExistingPanelDuringNoLinkRescan(owningPost, postId, "no-link-after-render")) {
-      return;
-    }
+  const messageType = hasPriorBaseline
+    ? MESSAGE_TYPES.REANALYZE_LINK
+    : MESSAGE_TYPES.ANALYZE_LINK;
 
-    await setNoLinkState(owningPost, postId, postTextSnapshot, postIdentity);
-  }
-}
-      return;
-    }
+  const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const linkFingerprint = linkInfo.linkFingerprint;
 
-    postSignatureCache.set(owningPost, signature);
-    observedPostIds.set(postId, {
-      signature,
-      lastSeen: Date.now()
-    });
+  latestRequestByPostId.set(postId, {
+    requestId,
+    signature,
+    linkFingerprint,
+    postTextHash: postTextSnapshot.postTextHash
+  });
 
-if (!linkInfo) {
-  scanStatus.skippedNoLinks += 1;
+  scanStatus.analysisRequestsSent += 1;
+  scanStatus.lastAnalysisPipelineState = {
+    stage: "request-sent",
+    postId,
+    requestId,
+    messageType,
+    signature,
+    linkFingerprint,
+    linkCount: linkInfo.links.length,
+    timestamp: Date.now()
+  };
 
-  // If the caption is collapsed but there is no visible link/domain/CTA evidence,
-  // do not show a DILI panel. We cannot prove a link exists yet.
-  if (isPostCaptionProbablyCollapsed(owningPost)) {
-    if (preserveExistingPanelDuringNoLinkRescan(owningPost, postId, "collapsed-no-link-after-render")) {
-      scanStatus.panelPreservedCollapsedRescan += 1;
-      return;
-    }
+  renderBadge(owningPost, {
+    label: "Analyzing",
+    safetyScore: null,
+    state: "monitored",
+    severityLevel: "unverified",
+    summaryLine: "DILI is resolving this post's external link destination.",
+    detailsSummary: "Scan details",
+    details: [`Checking ${linkInfo.links.length} link${linkInfo.links.length === 1 ? "" : "s"}.`]
+  });
 
-    await deferCollapsedNoLinkPost(owningPost, postId, postTextSnapshot);
-    return;
-  }
+  const backgroundStartedAt = nowMs();
 
-  if (preserveExistingPanelDuringNoLinkRescan(owningPost, postId, "no-link-after-render")) {
-    return;
-  }
+  const response = await sendRuntimeMessage({
+    type: messageType,
+    postId,
+    url: linkInfo.links[0]?.url,
+    links: linkInfo.links,
+    displayedText: linkInfo.displayText,
+    postTextHash: postTextSnapshot.postTextHash,
+    normalizedVisiblePostText: postTextSnapshot.normalizedVisiblePostText,
+    candidateContext: {
+      ...linkInfo.candidateContext,
+      postIdentityStable: postIdentity.stable
+    },
+    requestId,
+    postSignature: signature,
+    linkFingerprint
+  });
 
-  await setNoLinkState(owningPost, postId, postTextSnapshot, postIdentity);
-  return;
-}
+  const backgroundRoundTripMs = elapsedMs(backgroundStartedAt);
+  scanStatus.perfLastBackgroundRoundTripMs = backgroundRoundTripMs;
+  recordMaxScanStatusValue("perfMaxBackgroundRoundTripMs", backgroundRoundTripMs);
 
-    scanStatus.lastPanelPreservationReason = "";
-
-    scanStatus.eligibleLinkPostsFound += 1;
-    const currentState = await sendRuntimeMessage({
-      type: MESSAGE_TYPES.GET_POST_STATE,
-      postId
-    });
-
-    const baseline = currentState?.baseline || null;
-
-    const hasPriorBaseline = Boolean(
-      baseline?.urlHash ||
-      baseline?.baselineState === "no_link" ||
-      baseline?.hadLinkAtBaseline === false ||
-      baseline?.postTextHash
-    );
-
-    const messageType = hasPriorBaseline
-      ? MESSAGE_TYPES.REANALYZE_LINK
-      : MESSAGE_TYPES.ANALYZE_LINK;
-
-    const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const linkFingerprint = linkInfo.linkFingerprint;
-    latestRequestByPostId.set(postId, {
-      requestId,
-      signature,
-      linkFingerprint,
-      postTextHash: postTextSnapshot.postTextHash
-    });
-
-    scanStatus.analysisRequestsSent += 1;
+  if (response?.analysis) {
+    scanStatus.analysisResponsesReceived += 1;
     scanStatus.lastAnalysisPipelineState = {
-      stage: "request-sent",
+      stage: "response-received",
       postId,
       requestId,
-      messageType,
-      signature,
-      linkFingerprint,
-      linkCount: linkInfo.links.length,
+      hasAnalysis: true,
+      timestamp: Date.now()
+    };
+  } else {
+    scanStatus.analysisResponsesMissing += 1;
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "response-missing",
+      postId,
+      requestId,
+      error: response?.error || "",
+      timestamp: Date.now()
+    };
+  }
+
+  const latestRequest = latestRequestByPostId.get(postId);
+  const currentLinkInfoForStaleCheck = extractRelevantLinks(owningPost, postId, {
+    suppressDiagnostics: true
+  });
+  const currentSignatureForStaleCheck = buildPostSignature(currentLinkInfoForStaleCheck);
+
+  let staleReason = "";
+
+  if (!latestRequest) {
+    staleReason = "missing-request";
+    scanStatus.analysisStaleDiscardedByMissingRequest += 1;
+  } else if (latestRequest.requestId !== requestId) {
+    staleReason = "request-id";
+    scanStatus.analysisStaleDiscardedByRequestId += 1;
+  } else if (latestRequest.signature !== signature) {
+    staleReason = "signature";
+    scanStatus.analysisStaleDiscardedBySignature += 1;
+  } else if (latestRequest.linkFingerprint !== linkFingerprint) {
+    staleReason = "fingerprint";
+    scanStatus.analysisStaleDiscardedByFingerprint += 1;
+  } else if (latestRequest.postTextHash !== postTextSnapshot.postTextHash) {
+    staleReason = "text-hash";
+    scanStatus.analysisStaleDiscardedByTextHash += 1;
+  } else if (currentSignatureForStaleCheck !== signature) {
+    staleReason = "current-rescan";
+    scanStatus.analysisStaleDiscardedByCurrentRescan += 1;
+  }
+
+  if (staleReason) {
+    scanStatus.staleResponsesDiscarded += 1;
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "stale-discarded",
+      reason: staleReason,
+      postId,
+      requestId,
+      expectedSignature: signature,
+      currentSignature: currentSignatureForStaleCheck,
+      expectedFingerprint: linkFingerprint,
+      currentFingerprint: currentLinkInfoForStaleCheck?.linkFingerprint || "",
       timestamp: Date.now()
     };
 
+    return;
+  }
+
+  if (!response?.analysis) {
     renderBadge(owningPost, {
-      label: "Analyzing",
+      label: "Analysis unavailable",
       safetyScore: null,
       state: "monitored",
       severityLevel: "unverified",
-      summaryLine: "DILI is resolving this post's external link destination.",
-      detailsSummary: "Scan details",
-      details: [`Checking ${linkInfo.links.length} link${linkInfo.links.length === 1 ? "" : "s"}.`]
+      summaryLine: "This link could not be verified in time.",
+      detailsSummary: "Why this result was given",
+      actionHint: "DILI may pause navigation until you decide whether to proceed.",
+      details: [response?.error || "Background analysis did not return data."]
     });
 
-    const response = await sendRuntimeMessage({
-      type: messageType,
-      postId,
-      url: linkInfo.links[0]?.url,
-      links: linkInfo.links,
-      displayedText: linkInfo.displayText,
-      postTextHash: postTextSnapshot.postTextHash,
-      normalizedVisiblePostText: postTextSnapshot.normalizedVisiblePostText,
-      candidateContext: {
-        ...linkInfo.candidateContext,
-        postIdentityStable: postIdentity.stable
-      },
-      requestId,
-      postSignature: signature,
-      linkFingerprint
-    });
-
-    if (response?.analysis) {
-      scanStatus.analysisResponsesReceived += 1;
-      scanStatus.lastAnalysisPipelineState = {
-        stage: "response-received",
-        postId,
-        requestId,
-        hasAnalysis: true,
-        timestamp: Date.now()
-      };
-    } else {
-      scanStatus.analysisResponsesMissing += 1;
-      scanStatus.lastAnalysisPipelineState = {
-        stage: "response-missing",
-        postId,
-        requestId,
-        error: response?.error || "",
-        timestamp: Date.now()
-      };
-    }
-
-    const latestRequest = latestRequestByPostId.get(postId);
-    const currentLinkInfoForStaleCheck = extractRelevantLinks(owningPost, postId, {
-      suppressDiagnostics: true
-    });
-    const currentSignatureForStaleCheck = buildPostSignature(currentLinkInfoForStaleCheck);
-
-    let staleReason = "";
-
-    if (!latestRequest) {
-      staleReason = "missing-request";
-      scanStatus.analysisStaleDiscardedByMissingRequest += 1;
-    } else if (latestRequest.requestId !== requestId) {
-      staleReason = "request-id";
-      scanStatus.analysisStaleDiscardedByRequestId += 1;
-    } else if (latestRequest.signature !== signature) {
-      staleReason = "signature";
-      scanStatus.analysisStaleDiscardedBySignature += 1;
-    } else if (latestRequest.linkFingerprint !== linkFingerprint) {
-      staleReason = "fingerprint";
-      scanStatus.analysisStaleDiscardedByFingerprint += 1;
-    } else if (latestRequest.postTextHash !== postTextSnapshot.postTextHash) {
-      staleReason = "text-hash";
-      scanStatus.analysisStaleDiscardedByTextHash += 1;
-    } else if (currentSignatureForStaleCheck !== signature) {
-      staleReason = "current-rescan";
-      scanStatus.analysisStaleDiscardedByCurrentRescan += 1;
-    }
-
-    if (staleReason) {
-      scanStatus.staleResponsesDiscarded += 1;
-      scanStatus.lastAnalysisPipelineState = {
-        stage: "stale-discarded",
-        reason: staleReason,
-        postId,
-        requestId,
-        expectedSignature: signature,
-        currentSignature: currentSignatureForStaleCheck,
-        expectedFingerprint: linkFingerprint,
-        currentFingerprint: currentLinkInfoForStaleCheck?.linkFingerprint || "",
-        timestamp: Date.now()
-      };
-      return;
-    }
-
-    if (!response?.analysis) {
-      renderBadge(owningPost, {
-        label: "Analysis unavailable",
-        safetyScore: null,
-        state: "monitored",
-        severityLevel: "unverified",
-        summaryLine: "This link could not be verified in time.",
-        detailsSummary: "Why this result was given",
-        actionHint: "DILI may pause navigation until you decide whether to proceed.",
-        details: [response?.error || "Background analysis did not return data."]
-      });
-      return;
-    }
-
-    scanStatus.analyzedPosts += 1;
-    scanStatus.lastAnalysisPipelineState = {
-      stage: "rendering-analysis-panel",
-      postId,
-      requestId,
-      timestamp: Date.now()
-    };
-    renderBadge(owningPost, mapAnalysisToViewModel(response.analysis));
-    scanStatus.analysisRenderedPanels += 1;
-    scanStatus.lastAnalysisPipelineState = {
-      stage: "analysis-panel-rendered",
-      postId,
-      requestId,
-      visiblePanels: document.querySelectorAll(".dili-panel[data-dili-owned='true']").length,
-      timestamp: Date.now()
-    };
+    return;
   }
 
+  scanStatus.analyzedPosts += 1;
+  scanStatus.lastAnalysisPipelineState = {
+    stage: "rendering-analysis-panel",
+    postId,
+    requestId,
+    timestamp: Date.now()
+  };
+
+  const renderStartedAt = nowMs();
+
+  renderBadge(owningPost, mapAnalysisToViewModel(response.analysis));
+  rememberAnalysisForLinkInfo(postId, linkInfo, response.analysis);
+
+  const renderMs = elapsedMs(renderStartedAt);
+  scanStatus.perfLastRenderMs = renderMs;
+  recordMaxScanStatusValue("perfMaxRenderMs", renderMs);
+  scanStatus.analysisRenderedPanels += 1;
+
+  scanStatus.lastAnalysisPipelineState = {
+    stage: "analysis-panel-rendered",
+    postId,
+    requestId,
+    visiblePanels: document.querySelectorAll(".dili-panel[data-dili-owned='true']").length,
+    timestamp: Date.now()
+  };
+
+  const postMs = elapsedMs(postStartedAt);
+  scanStatus.perfLastPostMs = postMs;
+  recordMaxScanStatusValue("perfMaxPostMs", postMs);
+}
 function isPostCaptionProbablyCollapsed(post) {
   if (!(post instanceof Element)) {
     return false;
@@ -2761,7 +2992,38 @@ function isUserFacingOutboundCandidate(element, post) {
       cachedPanelByPostId.has(postId)
     );
   }
+function shouldRemovePanelAfterNoLinkRescan(postId) {
+  const currentCount = Number(noLinkRescanCountsByPostId.get(postId) || 0) + 1;
+  noLinkRescanCountsByPostId.set(postId, currentCount);
 
+  return currentCount >= NO_LINK_PANEL_REMOVAL_CONFIRMATION_COUNT;
+}
+
+function resetNoLinkRescanCount(postId) {
+  if (postId) {
+    noLinkRescanCountsByPostId.delete(postId);
+  }
+}
+function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
+  if (!hasRenderedOrCachedPanel(post, postId)) {
+    return false;
+  }
+
+  if (shouldRemovePanelAfterNoLinkRescan(postId)) {
+    return false;
+  }
+
+  scanStatus.panelPreservedNoLinkRescan += 1;
+  scanStatus.lastPanelPreservationReason = reason || "no-link-rescan-awaiting-confirmation";
+  scanStatus.lastAnalysisPipelineState = {
+    stage: "panel-preserved-no-link-rescan",
+    reason: reason || "awaiting-confirmation",
+    postId,
+    timestamp: Date.now()
+  };
+
+  return true;
+}
   function preserveExistingPanelDuringNoLinkRescan(post, postId, reason) {
     if (!hasRenderedOrCachedPanel(post, postId)) {
       return false;
@@ -2808,8 +3070,10 @@ function isUserFacingOutboundCandidate(element, post) {
   function stopScanning() {
     pendingPosts.clear();
     selectedPostLinkCache.clear();
+    clickAnalysisCache.clear();
     observedPostIds.clear();
     latestRequestByPostId.clear();
+noLinkRescanCountsByPostId.clear();
 
     if (flushTimer !== null) {
       window.clearTimeout(flushTimer);
@@ -5186,7 +5450,20 @@ function findActionBar(post) {
     console.debug("[DILI] Extension context invalidated; stopping old content script instance.");
     stopScanning();
   }
+function nowMs() {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
 
+function elapsedMs(startMs) {
+  return Math.max(0, Math.round(nowMs() - Number(startMs || nowMs())));
+}
+
+function recordMaxScanStatusValue(key, value) {
+  const numeric = Number(value || 0);
+  scanStatus[key] = Math.max(Number(scanStatus[key] || 0), numeric);
+}
   function buildScanStatusSnapshot() {
     scanStatus.enabled = scanRuntimeState.enabled && !scanRuntimeState.extensionContextInvalidated;
     scanStatus.visiblePanels = document.querySelectorAll(".dili-panel[data-dili-owned='true']").length;

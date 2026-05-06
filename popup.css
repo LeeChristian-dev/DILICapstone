@@ -338,7 +338,57 @@ body {
   background: var(--panel-bg);
   box-shadow: var(--shadow-card);
 }
+.diagnostics-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
 
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.diag-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 58px;
+  padding: 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  background: var(--panel-bg);
+  box-shadow: var(--shadow-card);
+  box-sizing: border-box;
+}
+
+.diag-label {
+  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.diag-card strong {
+  color: var(--text-main);
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.05;
+}
+
+.diagnostics-breakdown {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(248, 250, 252, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+}
 .stat-label {
   color: var(--text-muted);
   font-size: 11px;
