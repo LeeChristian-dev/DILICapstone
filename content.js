@@ -227,6 +227,7 @@ const scanStatus = {
   fallbackCandidatesFound: 0,
   visibleDomainCandidatesFound: 0,
   sponsoredFallbackCandidatesFound: 0,
+  hiddenFullUrlCandidatesFound: 0,
 
   // P1 diagnostics: panel mount behavior
   panelMountFallbackUsed: 0,
@@ -357,12 +358,13 @@ async function handleDocumentClickCapture(event) {
   }
 
   const cachedAnalysis = getCachedClickAnalysisSync(clickContext);
+  const forceFullUrlReanalysis = shouldForceFullUrlClickReanalysis(cachedAnalysis, clickContext);
 
   // Important:
   // If this exact clicked link was already analyzed and does not require a warning,
   // do not intercept at all. Let Facebook/browser navigation proceed normally.
   // This prevents the repeated "DILI link check" tab/window.
-  if (cachedAnalysis && !shouldShowWarningModal(cachedAnalysis)) {
+  if (cachedAnalysis && !forceFullUrlReanalysis && !shouldShowWarningModal(cachedAnalysis)) {
     scanStatus.lastAnalysisPipelineState = {
       stage: "click-allowed-from-cache",
       postId: clickContext.postId,
@@ -381,7 +383,9 @@ async function handleDocumentClickCapture(event) {
   closeWarningModal({ restoreFocus: false });
 
   try {
-    const analysis = cachedAnalysis || await resolveClickAnalysis(clickContext);
+    const analysis = forceFullUrlReanalysis
+      ? await resolveClickAnalysis(clickContext, { forceReanalysis: true })
+      : cachedAnalysis || await resolveClickAnalysis(clickContext);
 
     if (verificationToken !== clickWarningState.activeToken) {
       closePendingWindow(clickContext.intent.pendingWindow);
@@ -390,6 +394,9 @@ async function handleDocumentClickCapture(event) {
 
     if (analysis) {
       rememberClickAnalysis(clickContext, analysis);
+      if (forceFullUrlReanalysis && clickContext.post instanceof Element) {
+        renderBadge(getTopLevelPanelOwner(clickContext.post), mapAnalysisToViewModel(analysis));
+      }
     }
 
     const destinationUrl = pickDestinationUrl(analysis, clickContext);
@@ -502,14 +509,15 @@ function findClickableUrlElement(startElement) {
   return primary;
 }
 
-  async function resolveClickAnalysis(clickContext) {
+  async function resolveClickAnalysis(clickContext, options = {}) {
+    const forceReanalysis = options?.forceReanalysis === true;
     const currentState = await sendRuntimeMessage({
       type: MESSAGE_TYPES.GET_POST_STATE,
       postId: clickContext.postId
     });
     const baseline = currentState?.baseline || null;
 
-if (analysisMatchesTarget(baseline, clickContext.normalizedTargetUrl)) {
+if (!forceReanalysis && analysisMatchesTarget(baseline, clickContext.normalizedTargetUrl)) {
   rememberClickAnalysis(clickContext, baseline);
   return baseline;
 }
@@ -521,17 +529,18 @@ if (analysisMatchesTarget(baseline, clickContext.normalizedTargetUrl)) {
     });
     const cachedClickAnalysis = cachedClickState?.baseline || null;
 
-if (analysisMatchesTarget(cachedClickAnalysis, clickContext.normalizedTargetUrl)) {
+if (!forceReanalysis && analysisMatchesTarget(cachedClickAnalysis, clickContext.normalizedTargetUrl)) {
   rememberClickAnalysis(clickContext, cachedClickAnalysis);
   return cachedClickAnalysis;
 }
 
-    const messageType = cachedClickAnalysis?.urlHash ? MESSAGE_TYPES.REANALYZE_LINK : MESSAGE_TYPES.ANALYZE_LINK;
+    const messageType = !forceReanalysis && cachedClickAnalysis?.urlHash ? MESSAGE_TYPES.REANALYZE_LINK : MESSAGE_TYPES.ANALYZE_LINK;
     const response = await sendRuntimeMessage({
       type: messageType,
       postId: clickPostId,
       url: clickContext.rawUrl,
-      displayedText: clickContext.displayText
+      displayedText: clickContext.displayText,
+      candidateContext: buildClickCandidateContext(clickContext)
     });
 
 const analysis = response?.analysis || null;
@@ -542,6 +551,68 @@ if (analysis) {
 
 return analysis;
   }
+
+function shouldForceFullUrlClickReanalysis(cachedAnalysis, clickContext) {
+  if (!cachedAnalysis || !clickContext) {
+    return false;
+  }
+
+  const fallbackOnly = Boolean(
+    cachedAnalysis.candidateIsDomainOnlyFallback === true ||
+    cachedAnalysis.candidateContext?.candidateIsDomainOnlyFallback === true ||
+    cachedAnalysis.candidateUrlCompleteness === "domain-only-fallback"
+  );
+
+  if (!fallbackOnly) {
+    return false;
+  }
+
+  return hasPathOrQueryUrl(clickContext.rawUrl) ||
+    hasPathOrQueryUrl(clickContext.normalizedTargetUrl) ||
+    hasPathOrQueryUrl(unwrapFacebookRedirectUrl(clickContext.rawUrl || ""));
+}
+
+function hasPathOrQueryUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""), location.href);
+    return ["http:", "https:"].includes(url.protocol) && Boolean((url.pathname && url.pathname !== "/") || url.search);
+  } catch {
+    return false;
+  }
+}
+
+function buildClickCandidateContext(clickContext = {}) {
+  const rawUrl = String(clickContext.rawUrl || "").trim();
+  const unwrappedCandidateUrl = unwrapFacebookRedirectUrl(rawUrl);
+  const normalizedTargetUrl = clickContext.normalizedTargetUrl || safelyNormalizeComparableUrl(rawUrl);
+
+  return {
+    candidateMode: "single",
+    candidateCount: 1,
+    candidateDomainCount: safeHostname(normalizedTargetUrl || unwrappedCandidateUrl || rawUrl) ? 1 : 0,
+    dominantDomain: getRegistrableDomain(safeHostname(normalizedTargetUrl || unwrappedCandidateUrl || rawUrl)),
+    selectedNormalizedTarget: normalizedTargetUrl || unwrappedCandidateUrl || rawUrl,
+    displayText: clickContext.displayText || "",
+    visibleText: clickContext.displayText || "",
+    rawHref: rawUrl,
+    facebookWrapperUrl: isFacebookWrapperHref(rawUrl) ? rawUrl : "",
+    unwrappedCandidateUrl,
+    candidateSource: "direct",
+    candidateUrlCompleteness: getUrlCompletenessForValue(normalizedTargetUrl || unwrappedCandidateUrl || rawUrl),
+    candidateIsDomainOnlyFallback: false
+  };
+}
+
+function getUrlCompletenessForValue(rawUrl) {
+  try {
+    const url = new URL(rawUrl, location.href);
+    const hasPath = url.pathname && url.pathname !== "/";
+    const hasQuery = Boolean(url.search);
+    return hasPath || hasQuery ? "full-url" : "domain-root-url";
+  } catch {
+    return "unknown";
+  }
+}
 
 function analysisMatchesTarget(analysis, normalizedTargetUrl) {
   if (!analysis || !normalizedTargetUrl) {
@@ -758,10 +829,9 @@ function shouldShowWarningModal(analysis) {
   }
 
   const gsb = findProviderResult(analysis.providerResults, "gsb");
-  const phishtank = findProviderResult(analysis.providerResults, "phishtank");
   const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
 
-  if (gsb?.flagged || phishtank?.flagged || urlhaus?.flagged) {
+  if (gsb?.flagged || urlhaus?.flagged) {
     return true;
   }
 
@@ -806,11 +876,16 @@ function shouldShowWarningModal(analysis) {
 
   return false;
 }
-function resolveModalDestinationUrl(destinationUrl, clickContext) {
+function resolveModalDestinationUrl(destinationUrl, clickContext, analysis = null) {
   const candidates = [
-    destinationUrl,
-    clickContext?.normalizedTargetUrl,
+    analysis?.endpointResult?.effectiveEndpoint,
+    analysis?.analysisUrl,
+    analysis?.endpointResult?.resolvedUrl,
+    analysis?.redirectAnalysis?.resolvedUrl,
+    analysis?.endpointResult?.unwrappedUrl,
     unwrapFacebookRedirectUrl(clickContext?.rawUrl || ""),
+    clickContext?.normalizedTargetUrl,
+    destinationUrl,
     clickContext?.rawUrl
   ];
 
@@ -845,10 +920,13 @@ function normalizeNavigationCandidate(candidate) {
 }
   function pickDestinationUrl(analysis, clickContext) {
     const candidates = [
+      analysis?.endpointResult?.effectiveEndpoint,
+      analysis?.analysisUrl,
+      analysis?.endpointResult?.resolvedUrl,
       analysis?.redirectAnalysis?.resolvedUrl,
-      analysis?.normalizedUrl,
-      clickContext?.normalizedTargetUrl,
+      analysis?.endpointResult?.unwrappedUrl,
       unwrapFacebookRedirectUrl(clickContext?.rawUrl || ""),
+      clickContext?.normalizedTargetUrl,
       clickContext?.rawUrl
     ];
 
@@ -865,16 +943,11 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
     const reasons = [];
     const features = analysis?.features || {};
     const gsb = findProviderResult(analysis?.providerResults, "gsb");
-    const phishtank = findProviderResult(analysis?.providerResults, "phishtank");
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
     const redirectCount = Number(analysis?.redirectAnalysis?.redirectCount ?? features.redirectCount ?? 0);
 
     if (gsb?.flagged) {
       reasons.push("Google Safe Browsing flagged this destination as unsafe.");
-    }
-
-    if (phishtank?.flagged) {
-      reasons.push("PhishTank verified this URL as a phishing site.");
     }
 
     if (urlhaus?.flagged) {
@@ -926,12 +999,11 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
 
   function buildWarningExplanation(analysis) {
     const gsb = findProviderResult(analysis?.providerResults, "gsb");
-    const phishtank = findProviderResult(analysis?.providerResults, "phishtank");
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
     const classification = String(analysis?.classification || "").toLowerCase();
     const score = Number(analysis?.safetyScore);
 
-    if (gsb?.flagged || phishtank?.flagged || urlhaus?.flagged) {
+    if (gsb?.flagged || urlhaus?.flagged) {
       return "DILI paused navigation because this destination was flagged by a threat-intelligence provider and may expose you to phishing, malware, or other unsafe behavior.";
     }
 
@@ -968,7 +1040,6 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
           safetyScore: null,
           providerFlags: {
             googleSafeBrowsing: false,
-            phishTank: false,
             urlhaus: false
           },
           integrityMismatch: false
@@ -987,7 +1058,7 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
     overlay.className = "dili-warning-overlay";
     overlay.dataset.diliOwned = "true";
 
-const safeDestinationUrl = resolveModalDestinationUrl(destinationUrl, clickContext);
+const safeDestinationUrl = resolveModalDestinationUrl(destinationUrl, clickContext, analysis);
 const displayDestinationUrl = safeDestinationUrl || "Unresolved destination";
 const navigationDestinationUrl = safeDestinationUrl;
 
@@ -1024,7 +1095,7 @@ const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain"; 
             <strong>${escapeHtml(classificationText)}</strong>
           </div>
           <div class="dili-warning-summary-item">
-            <span>Score</span>
+            <span>Safety Score</span>
             <strong>${escapeHtml(scoreText)}</strong>
           </div>
         </div>
@@ -1155,12 +1226,10 @@ proceedButton?.addEventListener("click", () => {
 
   function buildReportPayload(clickContext, analysis, destinationUrl, reasons, overrides = {}) {
     const gsb = findProviderResult(analysis?.providerResults, "gsb");
-    const phishtank = findProviderResult(analysis?.providerResults, "phishtank");
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
     const features = analysis?.features || {};
     const providerFlags = overrides.providerFlags || {
       googleSafeBrowsing: Boolean(gsb?.flagged),
-      phishTank: Boolean(phishtank?.flagged),
       urlhaus: Boolean(urlhaus?.flagged)
     };
 
@@ -1176,6 +1245,10 @@ proceedButton?.addEventListener("click", () => {
       safetyScore: overrides.safetyScore !== undefined ? overrides.safetyScore : Number.isFinite(analysis?.safetyScore) ? analysis.safetyScore : null,
       mainReasons: reasons || [],
       providerFlags,
+      providerEvidence: overrides.providerEvidence || {
+        gsb: buildProviderReportEvidence(gsb),
+        urlhaus: buildProviderReportEvidence(urlhaus)
+      },
       integrityMismatch: overrides.integrityMismatch !== undefined ? Boolean(overrides.integrityMismatch) : Boolean(features.integrityHashMismatch),
       redirectCount: overrides.redirectCount !== undefined ? Number(overrides.redirectCount || 0) : Number(analysis?.redirectAnalysis?.redirectCount ?? features.redirectCount ?? 0),
       analysisState: overrides.analysisState || analysis?.state || "",
@@ -1188,6 +1261,10 @@ proceedButton?.addEventListener("click", () => {
       ? payload.mainReasons.map((reason) => `- ${reason}`).join("\n")
       : "- No additional reason text was available.";
 
+    const providerEvidence = payload.providerEvidence || {};
+    const gsbEvidence = providerEvidence.gsb || {};
+    const urlhausEvidence = providerEvidence.urlhaus || {};
+
     return [
       "DILI Suspicious Link Report",
       `Generated at: ${payload.generatedAt}`,
@@ -1197,18 +1274,43 @@ proceedButton?.addEventListener("click", () => {
       `Clicked text: ${payload.clickedText || ""}`,
       `Destination URL: ${payload.destinationUrl || ""}`,
       `Destination domain: ${payload.destinationDomain || ""}`,
-      `Risk classification: ${payload.classification || ""}`,
+      `Safety Classification: ${payload.classification || ""}`,
       `Safety score: ${payload.safetyScore ?? "Unavailable"}`,
       "Main reasons:",
       reasonLines,
       `Google Safe Browsing flagged: ${payload.providerFlags?.googleSafeBrowsing ? "Yes" : "No"}`,
-      `PhishTank flagged: ${payload.providerFlags?.phishTank ? "Yes" : "No"}`,
+      `Google Safe Browsing checked URL: ${gsbEvidence.checkedUrl || "Unavailable"}`,
+      `Google Safe Browsing result: ${gsbEvidence.resultSummary || "Unavailable"}`,
+      `Google Safe Browsing checked at: ${gsbEvidence.checkedAt || "Unavailable"}`,
+      `Google Safe Browsing response time: ${Number.isFinite(Number(gsbEvidence.durationMs)) ? `${Number(gsbEvidence.durationMs)} ms` : "Unavailable"}`,
       `URLhaus flagged: ${payload.providerFlags?.urlhaus ? "Yes" : "No"}`,
+      `URLhaus checked URL: ${urlhausEvidence.checkedUrl || "Unavailable"}`,
+      `URLhaus result: ${urlhausEvidence.resultSummary || "Unavailable"}`,
+      `URLhaus checked at: ${urlhausEvidence.checkedAt || "Unavailable"}`,
+      `URLhaus response time: ${Number.isFinite(Number(urlhausEvidence.durationMs)) ? `${Number(urlhausEvidence.durationMs)} ms` : "Unavailable"}`,
       `Integrity mismatch detected: ${payload.integrityMismatch ? "Yes" : "No"}`,
       `Redirect count: ${payload.redirectCount ?? 0}`,
       `Analysis state: ${payload.analysisState || ""}`,
       `Timestamp: ${new Date(Number(payload.timestamp || Date.now())).toISOString()}`
     ].join("\n");
+  }
+
+  function buildProviderReportEvidence(provider) {
+    if (!provider || typeof provider !== "object") {
+      return {
+        checkedUrl: "",
+        checkedAt: "",
+        durationMs: null,
+        resultSummary: "Provider not configured."
+      };
+    }
+
+    return {
+      checkedUrl: provider.checkedUrl || "",
+      checkedAt: provider.checkedAt || "",
+      durationMs: Number.isFinite(Number(provider.durationMs)) ? Number(provider.durationMs) : null,
+      resultSummary: provider.resultSummary || getProviderOutcomeSummary(provider)
+    };
   }
 
   async function copyReportToClipboard(reportText) {
@@ -1967,23 +2069,26 @@ const directCandidates = candidateElements
 
 const embeddedCardCandidates = findEmbeddedCardCandidates(post);
 const sponsoredFallbackCandidates = findSponsoredFallbackCandidates(post);
+const hiddenFullUrlCandidates = findHiddenFullUrlCandidates(post);
 const visibleDomainFallbackCandidates = findVisibleDomainFallbackCandidates(post);
 
 const fallbackCandidates = [
   ...sponsoredFallbackCandidates,
+  ...hiddenFullUrlCandidates,
   ...visibleDomainFallbackCandidates
 ];
 
-const candidates = dedupeLinkCandidates([
+const candidates = filterFallbackCandidatesWhenFullUrlsExist(dedupeLinkCandidates([
   ...directCandidates,
   ...embeddedCardCandidates,
   ...fallbackCandidates
-]);
+]));
 
 if (!suppressDiagnostics) {
   scanStatus.directCandidatesFound += directCandidates.length;
   scanStatus.embeddedCandidatesFound += embeddedCardCandidates.length;
   scanStatus.sponsoredFallbackCandidatesFound += sponsoredFallbackCandidates.length;
+  scanStatus.hiddenFullUrlCandidatesFound += hiddenFullUrlCandidates.length;
   scanStatus.visibleDomainCandidatesFound += visibleDomainFallbackCandidates.length;
   scanStatus.fallbackCandidatesFound += fallbackCandidates.length;
 
@@ -1991,6 +2096,7 @@ if (!suppressDiagnostics) {
     direct: directCandidates.length,
     embedded: embeddedCardCandidates.length,
     sponsoredFallback: sponsoredFallbackCandidates.length,
+    hiddenFullUrl: hiddenFullUrlCandidates.length,
     visibleDomainFallback: visibleDomainFallbackCandidates.length,
     fallback: fallbackCandidates.length,
     total: candidates.length
@@ -2040,22 +2146,34 @@ if (!suppressDiagnostics) {
     normalizedTargetUrl: selectedCandidate.normalizedTargetUrl
   });
 
+  const selectedCandidateDetails = buildCandidateContextDetails(selectedCandidate);
+
   return {
     element: selectedCandidate.element,
     url: selectedCandidate.url,
     displayText: selectedCandidate.displayText,
+    visibleText: selectedCandidate.visibleText || selectedCandidate.displayText || "",
+    rawHref: selectedCandidate.rawHref || selectedCandidate.url || "",
     normalizedTargetUrl: selectedCandidate.normalizedTargetUrl,
     links: uniqueCandidates.map((candidate) => ({
       url: candidate.url,
       displayText: candidate.displayText,
+      visibleText: candidate.visibleText || candidate.displayText || "",
+      rawHref: candidate.rawHref || candidate.url || "",
+      facebookWrapperUrl: candidate.facebookWrapperUrl || "",
+      unwrappedCandidateUrl: candidate.unwrappedCandidateUrl || candidate.normalizedTargetUrl || candidate.url || "",
       normalizedTargetUrl: candidate.normalizedTargetUrl,
+      candidateSource: getCandidateSource(candidate),
+      candidateUrlCompleteness: getCandidateUrlCompleteness(candidate),
+      candidateIsDomainOnlyFallback: isDomainOnlyFallbackCandidate(candidate),
       candidateContext: {
         candidateMode,
         candidateCount: uniqueCandidates.length,
         candidateDomainCount: uniqueDomains.length,
         dominantDomain: candidate.registrableDomain || "",
         selectedNormalizedTarget: candidate.normalizedTargetUrl,
-        signature
+        signature,
+        ...buildCandidateContextDetails(candidate)
       }
     })),
     linkFingerprint: uniqueTargets.sort().join("|"),
@@ -2065,7 +2183,8 @@ if (!suppressDiagnostics) {
       candidateDomainCount: uniqueDomains.length,
       dominantDomain: selectedCandidate.registrableDomain || "",
       selectedNormalizedTarget,
-      signature
+      signature,
+      ...selectedCandidateDetails
     }
   };
 }
@@ -2157,6 +2276,10 @@ function findVisibleDomainFallbackCandidates(post) {
         url,
         normalizedTargetUrl: safelyNormalizeComparableUrl(url),
         displayText: domain,
+        visibleText: domain,
+        rawHref: url,
+        facebookWrapperUrl: "",
+        unwrappedCandidateUrl: url,
         hostname,
         registrableDomain,
         wrapperOutbound: false,
@@ -2282,6 +2405,10 @@ if (isInsidePostHeaderArea(element, post)) {
         url,
         normalizedTargetUrl: safelyNormalizeComparableUrl(url),
         displayText: domain,
+        visibleText: domain,
+        rawHref: url,
+        facebookWrapperUrl: "",
+        unwrappedCandidateUrl: url,
         hostname,
         registrableDomain,
         wrapperOutbound: false,
@@ -2299,6 +2426,334 @@ if (isInsidePostHeaderArea(element, post)) {
   }
 
   return dedupeLinkCandidates(candidates);
+}
+
+function findHiddenFullUrlCandidates(post) {
+  if (!(post instanceof Element)) {
+    return [];
+  }
+
+  const visibleDomains = collectVisibleDomains(post);
+  const candidates = [];
+  const seen = new Set();
+
+  for (const { element, value, sourceLabel } of collectAttributeUrlStrings(post)) {
+    for (const rawUrl of extractUrlCandidatesFromRawString(value)) {
+      if (!isUsefulFullEndpointCandidate(rawUrl, post)) {
+        continue;
+      }
+
+      const candidate = buildHiddenFullUrlCandidate(rawUrl, element, sourceLabel, post);
+      if (!candidate) {
+        continue;
+      }
+
+      candidate.visibleDomainMatch = candidateMatchesVisibleDomains(candidate, visibleDomains);
+      const key = candidate.normalizedTargetUrl || candidate.url;
+      if (!key || seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      candidates.push(candidate);
+    }
+  }
+
+  const uniqueCandidates = dedupeLinkCandidates(candidates);
+  if (uniqueCandidates.length > 0) {
+    console.debug(`[DILI] Hidden full URL candidates found: ${uniqueCandidates.length}`);
+  }
+
+  return uniqueCandidates;
+}
+
+function collectAttributeUrlStrings(root) {
+  if (!(root instanceof Element)) {
+    return [];
+  }
+
+  const interestingAttributes = new Set([
+    "href",
+    "data-url",
+    "data-lynx-uri",
+    "ajaxify",
+    "data-store",
+    "data-ft",
+    "data-hovercard",
+    "data-hovercard-prefer-more-content-show",
+    "aria-label",
+    "title",
+    "onclick",
+    "role",
+    "target"
+  ]);
+  const urlishPattern =
+  /https?:\/\/|https?:\\\/\\\/|https?\\u003a\\u002f\\u002f|https?%3a%2f%2f|l\.facebook\.com\/l\.php|l\.facebook\.com\\\/l\.php|(?:^|[?&"'\s])(url|u|redirect|destination|target)=|(?:url|u|redirect|destination|target)\\u003d/i;
+  const result = [];
+  const elements = [root, ...root.querySelectorAll("*")];
+
+  for (const element of elements) {
+    if (!(element instanceof Element) || element.closest(".dili-panel, .dili-panel-slot, .dili-badge, .dili-warning-overlay")) {
+      continue;
+    }
+
+    for (const attribute of [...element.attributes]) {
+      const name = String(attribute.name || "").toLowerCase();
+      const value = String(attribute.value || "").trim();
+      if (!value) {
+        continue;
+      }
+
+      if (interestingAttributes.has(name) || urlishPattern.test(value)) {
+        result.push({ element, value, sourceLabel: name });
+      }
+    }
+  }
+
+  return result;
+}
+
+function extractUrlCandidatesFromRawString(rawValue) {
+  const values = [];
+  const seenValues = new Set();
+  const pushValue = (value) => {
+    const text = String(value || "").trim();
+    if (text && !seenValues.has(text)) {
+      seenValues.add(text);
+      values.push(text);
+    }
+  };
+
+  pushValue(rawValue);
+  pushValue(decodeHtmlEntities(rawValue));
+  pushValue(normalizeEscapedUrlString(rawValue));
+
+  for (let index = 0; index < values.length && index < 12; index += 1) {
+    const decoded = decodePossibleUrlString(values[index]);
+    if (decoded && decoded !== values[index]) {
+      pushValue(decoded);
+    }
+  }
+
+  const found = [];
+  const seenUrls = new Set();
+  const pushUrl = (url) => {
+    const text = String(url || "").trim();
+    if (!/^https?:\/\//i.test(text) || seenUrls.has(text)) {
+      return;
+    }
+
+    seenUrls.add(text);
+    found.push(text);
+  };
+
+  for (const value of values) {
+    for (const match of value.matchAll(/https?:\/\/[^\s"'<>\\)\\]}]+/gi)) {
+      pushUrl(cleanExtractedUrl(match[0]));
+    }
+
+    for (const match of value.matchAll(/https?%3a%2f%2f[^\s"'<>\\)\\]}]+/gi)) {
+      pushUrl(cleanExtractedUrl(decodePossibleUrlString(match[0])));
+    }
+
+    for (const nested of extractRedirectParamUrls(value)) {
+      pushUrl(nested);
+    }
+  }
+
+  return found;
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function normalizeEscapedUrlString(value) {
+  return decodeHtmlEntities(value)
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\u003d/gi, "=")
+    .replace(/\\u003f/gi, "?")
+    .replace(/\\u002f/gi, "/")
+    .replace(/\\u003a/gi, ":")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/gi, "&");
+}
+
+function decodePossibleUrlString(value) {
+  let current = normalizeEscapedUrlString(value);
+  for (let depth = 0; depth < 2; depth += 1) {
+    try {
+      const decoded = decodeURIComponent(current);
+      if (decoded === current) {
+        break;
+      }
+      current = normalizeEscapedUrlString(decoded);
+    } catch {
+      break;
+    }
+  }
+
+  return current;
+}
+
+function extractRedirectParamUrls(rawUrl) {
+  const result = [];
+  const queue = extractUrlCandidatesFromPlainText(decodePossibleUrlString(rawUrl)).slice(0, 8);
+  const seen = new Set();
+
+  for (let index = 0; index < queue.length && index < 12; index += 1) {
+    const value = queue[index];
+    if (seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+
+    try {
+      const parsed = new URL(value, location.href);
+      for (const paramName of FACEBOOK_REDIRECT_PARAMS) {
+        const nested = parsed.searchParams.get(paramName);
+        if (!nested) {
+          continue;
+        }
+
+        const decoded = decodePossibleUrlString(nested);
+        if (/^https?:\/\//i.test(decoded)) {
+          result.push(decoded);
+          queue.push(decoded);
+        }
+      }
+
+      const unwrapped = unwrapFacebookRedirectUrl(parsed.toString());
+      if (unwrapped && unwrapped !== parsed.toString()) {
+        result.push(unwrapped);
+        queue.push(unwrapped);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return [...new Set(result)];
+}
+
+function extractUrlCandidatesFromPlainText(value) {
+  const text = String(value || "");
+  const urls = [];
+  for (const match of text.matchAll(/https?:\/\/[^\s"'<>\\)\\]}]+/gi)) {
+    urls.push(cleanExtractedUrl(match[0]));
+  }
+  return urls;
+}
+
+function cleanExtractedUrl(value) {
+  return normalizeEscapedUrlString(value)
+    .replace(/[),.;\]}]+$/g, "")
+    .trim();
+}
+
+function isUsefulFullEndpointCandidate(rawUrl, post) {
+  if (!isEligibleLink(rawUrl)) {
+    return false;
+  }
+
+  const unwrapped = unwrapFacebookRedirectUrl(rawUrl);
+
+  try {
+    const url = new URL(unwrapped, location.href);
+    const hostname = url.hostname.toLowerCase();
+    const hasPathOrQuery = Boolean((url.pathname && url.pathname !== "/") || url.search);
+
+    if (!["http:", "https:"].includes(url.protocol) || !hasPathOrQuery) {
+      return false;
+    }
+
+    if (isFacebookHost(hostname) || isFacebookMediaCdnOrViewerUrl(url.toString()) || isInternalFacebookMediaOrActionUrl(url.toString())) {
+      return false;
+    }
+
+    if (isProviderApiUrl(url.toString()) || isFacebookInAppFormUrl(url.toString()) || isLikelyMediaAssetUrl(url.toString())) {
+      return false;
+    }
+
+    return post instanceof Element;
+  } catch {
+    return false;
+  }
+}
+
+function buildHiddenFullUrlCandidate(rawUrl, sourceElement, sourceLabel, post) {
+  const unwrappedCandidateUrl = unwrapFacebookRedirectUrl(rawUrl);
+  const normalizedTargetUrl = safelyNormalizeComparableUrl(unwrappedCandidateUrl || rawUrl);
+  const hostname = safeHostname(normalizedTargetUrl || unwrappedCandidateUrl || rawUrl);
+  const registrableDomain = getRegistrableDomain(hostname);
+
+  if (!hostname || !registrableDomain) {
+    return null;
+  }
+
+  const rect = sourceElement instanceof Element ? sourceElement.getBoundingClientRect() : { width: 0, height: 0 };
+  const displayText = sourceElement instanceof Element ? extractAnchorDisplayText(sourceElement) : "";
+  const facebookWrapperUrl = isFacebookWrapperHref(rawUrl) ? rawUrl : "";
+
+  return {
+    element: sourceElement instanceof Element ? sourceElement : post,
+    url: rawUrl,
+    rawHref: rawUrl,
+    normalizedTargetUrl,
+    displayText,
+    visibleText: displayText,
+    facebookWrapperUrl,
+    unwrappedCandidateUrl,
+    hostname,
+    registrableDomain,
+    wrapperOutbound: Boolean(facebookWrapperUrl),
+    meaningfulText: hasMeaningfulCandidateText(displayText),
+    inMainContent: sourceElement instanceof Element ? isElementInMainPostContent(sourceElement, post) : false,
+    inActionArea: sourceElement instanceof Element ? isElementInActionArea(sourceElement, post) : false,
+    hasMedia: sourceElement instanceof Element ? Boolean(sourceElement.querySelector?.("img, picture, video, svg")) : false,
+    visualArea: Math.round(Math.max(rect.width || 0, 0) * Math.max(rect.height || 0, 0)),
+    textLength: displayText.length,
+    urlLength: normalizedTargetUrl.length,
+    domPath: `hidden-url:${String(sourceLabel || "attribute")}:${hostname}`,
+    candidateSource: facebookWrapperUrl ? "hidden-facebook-wrapper-full-url" : "hidden-attribute-full-url"
+  };
+}
+
+function collectVisibleDomains(post) {
+  const text = removeHeaderTextFromRenderedText(post, extractRenderedVisibleText(post));
+  return new Set(
+    [...text.matchAll(new RegExp(DOMAIN_TEXT_PATTERN.source, "gi"))]
+      .map((match) => getRegistrableDomain(String(match[0] || "").toLowerCase()))
+      .filter(Boolean)
+  );
+}
+
+function candidateMatchesVisibleDomains(candidate, visibleDomains) {
+  return Boolean(candidate?.registrableDomain && visibleDomains instanceof Set && visibleDomains.has(candidate.registrableDomain));
+}
+
+function isProviderApiUrl(rawUrl) {
+  const hostname = safeHostname(rawUrl);
+  return (
+    hostname === "safebrowsing.googleapis.com" ||
+    hostname.endsWith(".safebrowsing.googleapis.com") ||
+    hostname === "urlhaus-api.abuse.ch" ||
+    hostname.endsWith(".urlhaus-api.abuse.ch")
+  );
+}
+
+function isLikelyMediaAssetUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl, location.href);
+    return /\.(?:png|jpe?g|gif|webp|svg|mp4|webm|mov|avi)(?:$|[?#])/i.test(url.pathname);
+  } catch {
+    return false;
+  }
 }
 
 function isBarePublicSuffixLikeDomain(domain) {
@@ -2423,7 +2878,53 @@ function isIgnoredVisibleDomain(domain) {
       seen.add(key);
       unique.push(candidate);
     }
-    return unique;
+
+    const byDomain = new Map();
+    for (const candidate of unique) {
+      const domain = getComparableCandidateDomain(candidate);
+      if (!domain) {
+        continue;
+      }
+
+      if (!byDomain.has(domain)) {
+        byDomain.set(domain, []);
+      }
+
+      byDomain.get(domain).push(candidate);
+    }
+
+    const result = [];
+    const processedKeys = new Set();
+
+    for (const candidate of unique) {
+      const key = candidate.normalizedTargetUrl || candidate.url;
+      if (processedKeys.has(key)) {
+        continue;
+      }
+
+      const domain = getComparableCandidateDomain(candidate);
+      if (!domain) {
+        result.push(candidate);
+        processedKeys.add(key);
+        continue;
+      }
+
+      const group = byDomain.get(domain) || [];
+      const isDomainOnlyFallback = isDomainOnlyFallbackCandidate(candidate);
+
+      if (isDomainOnlyFallback && group.length > 1) {
+        const hasFullerUrl = group.some((c) => !isDomainOnlyFallbackCandidate(c) && isFullerCandidateThan(c, candidate));
+        if (hasFullerUrl) {
+          processedKeys.add(key);
+          continue;
+        }
+      }
+
+      result.push(candidate);
+      processedKeys.add(key);
+    }
+
+    return result;
   }
 
   function findSponsoredFallbackCandidates(post) {
@@ -2459,7 +2960,10 @@ for (const element of elements) {
 
   const candidate = buildRelevantLinkCandidate(element, post);
   if (candidate) {
-    candidates.push(candidate);
+    candidates.push({
+      ...candidate,
+      candidateSource: "sponsored-fallback-direct"
+    });
   }
 }
     }
@@ -2503,6 +3007,8 @@ function buildRelevantLinkCandidate(element, post) {
   }
 
     const displayText = extractAnchorDisplayText(element);
+    const unwrappedCandidateUrl = unwrapFacebookRedirectUrl(rawUrl);
+    const facebookWrapperUrl = isFacebookWrapperHref(rawUrl) ? rawUrl : "";
     const normalizedTargetUrl = safelyNormalizeComparableUrl(rawUrl);
     const domPath = buildDomPath(element);
     const hostname = safeHostname(normalizedTargetUrl || rawUrl);
@@ -2515,8 +3021,12 @@ function buildRelevantLinkCandidate(element, post) {
     return {
       element,
       url: rawUrl,
+      rawHref: rawUrl,
       normalizedTargetUrl,
       displayText,
+      visibleText: displayText,
+      facebookWrapperUrl,
+      unwrappedCandidateUrl,
       hostname,
       registrableDomain,
       wrapperOutbound: isFacebookWrapperHref(rawUrl),
@@ -2527,7 +3037,8 @@ function buildRelevantLinkCandidate(element, post) {
       visualArea,
       textLength: displayText.length,
       urlLength: normalizedTargetUrl.length,
-      domPath
+      domPath,
+      candidateSource: "direct"
     };
   }
 
@@ -2671,16 +3182,143 @@ function readCandidateRawUrlFromElement(element) {
     return left.domPath.localeCompare(right.domPath);
   }
 
+  function getCandidateSource(candidate = {}) {
+    return String(candidate.candidateSource || "direct").trim() || "direct";
+  }
+
+  function buildCandidateContextDetails(candidate = {}) {
+    return {
+      displayText: candidate.displayText || "",
+      visibleText: candidate.visibleText || candidate.displayText || "",
+      rawHref: candidate.rawHref || candidate.url || "",
+      facebookWrapperUrl: candidate.facebookWrapperUrl || "",
+      unwrappedCandidateUrl: candidate.unwrappedCandidateUrl || candidate.normalizedTargetUrl || candidate.url || "",
+      candidateSource: getCandidateSource(candidate),
+      candidateUrlCompleteness: getCandidateUrlCompleteness(candidate),
+      candidateIsDomainOnlyFallback: isDomainOnlyFallbackCandidate(candidate)
+    };
+  }
+
+  function filterFallbackCandidatesWhenFullUrlsExist(candidates = []) {
+    const values = Array.isArray(candidates) ? candidates : [];
+    const hasUsableFullCandidate = values.some((candidate) => {
+      const source = getCandidateSource(candidate);
+      return (
+        !isVisibleDomainFallbackSource(source) &&
+        getCandidateUrlCompleteness(candidate) === "full-url"
+      );
+    });
+
+    if (!hasUsableFullCandidate) {
+      return values;
+    }
+
+    return values.filter((candidate) => {
+      return !isVisibleDomainFallbackSource(getCandidateSource(candidate));
+    });
+  }
+
+  function isVisibleDomainFallbackSource(source) {
+    return /visible-domain/i.test(String(source || ""));
+  }
+
+  function isDomainOnlyFallbackCandidate(candidate = {}) {
+    const source = getCandidateSource(candidate);
+
+    if (!isVisibleDomainFallbackSource(source)) {
+      return false;
+    }
+
+    try {
+      const url = new URL(candidate.normalizedTargetUrl || candidate.url || "", location.href);
+      const pathname = url.pathname || "/";
+      return (pathname === "/" || pathname === "") && !url.search && !url.hash;
+    } catch {
+      return true;
+    }
+  }
+
+  function getCandidateUrlCompleteness(candidate = {}) {
+    if (isDomainOnlyFallbackCandidate(candidate)) {
+      return "domain-only-fallback";
+    }
+
+    try {
+      const url = new URL(candidate.normalizedTargetUrl || candidate.url || "", location.href);
+      const hasPath = url.pathname && url.pathname !== "/";
+      const hasQuery = Boolean(url.search);
+      return hasPath || hasQuery ? "full-url" : "domain-root-url";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  function getCandidateSourcePriority(candidate = {}) {
+    const source = getCandidateSource(candidate);
+
+    if (source === "hidden-facebook-wrapper-full-url") {
+      return 95;
+    }
+
+    if (source === "hidden-attribute-full-url") {
+      return 92;
+    }
+
+    if (source === "embedded-card-direct") {
+      return 90;
+    }
+
+    if (source === "sponsored-fallback-direct") {
+      return 85;
+    }
+
+    if (source === "direct") {
+      return 80;
+    }
+
+    if (source === "embedded-card-visible-domain") {
+      return 45;
+    }
+
+    if (source === "visible-domain-fallback") {
+      return 35;
+    }
+
+    if (source.includes("visible-domain")) {
+      return 35;
+    }
+
+    return 60;
+  }
+
+  function getComparableCandidateDomain(candidate = {}) {
+    return candidate.registrableDomain || safeHostname(candidate.normalizedTargetUrl || candidate.url) || "";
+  }
+
+  function isFullerCandidateThan(left = {}, right = {}) {
+    const leftCompleteness = getCandidateUrlCompleteness(left);
+    const rightCompleteness = getCandidateUrlCompleteness(right);
+    const rank = {
+      "full-url": 3,
+      "domain-root-url": 2,
+      "unknown": 1,
+      "domain-only-fallback": 0
+    };
+
+    const leftRank = rank[leftCompleteness] ?? 1;
+    const rightRank = rank[rightCompleteness] ?? 1;
+
+    if (leftRank !== rightRank) {
+      return leftRank > rightRank;
+    }
+
+    return buildRelevantLinkScore(left) > buildRelevantLinkScore(right);
+  }
+
   function buildRelevantLinkScore(candidate) {
     let score = 0;
 
-    if (candidate.candidateSource === "embedded-card-direct") {
-      score += 35;
-    }
-
-    if (candidate.candidateSource === "embedded-card-visible-domain") {
-      score += 28;
-    }
+    score += getCandidateSourcePriority(candidate);
 
     if (candidate.inMainContent) {
       score += 45;
@@ -2702,7 +3340,20 @@ function readCandidateRawUrlFromElement(element) {
       score += 12;
     }
 
-    score += Math.min(Math.round(candidate.visualArea / 450), 80);
+    if (candidate.visibleDomainMatch) {
+      score += 18;
+    }
+
+    const completeness = getCandidateUrlCompleteness(candidate);
+    if (completeness === "full-url") {
+      score += 120;
+    } else if (completeness === "domain-root-url") {
+      score += 20;
+    } else if (completeness === "domain-only-fallback") {
+      score -= 120;
+    }
+
+    score += Math.min(Math.round(candidate.visualArea / 800), 30);
     score += Math.min(candidate.textLength, 60);
     score += Math.min(candidate.urlLength, 30);
 
@@ -3386,8 +4037,8 @@ detailsSummary: buildInlineDetailsSummary(
     const details = [];
     const seenDetails = new Set();
     const finalDomain = analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || safeHostname(analysis.analysisUrl) || "unknown site";
-    const originalDomain = safeHostname(analysis.rawUrl || analysis.normalizedUrl) || analysis.endpointResult?.effectiveDomain || "unknown link";
-    const scoreLabel = Number.isFinite(analysis.safetyScore) ? `score ${analysis.safetyScore}` : "no score";
+    const originalDomain = getUserFacingStartDomain(analysis);
+    const scoreLabel = Number.isFinite(analysis.safetyScore) ? `safety score ${analysis.safetyScore}` : "no score";
     const classification = analysis.classification || "Unverified";
     const severityLevel = normalizeInlineSeverityLevel({
       label: classification,
@@ -3396,7 +4047,7 @@ detailsSummary: buildInlineDetailsSummary(
     });
 
     pushUniqueAnalysisDetail(details, seenDetails, `Result: ${classification} (${scoreLabel}) for ${finalDomain}.`);
-    pushUniqueAnalysisDetail(details, seenDetails, `What DILI checked: The visible/original link was ${originalDomain}, and the final site appears to be ${finalDomain}.`);
+    pushUniqueAnalysisDetail(details, seenDetails, `What DILI checked: The clicked/visible link was ${originalDomain}, and the final site appears to be ${finalDomain}.`);
 
     const mainReasons = buildMainRiskReasons(analysis).slice(0, 4);
     if (mainReasons.length > 0) {
@@ -3430,10 +4081,7 @@ function buildPanelReportSections(analysis = {}) {
     safeHostname(analysis.analysisUrl) ||
     "unknown site";
 
-  const originalDomain =
-    safeHostname(analysis.rawUrl || analysis.normalizedUrl) ||
-    analysis.endpointResult?.effectiveDomain ||
-    "unknown link";
+  const originalDomain = getUserFacingStartDomain(analysis);
 
   const classification = analysis.classification || "Unverified";
   const severityLevel = normalizeInlineSeverityLevel({
@@ -3448,27 +4096,128 @@ function buildPanelReportSections(analysis = {}) {
 
   return {
     resultLine: buildPlainResultLine(classification, analysis.safetyScore, finalDomain),
-    checkedLine: `DILI checked where the link starts and where it finally leads. The original link appears to be ${originalDomain}, and the final site appears to be ${finalDomain}.`,
+    checkedLine: `DILI checked where the link starts and where it finally leads. The clicked/visible link appears to be ${originalDomain}, and the final site appears to be ${finalDomain}.`,
     reasons,
     recommendation: buildEndUserRecommendation(analysis, severityLevel),
     verificationNotes,
     technicalDetails
   };
 }
+
+function getUserFacingStartUrlOrText(analysis = {}) {
+  const context = analysis.candidateContext || {};
+  const endpoint = analysis.endpointResult || {};
+  const candidates = [
+    context.unwrappedCandidateUrl,
+    context.selectedNormalizedTarget,
+    endpoint.unwrappedUrl,
+    analysis.normalizedUrl,
+    looksLikeUsefulVisibleDestinationText(context.visibleText) ? context.visibleText : "",
+    looksLikeUsefulVisibleDestinationText(context.displayText) ? context.displayText : "",
+    isFacebookClickWrapperLikeText(analysis.rawUrl) ? "" : analysis.rawUrl
+  ];
+
+  for (const candidate of candidates) {
+    const value = String(candidate || "").replace(/\s+/g, " ").trim();
+    if (!value) {
+      continue;
+    }
+
+    if (isFacebookClickWrapperLikeText(value)) {
+      continue;
+    }
+
+    return value;
+  }
+
+  return String(endpoint.unwrappedUrl || analysis.normalizedUrl || analysis.rawUrl || "unknown link").trim();
+}
+
+function getUserFacingStartDomain(analysis = {}) {
+  const value = getUserFacingStartUrlOrText(analysis);
+  return normalizeVisibleDestinationLabel(value) || "unknown link";
+}
+
+function isFacebookClickWrapperLikeText(value) {
+  try {
+    const url = new URL(String(value || ""), location.href);
+    return /(^|\.)facebook\.com$/i.test(url.hostname) && /\/l\.php(?:$|[/?#])/i.test(url.pathname);
+  } catch {
+    return /^https?:\/\/l\.facebook\.com\/l\.php/i.test(String(value || ""));
+  }
+}
+
+function looksLikeUsefulVisibleDestinationText(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+
+  if (!text) {
+    return false;
+  }
+
+  if (isFacebookClickWrapperLikeText(text)) {
+    return false;
+  }
+
+  if (/^facebook\.com$/i.test(text) || /^www\.facebook\.com$/i.test(text)) {
+    return false;
+  }
+
+  if (/^[a-z0-9_-]{20,}$/i.test(text) && !/[./:]/.test(text)) {
+    return false;
+  }
+
+  if (getHostnameFromUrlOrDomainText(text)) {
+    return true;
+  }
+
+  return /\b(?:https?:\/\/|www\.)?[a-z0-9][a-z0-9.-]*\.(?:com|net|org|ph|app|ai|edu|gov|io|me|page|shop|site|store|xyz)\b/i.test(text);
+}
+
+function normalizeVisibleDestinationLabel(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  const host = getHostnameFromUrlOrDomainText(text);
+
+  if (host) {
+    return host.replace(/^www\./i, "");
+  }
+
+  const domainMatch = text.match(/\b(?:https?:\/\/|www\.)?([a-z0-9][a-z0-9.-]*\.(?:com|net|org|ph|app|ai|edu|gov|io|me|page|shop|site|store|xyz))\b/i);
+  if (domainMatch?.[1]) {
+    return domainMatch[1].replace(/^www\./i, "");
+  }
+
+  return text;
+}
+
+function getHostnameFromUrlOrDomainText(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+
+  try {
+    if (/^https?:\/\//i.test(text)) {
+      return new URL(text).hostname.toLowerCase();
+    }
+
+    if (/^(?:www\.)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:[/?#].*)?$/i.test(text)) {
+      return new URL(`https://${text.replace(/^\/+/, "")}`).hostname.toLowerCase();
+    }
+  } catch {
+    return "";
+  }
+
+  return "";
+}
 function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
   const features = analysis.features || {};
   const reasons = [];
 
   const gsb = findProviderResult(analysis.providerResults, "gsb");
-  const phishtank = findProviderResult(analysis.providerResults, "phishtank");
   const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
 
   if (gsb?.flagged) {
     reasons.push("Google Safe Browsing flagged this destination as unsafe.");
-  }
-
-  if (phishtank?.flagged) {
-    reasons.push("PhishTank verified this URL as a phishing site.");
   }
 
   if (urlhaus?.flagged) {
@@ -3515,23 +4264,112 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
 
   return [...new Set(reasons)].slice(0, 4);
 }
+
+function getProviderOutcomeSummary(provider = {}) {
+  const providerName = String(provider.provider || "").toLowerCase();
+  const status = String(provider.details?.status || "").toLowerCase();
+
+  if (!provider.configured || status === "not-configured") {
+    return "Provider not configured.";
+  }
+
+  if (status === "error" || status === "rate-limited" || status === "parse-error") {
+    return "Request failed.";
+  }
+
+  if (!provider.checked || status === "skipped") {
+    return "Provider not configured.";
+  }
+
+  if (providerName === "gsb") {
+    return provider.flagged ? "Unsafe URL reported." : "No unsafe matches reported.";
+  }
+
+  if (providerName === "urlhaus") {
+    return provider.flagged ? "Known malware record found." : "No known malware record found.";
+  }
+
+  return provider.flagged ? "Provider reported a match." : "No provider match reported.";
+}
+
+function getProviderAuditStatus(provider = {}) {
+  const status = String(provider.details?.status || "").toLowerCase();
+
+  if (!provider.configured || status === "not-configured" || status === "skipped" || !provider.checked) {
+    return "skipped";
+  }
+
+  if (status === "error" || status === "rate-limited" || status === "parse-error") {
+    return "failed";
+  }
+
+  return "completed";
+}
+
+function pushProviderVerificationNote(notes, provider, providerName) {
+  if (!provider || typeof provider !== "object") {
+    return;
+  }
+
+  const providerKey = String(provider.provider || "").toLowerCase();
+  const status = String(provider.details?.status || "").toLowerCase();
+
+  if (!provider.configured || status === "not-configured" || status === "skipped") {
+    return;
+  }
+
+  if (status === "error" || status === "rate-limited" || status === "parse-error") {
+    notes.push(`${providerName} verification could not be completed during this scan.`);
+    return;
+  }
+
+  if (provider.flagged) {
+    if (providerKey === "gsb") {
+      notes.push("Google Safe Browsing reported this link as unsafe.");
+      return;
+    }
+
+    notes.push("URLhaus reported known malware activity for this link.");
+    return;
+  }
+
+  if (provider.checked) {
+    if (providerKey === "gsb") {
+      notes.push("Google Safe Browsing completed its endpoint check and did not report this link as unsafe.");
+      return;
+    }
+
+    notes.push("URLhaus did not report known malware activity for this link.");
+  }
+}
+
 function buildEndUserVerificationNotes(analysis = {}) {
   const notes = [];
+  const gsb = findProviderResult(analysis.providerResults, "gsb");
+  const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
+
+  pushProviderVerificationNote(notes, gsb, "Google Safe Browsing");
+  pushProviderVerificationNote(notes, urlhaus, "URLhaus");
 
   for (const limitation of analysis.limitations || []) {
     const text = String(limitation || "");
 
-    if (/phishtank/i.test(text)) {
-      notes.push("PhishTank could not complete its check for this link.");
+    if (/did not expose a full clickable URL|visible domain only|domain-only fallback/i.test(text)) {
+      notes.push("Facebook only exposed the visible domain for this card, so DILI checked that domain instead of a full page path.");
+      continue;
+    }
+
+    if (/google safe browsing completed its endpoint check and did not report/i.test(text)) {
+      notes.push("Google Safe Browsing completed its endpoint check and did not report this link as unsafe.");
       continue;
     }
 
     if (/urlhaus/i.test(text)) {
-      notes.push("URLhaus could not complete its malware-database check for this link.");
+      notes.push("URLhaus verification could not be completed during this scan.");
       continue;
     }
 
-    if (/google safe browsing/i.test(text)) {
+    if (/google safe browsing/i.test(text) && !/completed/i.test(text)) {
       notes.push("Google Safe Browsing could not complete its check for this link.");
       continue;
     }
@@ -3582,68 +4420,294 @@ function buildEndUserVerificationNotes(analysis = {}) {
     if (urlhaus?.details?.status === "error") {
       limitations.push("URLhaus public lookup was unavailable.");
     }
-
     return [...new Set(limitations)];
   }
 
-  function buildTechnicalDetails(analysis = {}) {
-    const details = [];
-    const endpoint = analysis.endpointResult || {};
-    const finalDomain = endpoint.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || safeHostname(analysis.analysisUrl) || "";
-    const chain = endpoint.resolutionChain || analysis.redirectAnalysis?.redirectChain || [];
-    const chainDomains = [...new Set(chain.map((url) => safeHostname(url)).filter(Boolean))];
+function pushUniqueTechnicalDetail(details, text) {
+  const normalized = String(text || "")
+    .replace(/\s+/g, " ")
+    .replace(/\.$/, "")
+    .trim()
+    .toLowerCase();
 
-    for (const detail of analysis.technicalDetails || []) {
-      if (detail && !isNormalWrapperText(detail)) {
-        details.push(detail);
-      }
-    }
-
-    if (endpoint.isFacebookWrapper && finalDomain) {
-      details.push(`Facebook wrapper unwrapped to ${finalDomain}.`);
-    }
-
-    if (chainDomains.length > 1) {
-      details.push(`Redirect chain: ${chainDomains.join(" -> ")}.`);
-    }
-
-    if (analysis.urlFeatureAnalysis?.sourceNormalizedUrl && analysis.urlFeatureAnalysis?.sourceRawComparableUrl && analysis.urlFeatureAnalysis.sourceNormalizedUrl !== analysis.urlFeatureAnalysis.sourceRawComparableUrl) {
-      details.push("Tracking parameters were stripped for comparison.");
-    }
-
-    if (endpoint.endpointConfidence || analysis.endpointConfidence) {
-      details.push(`Endpoint confidence: ${endpoint.endpointConfidence || analysis.endpointConfidence}.`);
-    }
-
-    if (analysis.postIntegrityEvent) {
-      details.push(`Post integrity event: ${formatIntegrityEventLabel(analysis.postIntegrityEvent)}.`);
-    }
-
-    if (analysis.linkInsertedAfterBaseline) {
-      details.push("A link was inserted after a stored no-link baseline.");
-    }
-
-    if (analysis.baselineFirstSeenAt) {
-      details.push(`Baseline first seen: ${new Date(Number(analysis.baselineFirstSeenAt)).toISOString()}.`);
-    }
-
-    if (analysis.previousPostTextHash) {
-      details.push(`Previous post text hash: ${analysis.previousPostTextHash}.`);
-    }
-
-    if (analysis.currentPostTextHash) {
-      details.push(`Current post text hash: ${analysis.currentPostTextHash}.`);
-    }
-
-    for (const note of analysis.redirectAnalysis?.notes || []) {
-      if (!isNormalWrapperText(note)) {
-        details.push(note);
-      }
-    }
-
-    return [...new Set(details)];
+  if (!normalized) {
+    return;
   }
 
+  const alreadyExists = details.some((item) => {
+    return String(item || "")
+      .replace(/\s+/g, " ")
+      .replace(/\.$/, "")
+      .trim()
+      .toLowerCase() === normalized;
+  });
+
+  if (!alreadyExists) {
+    details.push(text);
+  }
+}
+
+function shouldSkipAutoGeneratedTechnicalDetail(detail) {
+  const text = String(detail || "").trim();
+
+  return (
+    /^Original URL:/i.test(text) ||
+    /^Clicked\/visible URL:/i.test(text) ||
+    /^Visible post URL\/text:/i.test(text) ||
+    /^Facebook click wrapper URL:/i.test(text) ||
+    /^Unwrapped URL:/i.test(text) ||
+    /^Full endpoint URL:/i.test(text) ||
+    /^Redirect chain:/i.test(text) ||
+    /^Observed redirect chain:/i.test(text) ||
+    /^Risk-relevant redirect chain:/i.test(text) ||
+    /^Redirect chain domains:/i.test(text) ||
+    /^Endpoint confidence:/i.test(text) ||
+    /^Provider scan scope:/i.test(text) ||
+    /^Full endpoint extraction status:/i.test(text) ||
+    /^Click-time note:/i.test(text) ||
+    /^Resolution method:/i.test(text) ||
+    /^GSB checked URL:/i.test(text) ||
+    /^URLHAUS checked URL:/i.test(text) ||
+    /^Google Safe Browsing checked URL:/i.test(text) ||
+    /^Google Safe Browsing attempted URL check:/i.test(text) ||
+    /^URLhaus checked URL:/i.test(text) ||
+    /^URLhaus attempted URL check:/i.test(text)
+  );
+}
+function formatCompactRedirectChainDetail(chain = []) {
+  const urls = Array.isArray(chain)
+    ? chain.map((url) => String(url || "").trim()).filter(Boolean)
+    : [];
+
+  if (urls.length === 0) {
+    return "";
+  }
+
+  const domains = urls
+    .map((url) => safeHostname(url).replace(/^www\./i, ""))
+    .filter(Boolean);
+
+  if (domains.length === 0) {
+    return "";
+  }
+
+  const compactDomains = [];
+  for (const domain of domains) {
+    if (compactDomains[compactDomains.length - 1] !== domain) {
+      compactDomains.push(domain);
+    }
+  }
+
+  const hopCount = Math.max(urls.length - 1, 0);
+  const hopText = hopCount === 1 ? "1 redirect hop" : `${hopCount} redirect hops`;
+
+  if (compactDomains.length === 1) {
+    return hopCount > 0
+      ? `Redirect chain: ${compactDomains[0]} only (${hopText}; same-domain redirect or tracking cleanup).`
+      : `Redirect chain: ${compactDomains[0]} only (no redirect hop observed).`;
+  }
+
+  return `Redirect chain: ${compactDomains.join(" -> ")} (${hopText}).`;
+}
+
+function isFacebookPlatformWrapperUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    return /(^|\.)facebook\.com$/i.test(url.hostname) && /\/l\.php(?:$|[/?#])/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function buildRiskRelevantRedirectChain(chain = []) {
+  return (Array.isArray(chain) ? chain : []).filter((url) => !isFacebookPlatformWrapperUrl(url));
+}
+
+function prependKnownFacebookWrapperForDisplay(chain = [], facebookWrapperUrl = "") {
+  const values = Array.isArray(chain) ? chain.filter(Boolean) : [];
+  if (!facebookWrapperUrl || values.some((url) => String(url || "") === String(facebookWrapperUrl))) {
+    return values;
+  }
+
+  return [facebookWrapperUrl, ...values];
+}
+
+function buildTechnicalDetails(analysis = {}) {
+  const details = [];
+  const endpoint = analysis.endpointResult || {};
+  const finalDomain =
+    endpoint.effectiveDomain ||
+    analysis.urlFeatureAnalysis?.finalDomain ||
+    safeHostname(analysis.analysisUrl) ||
+    "";
+
+  const chain = Array.isArray(endpoint.resolutionChain) && endpoint.resolutionChain.length > 0
+    ? endpoint.resolutionChain
+    : Array.isArray(analysis.redirectAnalysis?.redirectChain)
+      ? analysis.redirectAnalysis.redirectChain
+      : [];
+
+  const chainDomains = [...new Set(chain.map((url) => safeHostname(url)).filter(Boolean))];
+
+  for (const detail of analysis.technicalDetails || []) {
+    if (!detail || isNormalWrapperText(detail) || shouldSkipAutoGeneratedTechnicalDetail(detail)) {
+      continue;
+    }
+
+    pushUniqueTechnicalDetail(details, detail);
+  }
+
+  const candidateContext = analysis.candidateContext || {};
+  const visiblePostValue =
+    candidateContext.unwrappedCandidateUrl ||
+    candidateContext.selectedNormalizedTarget ||
+    endpoint.unwrappedUrl ||
+    (looksLikeUsefulVisibleDestinationText(candidateContext.visibleText) ? candidateContext.visibleText : "") ||
+    (looksLikeUsefulVisibleDestinationText(candidateContext.displayText) ? candidateContext.displayText : "") ||
+    "";
+
+  if (visiblePostValue && !isFacebookClickWrapperLikeText(visiblePostValue)) {
+    pushUniqueTechnicalDetail(details, `Visible post URL/text: ${visiblePostValue}.`);
+  }
+
+  const facebookWrapperUrl = candidateContext.facebookWrapperUrl || (endpoint.isFacebookWrapper ? endpoint.rawUrl || analysis.rawUrl : "");
+  if (facebookWrapperUrl) {
+    pushUniqueTechnicalDetail(details, `Facebook click wrapper URL: ${facebookWrapperUrl}.`);
+  }
+
+  if (
+    endpoint.unwrappedUrl &&
+    endpoint.unwrappedUrl !== analysis.rawUrl &&
+    endpoint.unwrappedUrl !== endpoint.effectiveEndpoint
+  ) {
+    pushUniqueTechnicalDetail(details, `Unwrapped URL: ${endpoint.unwrappedUrl}`);
+  }
+
+  if (endpoint.effectiveEndpoint) {
+    pushUniqueTechnicalDetail(details, `Full endpoint URL: ${endpoint.effectiveEndpoint}`);
+  }
+
+  const observedRedirectChain = prependKnownFacebookWrapperForDisplay(chain, facebookWrapperUrl);
+  const observedRedirectChainDetail = formatCompactRedirectChainDetail(observedRedirectChain);
+  if (observedRedirectChainDetail) {
+    pushUniqueTechnicalDetail(details, observedRedirectChainDetail.replace(/^Redirect chain:/, "Observed redirect chain:"));
+  }
+
+  const riskRelevantRedirectChain = buildRiskRelevantRedirectChain(observedRedirectChain);
+  const riskRelevantRedirectChainDetail = formatCompactRedirectChainDetail(riskRelevantRedirectChain);
+  if (
+    riskRelevantRedirectChainDetail &&
+    riskRelevantRedirectChain.length > 0 &&
+    riskRelevantRedirectChain.length !== observedRedirectChain.length
+  ) {
+    pushUniqueTechnicalDetail(details, riskRelevantRedirectChainDetail.replace(/^Redirect chain:/, "Risk-relevant redirect chain:"));
+  }
+
+  if (endpoint.isFacebookWrapper && finalDomain) {
+    pushUniqueTechnicalDetail(details, `Facebook wrapper unwrapped to ${finalDomain}.`);
+  }
+
+  if (chainDomains.length > 1) {
+    pushUniqueTechnicalDetail(details, `Redirect chain domains: ${chainDomains.join(" -> ")}.`);
+  }
+
+  if (
+    analysis.urlFeatureAnalysis?.sourceNormalizedUrl &&
+    analysis.urlFeatureAnalysis?.sourceRawComparableUrl &&
+    analysis.urlFeatureAnalysis.sourceNormalizedUrl !== analysis.urlFeatureAnalysis.sourceRawComparableUrl
+  ) {
+    pushUniqueTechnicalDetail(details, "Tracking parameters were stripped for comparison.");
+  }
+
+  if (endpoint.endpointConfidence || analysis.endpointConfidence) {
+    pushUniqueTechnicalDetail(
+      details,
+      `Endpoint confidence: ${endpoint.endpointConfidence || analysis.endpointConfidence}.`
+    );
+  }
+
+  if (endpoint.resolutionMethod) {
+    pushUniqueTechnicalDetail(details, `Resolution method: ${endpoint.resolutionMethod}.`);
+  }
+
+  if (
+    candidateContext?.candidateIsDomainOnlyFallback === true ||
+    candidateContext?.candidateUrlCompleteness === "domain-only-fallback"
+  ) {
+    pushUniqueTechnicalDetail(details, "Candidate source: visible-domain-fallback.");
+    pushUniqueTechnicalDetail(details, "Endpoint source note: Facebook did not expose a full clickable URL for this card, so DILI checked the visible domain only.");
+    pushUniqueTechnicalDetail(details, "Provider scan scope: limited to visible-domain fallback because no full endpoint was exposed during passive scan.");
+    pushUniqueTechnicalDetail(details, "Full endpoint extraction status: No full path/query URL was exposed during passive scan.");
+    pushUniqueTechnicalDetail(details, "Click-time note: If the user clicks this card, DILI will re-check the actual clicked destination before navigation.");
+  }
+
+  const providerLabels = {
+    gsb: "Google Safe Browsing",
+    urlhaus: "URLhaus"
+  };
+
+  for (const provider of analysis.providerResults || []) {
+    if (!provider?.checkedUrl) {
+      continue;
+    }
+
+    const providerName = String(provider.provider || "").toLowerCase();
+    if (providerName !== "gsb" && providerName !== "urlhaus") {
+      continue;
+    }
+
+    const label = providerLabels[providerName] || provider.provider || "Provider";
+    const auditStatus = getProviderAuditStatus(provider);
+    const outcomeSummary = provider.resultSummary || getProviderOutcomeSummary(provider);
+    const durationMs = Number(provider.durationMs);
+
+    pushUniqueTechnicalDetail(details, `${label} checked URL: ${provider.checkedUrl}.`);
+    pushUniqueTechnicalDetail(details, `${label} result: ${outcomeSummary}`);
+    pushUniqueTechnicalDetail(details, `${label} status: ${auditStatus}.`);
+
+    if (provider.checkedAt) {
+      pushUniqueTechnicalDetail(details, `${label} checked at: ${provider.checkedAt}.`);
+    }
+
+    if (Number.isFinite(durationMs)) {
+      pushUniqueTechnicalDetail(details, `${label} response time: ${durationMs} ms`);
+    }
+  }
+
+  if (analysis.postIntegrityEvent) {
+    pushUniqueTechnicalDetail(
+      details,
+      `Post integrity event: ${formatIntegrityEventLabel(analysis.postIntegrityEvent)}.`
+    );
+  }
+
+  if (analysis.linkInsertedAfterBaseline) {
+    pushUniqueTechnicalDetail(details, "A link was inserted after a stored no-link baseline.");
+  }
+
+  if (analysis.baselineFirstSeenAt) {
+    pushUniqueTechnicalDetail(
+      details,
+      `Baseline first seen: ${new Date(Number(analysis.baselineFirstSeenAt)).toISOString()}.`
+    );
+  }
+
+  if (analysis.previousPostTextHash) {
+    pushUniqueTechnicalDetail(details, `Previous post text hash: ${analysis.previousPostTextHash}.`);
+  }
+
+  if (analysis.currentPostTextHash) {
+    pushUniqueTechnicalDetail(details, `Current post text hash: ${analysis.currentPostTextHash}.`);
+  }
+
+  for (const note of analysis.redirectAnalysis?.notes || []) {
+    if (!isNormalWrapperText(note)) {
+      pushUniqueTechnicalDetail(details, note);
+    }
+  }
+
+  return details;
+}
   function describeLinkType(analysis = {}) {
     if (analysis.endpointResult?.isShortener || analysis.features?.shortenedUrl) {
       return "Shortened external link";
@@ -3863,7 +4927,7 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
 
   function buildInlineScoreLabel(viewModel = {}, severityLevel = normalizeInlineSeverityLevel(viewModel)) {
     if (Number.isFinite(viewModel.safetyScore)) {
-      return `Score ${viewModel.safetyScore}`;
+      return `Safety Score ${viewModel.safetyScore}`;
     }
 
     if (severityLevel === "no-link") {

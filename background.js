@@ -1,9 +1,7 @@
 import {
   GSB_API_KEY,
   URLHAUS_API_KEY,
-  URLHAUS_AUTH_KEY,
-  PHISHTANK_APP_KEY,
-  PHISHTANK_ENABLED
+  URLHAUS_AUTH_KEY
 } from "./config.local.js";
 import { calculateSafetyScore, classifySafetyScore } from "./riskEngine.js";
 import { sha256Hex } from "./utils/hash.js";
@@ -329,7 +327,7 @@ recordMaxPerformanceStat("maxEndpointMs", endpointMs);
         internalFacebook: true
       },
       deductions: [],
-      providerResults: [createDefaultProviderResult("gsb"), createDefaultProviderResult("phishtank"), createDefaultProviderResult("urlhaus")],
+      providerResults: [createDefaultProviderResult("gsb"), createDefaultProviderResult("urlhaus")],
       redirectAnalysis: {
         redirectCount: 0,
         redirectChain: endpointResult.resolutionChain,
@@ -368,6 +366,11 @@ performanceStats.lastCacheHit = Boolean(reusableUrlAnalysis.cacheHit);
     normalizedUrl,
     domain
   });
+  const isDomainOnlyFallbackAnalysis = Boolean(
+    normalizedCandidateContext.candidateIsDomainOnlyFallback === true ||
+    normalizedCandidateContext.candidateUrlCompleteness === "domain-only-fallback" ||
+    /visible-domain/i.test(String(normalizedCandidateContext.candidateSource || ""))
+  );
   const currentHash = await sha256Hex(buildStableUrlHashInput({
     analysisUrl,
     normalizedUrl
@@ -430,21 +433,24 @@ const canUseNoLinkInjectionBaseline = Boolean(
     ...reusableUrlAnalysis.urlLevelFeatures,
     wrapperToExternalDestination: enrichedUrlFeatures.wrapperToExternalDestination
   };
-  const urlLevelFeatures = applyMainstreamResolvedShortlinkMitigation({
+  let urlLevelFeatures = applyMainstreamResolvedShortlinkMitigation({
     ...urlLevelFeaturesBase,
     trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(urlLevelFeaturesBase)
   }, reusableUrlAnalysis, endpointResult);
+  urlLevelFeatures = applyFacebookWrapperOnlyRedirectMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
+  urlLevelFeatures = applySameDomainMarketingEncodingMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
   const combinedFeaturesBase = {
     ...urlLevelFeatures,
     ...postContextFeatures
   };
-  const features = applyMainstreamResolvedShortlinkMitigation({
+  let features = applyMainstreamResolvedShortlinkMitigation({
     ...combinedFeaturesBase,
     trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(combinedFeaturesBase)
   }, reusableUrlAnalysis, endpointResult);
+  features = applyFacebookWrapperOnlyRedirectMitigation(features, reusableUrlAnalysis, endpointResult);
+  features = applySameDomainMarketingEncodingMitigation(features, reusableUrlAnalysis, endpointResult);
   const urlLevelScoring = calculateSafetyScore(urlLevelFeatures);
-  const phishtankResult = getNormalizedProviderResult(providerResults, "phishtank");
-  const providerOverride = Boolean(gsbResult.flagged || phishtankResult.flagged || urlhausResult.flagged);
+  const providerOverride = Boolean(gsbResult.flagged || urlhausResult.flagged);
   const urlLevelClassification = providerOverride ? "High Risk" : classifySafetyScore(urlLevelScoring.score);
 const scoringStartedAt = nowMs();
 const scoring = calculateSafetyScore(features);
@@ -459,7 +465,6 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     providerOverride ||
     features.integrityHashMismatch ||
     features.googleSafeBrowsingFlagged ||
-    features.phishtankFlagged ||
     features.urlhausFlagged ||
     features.usernamePasswordTrick ||
     features.suspiciousRedirectPattern ||
@@ -473,12 +478,15 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
   );
   const verificationState = endpointResolutionFailed
     ? "unverified"
-    : endpointResult?.endpointConfidence === "low"
-      ? "low-confidence"
-      : "verified";
+    : isDomainOnlyFallbackAnalysis
+      ? "partial-domain-only"
+      : endpointResult?.endpointConfidence === "low"
+        ? "low-confidence"
+        : "verified";
+  const trulyUnresolvedEndpoint = Boolean(endpointResolutionFailed && !endpointResult?.effectiveEndpoint);
   const verificationOnlyUnknown = Boolean(
     !providerOverride &&
-    verificationState !== "verified" &&
+    trulyUnresolvedEndpoint &&
     !concreteRiskSignals
   );
   let finalScore = providerOverride ? Math.min(scoring.score, 20) : scoring.score;
@@ -540,15 +548,20 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         linkInsertedAfterBaseline,
         baselineFirstSeenAt,
         previousPostTextHash,
-        currentPostTextHash
-      }
+        currentPostTextHash,
+        candidateContext: normalizedCandidateContext
+      },
+      providerResults
     }),
     endpointConfidence: endpointResult.endpointConfidence,
-    limitations: buildAnalysisLimitations({ endpointResult, providerResults }),
+    limitations: buildAnalysisLimitations({ endpointResult, providerResults, candidateContext: normalizedCandidateContext }),
     postIdentityStable: normalizedCandidateContext.postIdentityStable === true,
     integrityComparisonStatus: normalizedCandidateContext.postIdentityStable === true ? "checked" : "skipped-unstable-post-identity",
     redirectAnalysis,
     urlFeatureAnalysis: enrichedUrlFeatures,
+    candidateSource: normalizedCandidateContext.candidateSource || "",
+    candidateUrlCompleteness: normalizedCandidateContext.candidateUrlCompleteness || "",
+    candidateIsDomainOnlyFallback: normalizedCandidateContext.candidateIsDomainOnlyFallback === true,
     lastChecked: Date.now(),
     state: nextState
   };
@@ -573,7 +586,6 @@ recordMaxPerformanceStat("maxStorageMs", storageMs);
 
 const providerFlaggedDomain = Boolean(
   gsbResult.flagged ||
-  phishtankResult.flagged ||
   urlhausResult.flagged
 );
 
@@ -614,7 +626,7 @@ if (providerFlaggedDomain) {
 
   logDebug(`URL analysis reused=${reusableUrlAnalysis.cacheHit} analysisUrl=${analysisUrl}`);
   logDebug(
-    `Provider checks: gsb=${gsbResult.flagged} phishtank=${phishtankResult.flagged} urlhaus=${urlhausResult.flagged}`
+    `Provider checks: gsb=${gsbResult.flagged} urlhaus=${urlhausResult.flagged}`
   );
   logDebug(`Scoring result for ${postId}: safety=${finalScore} classification=${classification}`);
 const totalMs = elapsedMs(totalStartedAt);
@@ -652,6 +664,58 @@ function resolveAnalysisUrl(urlFeatures, redirectAnalysis) {
   }
 
   throw new Error("Unable to resolve a stable analysis URL.");
+}
+
+function pickProviderCheckedUrl({ endpointResult = {}, redirectAnalysis = {}, urlFeatures = {} } = {}) {
+  const candidates = [
+    endpointResult.effectiveEndpoint,
+    endpointResult.resolvedUrl,
+    redirectAnalysis.resolvedUrl,
+    urlFeatures.unwrappedUrl,
+    urlFeatures.normalizedUrl
+  ];
+
+  const fallbackCandidates = [];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeProviderCandidateUrl(candidate);
+    if (!normalized) {
+      continue;
+    }
+
+    fallbackCandidates.push(normalized);
+
+    if (isFacebookWrapperProviderCandidate(normalized)) {
+      continue;
+    }
+
+    return normalized;
+  }
+
+  return fallbackCandidates.find((candidate) => !isFacebookWrapperProviderCandidate(candidate)) || fallbackCandidates[0] || "";
+}
+
+function normalizeProviderCandidateUrl(candidate) {
+  const value = String(candidate || "").trim();
+  if (!value) {
+    return "";
+  }
+
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return "";
+    }
+
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function isFacebookWrapperProviderCandidate(candidate) {
+  const hostname = safeHostname(candidate);
+  return /(^|\.)facebook\.com$/i.test(hostname) && /\/l\.php(?:$|[/?#])/i.test(String(candidate || ""));
 }
 
 function getCompatibleBaseline(existingBaseline) {
@@ -713,13 +777,29 @@ function buildCandidateContext(candidateContext = {}, fallback = {}) {
     fallback.candidateMode,
     candidateDomainCount
   );
+  const candidateSource = String(candidateContext.candidateSource || fallback.candidateSource || "").trim();
+  const candidateUrlCompleteness = String(candidateContext.candidateUrlCompleteness || fallback.candidateUrlCompleteness || "").trim();
+  const candidateIsDomainOnlyFallback = candidateContext.candidateIsDomainOnlyFallback === true || fallback.candidateIsDomainOnlyFallback === true;
+  const displayText = String(candidateContext.displayText || fallback.displayText || "").trim();
+  const visibleText = String(candidateContext.visibleText || fallback.visibleText || displayText || "").trim();
+  const rawHref = String(candidateContext.rawHref || fallback.rawHref || "").trim();
+  const facebookWrapperUrl = String(candidateContext.facebookWrapperUrl || fallback.facebookWrapperUrl || "").trim();
+  const unwrappedCandidateUrl = String(candidateContext.unwrappedCandidateUrl || fallback.unwrappedCandidateUrl || "").trim();
 
   return {
     candidateMode,
     dominantDomain,
     candidateDomainCount,
     selectedNormalizedTarget,
-    postIdentityStable: candidateContext.postIdentityStable === true || fallback.postIdentityStable === true
+    postIdentityStable: candidateContext.postIdentityStable === true || fallback.postIdentityStable === true,
+    displayText,
+    visibleText,
+    rawHref,
+    facebookWrapperUrl,
+    unwrappedCandidateUrl,
+    candidateSource,
+    candidateUrlCompleteness,
+    candidateIsDomainOnlyFallback
   };
 }
 
@@ -828,12 +908,17 @@ performanceStats.lastCacheHit = true;
   const safeEndpointResult = endpointResult || {};
   const safeRedirectAnalysis = normalizeRedirectAnalysis(redirectAnalysis || endpointResult?.redirectAnalysis || await analyzeRedirects(rawUrl));
   const analysisUrl = endpointResult?.effectiveEndpoint || resolveAnalysisUrl(urlFeatures, safeRedirectAnalysis);
+  const providerCheckedUrl = pickProviderCheckedUrl({
+    endpointResult: safeEndpointResult,
+    redirectAnalysis: safeRedirectAnalysis,
+    urlFeatures
+  }) || analysisUrl;
   const domain = safeHostname(analysisUrl || urlFeatures.normalizedUrl);
   const analysisUrlFeatures = analyzeUrlFeatures({
     rawUrl: analysisUrl
   });
 const providerStartedAt = nowMs();
-const providerResults = normalizeProviderResults(await runThreatIntelligenceChecks(analysisUrl));
+const providerResults = normalizeProviderResults(await runThreatIntelligenceChecks(providerCheckedUrl));
 const providerMs = elapsedMs(providerStartedAt);
 performanceStats.lastProviderMs = providerMs;
 recordMaxPerformanceStat("maxProviderMs", providerMs);
@@ -872,6 +957,7 @@ recordMaxPerformanceStat("maxProviderMs", providerMs);
     redirectAnalysis: safeRedirectAnalysis,
     providerResults,
     endpointResult: safeEndpointResult,
+    providerCheckedUrl,
     urlFeatureAnalysis: stableUrlFeatureAnalysis,
     urlLevelFeatures
   };
@@ -890,12 +976,10 @@ function buildUrlLevelFeatures({ redirectAnalysis, providerResults, urlFeatureAn
   const safeRedirectAnalysis = normalizeRedirectAnalysis(redirectAnalysis);
   const safeUrlFeatureAnalysis = urlFeatureAnalysis || {};
   const gsbResult = safeProviderResults.find((item) => item.provider === "gsb");
-  const phishtankResult = safeProviderResults.find((item) => item.provider === "phishtank");
   const urlhausResult = safeProviderResults.find((item) => item.provider === "urlhaus");
 
   const baseFeatures = {
     googleSafeBrowsingFlagged: gsbResult.flagged,
-    phishtankFlagged: phishtankResult.flagged,
     urlhausFlagged: urlhausResult.flagged,
     domainPreviouslyFlagged: false,
     redirectCount: safeRedirectAnalysis.redirectCount,
@@ -937,10 +1021,6 @@ function isTrustedEndpointMitigationEligible(features = {}) {
     return false;
   }
 
-  if (features.phishtankFlagged) {
-    return false;
-  }
-
   if (features.textMismatch || features.integrityHashMismatch) {
     return false;
   }
@@ -977,14 +1057,13 @@ function normalizeReusableUrlAnalysis(value = {}) {
 
 function normalizeProviderResults(providerResults) {
   const values = Array.isArray(providerResults) ? providerResults : [];
-  const gsb = values.find((item) => item?.provider === "gsb") || createDefaultProviderResult("gsb");
-  const phishtank = values.find((item) => item?.provider === "phishtank") || createDefaultProviderResult("phishtank");
-  const urlhaus = values.find((item) => item?.provider === "urlhaus") || createDefaultProviderResult("urlhaus");
-  return [gsb, phishtank, urlhaus];
+  const gsb = values.find((item) => item?.provider === "gsb") || createDefaultProviderResult("gsb", "");
+  const urlhaus = values.find((item) => item?.provider === "urlhaus") || createDefaultProviderResult("urlhaus", "");
+  return [gsb, urlhaus];
 }
 
 function getNormalizedProviderResult(providerResults, providerName) {
-  return normalizeProviderResults(providerResults).find((item) => item.provider === providerName) || createDefaultProviderResult(providerName);
+  return normalizeProviderResults(providerResults).find((item) => item.provider === providerName) || createDefaultProviderResult(providerName, "");
 }
 
 function normalizeRedirectAnalysis(redirectAnalysis = {}) {
@@ -997,6 +1076,8 @@ function normalizeRedirectAnalysis(redirectAnalysis = {}) {
     uniqueRegistrableDomains: Array.isArray(safe.uniqueRegistrableDomains) ? safe.uniqueRegistrableDomains : [],
     resolvedUrl: safe.resolvedUrl || "",
     resolutionMethod: safe.resolutionMethod || "unknown",
+    fetchMethod: safe.fetchMethod || "",
+    fetchStatus: safe.fetchStatus || "",
     notes: Array.isArray(safe.notes) ? safe.notes : [],
     fetchAttempted: Boolean(safe.fetchAttempted),
     fetchAllowed: Boolean(safe.fetchAllowed),
@@ -1059,6 +1140,11 @@ function shouldApplyWrapperRisk({ endpointResult = {}, redirectAnalysis = {}, ur
 // suspicious paths, suspicious TLDs, text mismatch, or post-integrity changes.
 function applyMainstreamResolvedShortlinkMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
   const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
+  const resolutionChain = Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
+    ? endpointResult.resolutionChain
+    : reusableUrlAnalysis.redirectAnalysis?.redirectChain || [];
+  const sourceDomain = getRedirectSourceDomain(resolutionChain);
+  const knownShortenerOwnerRedirect = isKnownShortenerToOwnerDestination(sourceDomain, finalDomain);
   const mainstreamDomains = new Set([
     // Common global/social/e-commerce destinations
     "tiktok.com",
@@ -1068,6 +1154,7 @@ function applyMainstreamResolvedShortlinkMitigation(features = {}, reusableUrlAn
     "lazada.com",
     "youtube.com",
     "youtu.be",
+    "amazon.com",
     "instagram.com",
     "facebook.com",
     "messenger.com",
@@ -1087,16 +1174,15 @@ function applyMainstreamResolvedShortlinkMitigation(features = {}, reusableUrlAn
   const confidence = String(endpointResult?.endpointConfidence || "").toLowerCase();
   const isEligible = Boolean(
     features.shortenedUrl &&
-    mainstreamDomains.has(finalDomain) &&
+    (mainstreamDomains.has(finalDomain) || knownShortenerOwnerRedirect) &&
     ["high", "medium"].includes(confidence) &&
     features.httpsEndpoint &&
     !features.googleSafeBrowsingFlagged &&
-    !features.phishtankFlagged &&
     !features.urlhausFlagged &&
     !features.suspiciousPath &&
     !features.suspiciousTld &&
     !features.usernamePasswordTrick &&
-    !features.textMismatch &&
+    (!features.textMismatch || knownShortenerOwnerRedirect) &&
     !features.integrityHashMismatch
   );
 
@@ -1113,23 +1199,154 @@ function applyMainstreamResolvedShortlinkMitigation(features = {}, reusableUrlAn
     trackingHopToUnrelatedDomain: false,
     crossDomainRedirectChain: false,
     redirectChainToDifferentRegistrantLikeTarget: false,
+    textMismatch: knownShortenerOwnerRedirect ? false : features.textMismatch,
     trustedEndpoint: true,
     trustedEndpointMitigationEligible: true,
-    mainstreamResolvedShortlink: true
+    mainstreamResolvedShortlink: true,
+    knownShortenerOwnerRedirect
   };
 }
 
-function buildAnalysisLimitations({ endpointResult, providerResults }) {
+function getRiskRelevantRedirectChain(chain = []) {
+  return buildRiskRelevantRedirectChain(chain);
+}
+
+function getRegistrableDomainsFromChain(chain = []) {
+  return [...new Set(
+    (Array.isArray(chain) ? chain : [])
+      .map((url) => getRegistrableDomain(safeHostname(url)))
+      .filter(Boolean)
+  )];
+}
+
+function isSameDomainOrTrackingCleanupRedirect({ endpointResult, redirectAnalysis, finalDomain }) {
+  const rawChain =
+    Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
+      ? endpointResult.resolutionChain
+      : Array.isArray(redirectAnalysis?.redirectChain)
+        ? redirectAnalysis.redirectChain
+        : [];
+
+  const riskChain = getRiskRelevantRedirectChain(rawChain);
+  const riskDomains = getRegistrableDomainsFromChain(riskChain);
+
+  if (riskDomains.length <= 1 && finalDomain && riskDomains[0] === finalDomain) {
+    return true;
+  }
+
+  return false;
+}
+
+function applyFacebookWrapperOnlyRedirectMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
+  const providerFlagged = Boolean(features.googleSafeBrowsingFlagged || features.urlhausFlagged);
+  const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
+  const sameDomainTrackingCleanup = isSameDomainOrTrackingCleanupRedirect({
+    endpointResult,
+    redirectAnalysis: reusableUrlAnalysis.redirectAnalysis,
+    finalDomain
+  });
+
+  if (!sameDomainTrackingCleanup || providerFlagged) {
+    return features;
+  }
+
+  return {
+    ...features,
+    crossDomainRedirectChain: false,
+    redirectChainToDifferentRegistrantLikeTarget: false,
+    suspiciousRedirectPattern: false,
+    shortenerToUnrelatedDomain: false,
+    trackingHopToUnrelatedDomain: false,
+    wrapperToExternalDestination: false
+  };
+}
+
+function applySameDomainMarketingEncodingMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
+  const providerFlagged = Boolean(features.googleSafeBrowsingFlagged || features.urlhausFlagged);
+  const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
+  const sameDomainTrackingCleanup = isSameDomainOrTrackingCleanupRedirect({
+    endpointResult,
+    redirectAnalysis: reusableUrlAnalysis.redirectAnalysis,
+    finalDomain
+  });
+
+  const eligible = Boolean(
+    sameDomainTrackingCleanup &&
+    !providerFlagged &&
+    features.httpsEndpoint &&
+    !features.shortenedUrl &&
+    !features.suspiciousTld &&
+    !features.suspiciousPath &&
+    !features.usernamePasswordTrick &&
+    !features.integrityHashMismatch
+  );
+
+  if (!eligible) {
+    return features;
+  }
+
+  return {
+    ...features,
+    obfuscatedUrl: false,
+    excessiveQueryComplexity: false
+  };
+}
+
+function getKnownShortenerOwnerDomain(shortenerDomain) {
+  const normalized = String(shortenerDomain || "")
+    .toLowerCase()
+    .replace(/^www\./, "");
+
+  const map = {
+    "amzn.to": "amazon.com",
+    "youtu.be": "youtube.com",
+    "fb.me": "facebook.com",
+    "t.co": "x.com"
+  };
+
+  return map[normalized] || "";
+}
+
+function isKnownShortenerToOwnerDestination(sourceDomain, finalDomain) {
+  const source = String(sourceDomain || "").toLowerCase().replace(/^www\./, "");
+  const finalValue = String(finalDomain || "").toLowerCase().replace(/^www\./, "");
+  const owner = getKnownShortenerOwnerDomain(source);
+
+  if (!owner) {
+    return false;
+  }
+
+  return finalValue === owner || finalValue.endsWith(`.${owner}`);
+}
+
+function getRedirectSourceDomain(chain = []) {
+  const values = Array.isArray(chain) ? chain : [];
+  for (const url of values) {
+    if (isFacebookPlatformWrapperUrl(url)) {
+      continue;
+    }
+
+    const domain = getRegistrableDomain(safeHostname(url));
+    if (domain) {
+      return domain;
+    }
+  }
+
+  return "";
+}
+
+function buildAnalysisLimitations({ endpointResult, providerResults, candidateContext = {} }) {
   const limitations = [];
   const safeProviderResults = normalizeProviderResults(providerResults);
   const gsb = safeProviderResults.find((item) => item.provider === "gsb");
-  const phishtank = safeProviderResults.find((item) => item.provider === "phishtank");
   const urlhaus = safeProviderResults.find((item) => item.provider === "urlhaus");
 
   if (!gsb.configured) {
     limitations.push("Google Safe Browsing is not configured.");
   } else if (gsb.details?.status === "error") {
     limitations.push("Google Safe Browsing lookup returned an error.");
+  } else if (gsb.configured === true && gsb.checked === true && gsb.details?.status === "checked" && gsb.flagged !== true) {
+    limitations.push("Google Safe Browsing completed its endpoint check and did not report this URL as unsafe.");
   }
 
   if (urlhaus.details?.status === "error") {
@@ -1138,14 +1355,16 @@ function buildAnalysisLimitations({ endpointResult, providerResults }) {
     limitations.push("URLhaus was checked in public mode.");
   }
 
-  if (phishtank.details?.status === "error" || phishtank.details?.status === "rate-limited" || phishtank.details?.status === "parse-error") {
-    limitations.push("PhishTank lookup returned an error or was rate-limited.");
-  } else if (phishtank.details?.appKeyConfigured === false && phishtank.checked) {
-    limitations.push("PhishTank was checked in public mode.");
-  }
-
   if (!endpointResult?.effectiveEndpoint) {
     limitations.push("DILI could not confidently resolve the final endpoint.");
+  }
+
+  if (
+    candidateContext?.candidateIsDomainOnlyFallback === true ||
+    candidateContext?.candidateUrlCompleteness === "domain-only-fallback" ||
+    /visible-domain/i.test(String(candidateContext?.candidateSource || ""))
+  ) {
+    limitations.push("Facebook did not expose a full clickable URL for this card, so DILI checked the visible domain only.");
   }
 
   for (const warning of endpointResult?.warnings || []) {
@@ -1161,22 +1380,164 @@ function buildAnalysisLimitations({ endpointResult, providerResults }) {
 function isNormalWrapperMessage(message) {
   return /facebook wrapper concealed|wrapper concealed an external destination|facebook wrapper unwrapped/i.test(String(message || ""));
 }
+function formatCompactRedirectChainDetail(chain = []) {
+  const urls = Array.isArray(chain)
+    ? chain.map((url) => String(url || "").trim()).filter(Boolean)
+    : [];
 
-function buildTechnicalDetails({ endpointResult = {}, redirectAnalysis = {}, urlFeatureAnalysis = {}, analysis = {} } = {}) {
+  if (urls.length === 0) {
+    return "";
+  }
+
+  const domains = urls
+    .map((url) => safeHostname(url).replace(/^www\./i, ""))
+    .filter(Boolean);
+
+  if (domains.length === 0) {
+    return "";
+  }
+
+  const compactDomains = [];
+  for (const domain of domains) {
+    if (compactDomains[compactDomains.length - 1] !== domain) {
+      compactDomains.push(domain);
+    }
+  }
+
+  const hopCount = Math.max(urls.length - 1, 0);
+  const hopText = hopCount === 1 ? "1 redirect hop" : `${hopCount} redirect hops`;
+
+  if (compactDomains.length === 1) {
+    return hopCount > 0
+      ? `Redirect chain: ${compactDomains[0]} only (${hopText}; same-domain redirect or tracking cleanup).`
+      : `Redirect chain: ${compactDomains[0]} only (no redirect hop observed).`;
+  }
+
+  return `Redirect chain: ${compactDomains.join(" -> ")} (${hopText}).`;
+}
+
+function isFacebookPlatformWrapperUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    return /(^|\.)facebook\.com$/i.test(url.hostname) && /\/l\.php(?:$|[/?#])/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function buildRiskRelevantRedirectChain(chain = []) {
+  return (Array.isArray(chain) ? chain : []).filter((url) => !isFacebookPlatformWrapperUrl(url));
+}
+
+function prependKnownFacebookWrapperForDisplay(chain = [], facebookWrapperUrl = "") {
+  const values = Array.isArray(chain) ? chain.filter(Boolean) : [];
+  if (!facebookWrapperUrl || values.some((url) => String(url || "") === String(facebookWrapperUrl))) {
+    return values;
+  }
+
+  return [facebookWrapperUrl, ...values];
+}
+
+function looksLikeUsefulVisibleDestinationText(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+
+  if (!text) {
+    return false;
+  }
+
+  if (isFacebookPlatformWrapperUrl(text)) {
+    return false;
+  }
+
+  if (/^facebook\.com$/i.test(text) || /^www\.facebook\.com$/i.test(text)) {
+    return false;
+  }
+
+  if (/^[a-z0-9_-]{20,}$/i.test(text) && !/[./:]/.test(text)) {
+    return false;
+  }
+
+  if (getHostnameFromUrlOrDomainText(text)) {
+    return true;
+  }
+
+  return /\b(?:https?:\/\/|www\.)?[a-z0-9][a-z0-9.-]*\.(?:com|net|org|ph|app|ai|edu|gov|io|me|page|shop|site|store|xyz)\b/i.test(text);
+}
+
+function getHostnameFromUrlOrDomainText(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+
+  try {
+    if (/^https?:\/\//i.test(text)) {
+      return new URL(text).hostname.toLowerCase();
+    }
+
+    if (/^(?:www\.)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:[/?#].*)?$/i.test(text)) {
+      return new URL(`https://${text.replace(/^\/+/, "")}`).hostname.toLowerCase();
+    }
+  } catch {
+    return "";
+  }
+
+  return "";
+}
+
+function buildTechnicalDetails({ endpointResult = {}, redirectAnalysis = {}, urlFeatureAnalysis = {}, analysis = {}, providerResults = [] } = {}) {
   const details = [];
   const effectiveDomain = endpointResult.effectiveDomain || urlFeatureAnalysis.finalDomain || "";
-  const chainDomains = [...new Set((redirectAnalysis.redirectChain || endpointResult.resolutionChain || [])
-    .map((url) => safeHostname(url))
-    .filter(Boolean))];
-
+  const candidateContext = analysis.candidateContext || {};
+const redirectChain =
+  redirectAnalysis.redirectChain ||
+  endpointResult.resolutionChain ||
+  [];
   if (endpointResult.isFacebookWrapper && effectiveDomain) {
     details.push(`Facebook wrapper unwrapped to ${effectiveDomain}.`);
   }
 
-  if (chainDomains.length > 1) {
-    details.push(`Redirect chain: ${chainDomains.join(" -> ")}.`);
+if (redirectChain.length > 0) {
+  const visiblePostValue =
+    candidateContext.unwrappedCandidateUrl ||
+    candidateContext.selectedNormalizedTarget ||
+    endpointResult.unwrappedUrl ||
+    (looksLikeUsefulVisibleDestinationText(candidateContext.visibleText) ? candidateContext.visibleText : "") ||
+    (looksLikeUsefulVisibleDestinationText(candidateContext.displayText) ? candidateContext.displayText : "") ||
+    "unknown";
+  if (visiblePostValue !== "unknown" && !isFacebookPlatformWrapperUrl(visiblePostValue)) {
+    details.push(`Visible post URL/text: ${visiblePostValue}.`);
   }
 
+  const facebookWrapperUrl = candidateContext.facebookWrapperUrl || (endpointResult.isFacebookWrapper ? endpointResult.rawUrl : "");
+  if (facebookWrapperUrl) {
+    details.push(`Facebook click wrapper URL: ${facebookWrapperUrl}.`);
+  }
+
+  if (endpointResult.unwrappedUrl) {
+    details.push(`Unwrapped URL: ${endpointResult.unwrappedUrl}.`);
+  }
+
+  if (endpointResult.effectiveEndpoint) {
+    details.push(`Full endpoint URL: ${endpointResult.effectiveEndpoint}.`);
+  }
+
+const observedRedirectChain = prependKnownFacebookWrapperForDisplay(redirectChain, facebookWrapperUrl);
+const observedRedirectChainDetail = formatCompactRedirectChainDetail(observedRedirectChain);
+if (observedRedirectChainDetail) {
+  details.push(observedRedirectChainDetail.replace(/^Redirect chain:/, "Observed redirect chain:"));
+}
+
+const riskRelevantRedirectChain = buildRiskRelevantRedirectChain(observedRedirectChain);
+const riskRelevantRedirectChainDetail = formatCompactRedirectChainDetail(riskRelevantRedirectChain);
+if (
+  riskRelevantRedirectChainDetail &&
+  riskRelevantRedirectChain.length > 0 &&
+  riskRelevantRedirectChain.length !== observedRedirectChain.length
+) {
+  details.push(riskRelevantRedirectChainDetail.replace(/^Redirect chain:/, "Risk-relevant redirect chain:"));
+}
+}
   if (urlFeatureAnalysis.sourceNormalizedUrl && urlFeatureAnalysis.sourceRawComparableUrl && urlFeatureAnalysis.sourceNormalizedUrl !== urlFeatureAnalysis.sourceRawComparableUrl) {
     details.push("Tracking parameters were stripped for comparison.");
   }
@@ -1205,7 +1566,54 @@ function buildTechnicalDetails({ endpointResult = {}, redirectAnalysis = {}, url
     details.push(`Current post text hash: ${analysis.currentPostTextHash}.`);
   }
 
-  return [...new Set(details)].slice(0, 6);
+  if (
+    candidateContext?.candidateIsDomainOnlyFallback === true ||
+    candidateContext?.candidateUrlCompleteness === "domain-only-fallback" ||
+    /visible-domain/i.test(String(candidateContext?.candidateSource || ""))
+  ) {
+    details.push("Candidate source: visible-domain-fallback.");
+    details.push("Endpoint source note: Facebook did not expose a full clickable URL for this card, so DILI checked the visible domain only.");
+    details.push("Provider scan scope: limited to visible-domain fallback because no full endpoint was exposed during passive scan.");
+    details.push("Full endpoint extraction status: No full path/query URL was exposed during passive scan.");
+    details.push("Click-time note: If the user clicks this card, DILI will re-check the actual clicked destination before navigation.");
+  }
+
+  for (const note of redirectAnalysis?.notes || []) {
+    const text = String(note || "").trim();
+    if (text) {
+      details.push(text);
+    }
+  }
+
+const providerLabels = {
+  gsb: "Google Safe Browsing",
+  urlhaus: "URLhaus"
+};
+
+for (const provider of normalizeProviderResults(providerResults)) {
+  if (!provider?.checkedUrl) {
+    continue;
+  }
+
+  const label = providerLabels[provider.provider] || provider.provider || "Provider";
+  const auditStatus = getProviderAuditStatus(provider);
+  const outcomeSummary = provider.resultSummary || getProviderOutcomeSummary(provider);
+  const durationMs = Number(provider.durationMs);
+
+  details.push(`${label} checked URL: ${provider.checkedUrl}.`);
+  details.push(`${label} result: ${outcomeSummary}`);
+  details.push(`${label} status: ${auditStatus}.`);
+
+  if (provider.checkedAt) {
+    details.push(`${label} checked at: ${provider.checkedAt}.`);
+  }
+
+  if (Number.isFinite(durationMs)) {
+    details.push(`${label} response time: ${durationMs} ms`);
+  }
+}
+  return [...new Set(details)];
+
 }
 
 function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
@@ -1214,10 +1622,9 @@ function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
   const classification = String(analysis.classification || "").toLowerCase();
   const providerResults = normalizeProviderResults(analysis.providerResults || []);
   const gsb = providerResults.find((item) => item.provider === "gsb");
-  const phishtank = providerResults.find((item) => item.provider === "phishtank");
   const urlhaus = providerResults.find((item) => item.provider === "urlhaus");
 
-  if (gsb?.flagged || phishtank?.flagged || urlhaus?.flagged) {
+  if (gsb?.flagged || urlhaus?.flagged) {
     return true;
   }
   if (classification.includes("high risk") || classification.includes("suspicious")) {
@@ -1413,298 +1820,28 @@ function stripUrlAnalysisCacheMetadata(entry) {
   const { cachedAt, expiresAt, ...payload } = entry;
   return payload;
 }
-
 async function runThreatIntelligenceChecks(normalizedUrl) {
-  const [gsb, phishtank] = await Promise.all([
+  const providerTasks = [
     lookupGoogleSafeBrowsing(normalizedUrl),
-    lookupPhishTank(normalizedUrl)
-  ]);
+    lookupUrlhaus(normalizedUrl)
+  ];
 
-  const shouldRunUrlhaus = Boolean(
-    gsb.flagged ||
-    phishtank.flagged ||
-    gsb.details?.status === "error" ||
-    phishtank.details?.status === "error" ||
-    phishtank.details?.status === "rate-limited" ||
-    phishtank.details?.status === "parse-error"
-  );
+  const settled = await Promise.allSettled(providerTasks);
 
-  const urlhaus = shouldRunUrlhaus
-    ? await lookupUrlhaus(normalizedUrl)
-    : createSkippedUrlhausProviderResult();
+  return [
+    settled[0].status === "fulfilled"
+      ? settled[0].value
+      : createProviderErrorResult("gsb", normalizedUrl, settled[0].reason),
 
-  return [gsb, phishtank, urlhaus];
+    settled[1].status === "fulfilled"
+      ? settled[1].value
+      : createProviderErrorResult("urlhaus", normalizedUrl, settled[1].reason)
+  ];
 }
-
-async function lookupPhishTank(normalizedUrl) {
-  const config = await getRuntimeConfig();
-  const checkedAt = Date.now();
-  const enabled = config.PHISHTANK_ENABLED !== false;
-  const appKey = String(config.PHISHTANK_APP_KEY || "").trim();
-
-  if (!enabled) {
-    updatePhishTankHealth({
-      enabled: false,
-      appKeyConfigured: Boolean(appKey),
-      configured: false,
-      available: false,
-      lastStatus: "disabled",
-      lastHttpStatus: null,
-      lastError: null,
-      lastCheckedAt: checkedAt
-    });
-
-    return {
-      provider: "phishtank",
-      configured: false,
-      checked: false,
-      flagged: false,
-      category: null,
-      details: {
-        status: "disabled",
-        message: "PhishTank lookup is disabled."
-      }
-    };
-  }
-
-  const body = new URLSearchParams({
-    url: normalizedUrl,
-    format: "json"
-  });
-
-  if (appKey) {
-    body.set("app_key", appKey);
-  }
-
-  let response = null;
-  const requestHeaders = {
-    "Content-Type": "application/x-www-form-urlencoded",
-    Accept: "application/json",
-    "User-Agent": "phishtank/dili-extension",
-    "X-DILI-Client": "dili-extension"
-  };
-
-  try {
-    response = await fetch("https://checkurl.phishtank.com/checkurl/", {
-      method: "POST",
-      headers: requestHeaders,
-      body: body.toString()
-    });
-  } catch (fetchError) {
-    const fallbackMessage = String(fetchError?.message || fetchError || "").toLowerCase();
-
-    if (fallbackMessage.includes("user-agent") || fallbackMessage.includes("unsafe header")) {
-      try {
-        const fallbackHeaders = { ...requestHeaders };
-        delete fallbackHeaders["User-Agent"];
-
-        response = await fetch("https://checkurl.phishtank.com/checkurl/", {
-          method: "POST",
-          headers: fallbackHeaders,
-          body: body.toString()
-        });
-      } catch (fallbackError) {
-        const errorMessage = safeErrorMessage(fallbackError, "Unknown PhishTank lookup error.");
-
-        updatePhishTankHealth({
-          enabled: true,
-          appKeyConfigured: Boolean(appKey),
-          configured: true,
-          available: false,
-          lastStatus: "error",
-          lastHttpStatus: null,
-          lastError: errorMessage,
-          lastCheckedAt: checkedAt
-        });
-
-        return {
-          provider: "phishtank",
-          configured: true,
-          checked: true,
-          flagged: false,
-          category: null,
-          details: {
-            status: "error",
-            httpStatus: null,
-            message: errorMessage,
-            appKeyConfigured: Boolean(appKey)
-          }
-        };
-      }
-    } else {
-      const errorMessage = safeErrorMessage(fetchError, "Unknown PhishTank lookup error.");
-
-      updatePhishTankHealth({
-        enabled: true,
-        appKeyConfigured: Boolean(appKey),
-        configured: true,
-        available: false,
-        lastStatus: "error",
-        lastHttpStatus: null,
-        lastError: errorMessage,
-        lastCheckedAt: checkedAt
-      });
-
-      return {
-        provider: "phishtank",
-        configured: true,
-        checked: true,
-        flagged: false,
-        category: null,
-        details: {
-          status: "error",
-          httpStatus: null,
-          message: errorMessage,
-          appKeyConfigured: Boolean(appKey)
-        }
-      };
-    }
-  }
-
-  try {
-    if (!response.ok) {
-      const errorMessage =
-        response.status === 509
-          ? "PhishTank lookup was rate-limited."
-          : `PhishTank lookup returned HTTP ${response.status}.`;
-
-      updatePhishTankHealth({
-        enabled: true,
-        appKeyConfigured: Boolean(appKey),
-        configured: true,
-        available: false,
-        lastStatus: response.status === 509 ? "rate-limited" : "error",
-        lastHttpStatus: response.status,
-        lastError: errorMessage,
-        lastCheckedAt: checkedAt
-      });
-
-      return {
-        provider: "phishtank",
-        configured: true,
-        checked: true,
-        flagged: false,
-        category: null,
-        details: {
-          status: response.status === 509 ? "rate-limited" : "error",
-          httpStatus: response.status,
-          message: errorMessage,
-          appKeyConfigured: Boolean(appKey)
-        }
-      };
-    }
-
-    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-    const text = await response.text();
-
-    let payload = null;
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = null;
-    }
-
-    if (!payload || typeof payload !== "object") {
-      const errorMessage = "PhishTank returned a non-JSON response.";
-
-      updatePhishTankHealth({
-        enabled: true,
-        appKeyConfigured: Boolean(appKey),
-        configured: true,
-        available: false,
-        lastStatus: "parse-error",
-        lastHttpStatus: response.status,
-        lastError: errorMessage,
-        lastCheckedAt: checkedAt
-      });
-
-      return {
-        provider: "phishtank",
-        configured: true,
-        checked: true,
-        flagged: false,
-        category: null,
-        details: {
-          status: "parse-error",
-          httpStatus: response.status,
-          contentType,
-          message: errorMessage,
-          rawPreview: text.slice(0, 240),
-          appKeyConfigured: Boolean(appKey)
-        }
-      };
-    }
-
-    const results = payload.results || {};
-    const inDatabase = results.in_database === true || String(results.in_database).toLowerCase() === "true";
-    const valid = results.valid === true || String(results.valid).toLowerCase() === "true";
-    const verified = results.verified === true || String(results.verified).toLowerCase() === "true";
-
-    const flagged = Boolean(inDatabase && valid && verified);
-    const category = flagged ? "verified-phishing" : inDatabase ? "phishtank-unverified" : null;
-
-    updatePhishTankHealth({
-      enabled: true,
-      appKeyConfigured: Boolean(appKey),
-      configured: true,
-      available: true,
-      lastStatus: "ok",
-      lastHttpStatus: response.status,
-      lastError: null,
-      lastCheckedAt: checkedAt
-    });
-
-    return {
-      provider: "phishtank",
-      configured: true,
-      checked: true,
-      flagged,
-      category,
-      details: {
-        status: "checked",
-        inDatabase,
-        valid,
-        verified,
-        phishId: results.phish_id || null,
-        phishDetailPage: results.phish_detail_page || null,
-        verifiedAt: results.verified_at || null,
-        appKeyConfigured: Boolean(appKey),
-        payload
-      }
-    };
-  } catch (error) {
-    const errorMessage = safeErrorMessage(error, "Unknown PhishTank lookup error.");
-
-    updatePhishTankHealth({
-      enabled: true,
-      appKeyConfigured: Boolean(appKey),
-      configured: true,
-      available: false,
-      lastStatus: "error",
-      lastHttpStatus: response?.status ?? null,
-      lastError: errorMessage,
-      lastCheckedAt: checkedAt
-    });
-
-    return {
-      provider: "phishtank",
-      configured: true,
-      checked: true,
-      flagged: false,
-      category: null,
-      details: {
-        status: "error",
-        httpStatus: response?.status ?? null,
-        message: errorMessage,
-        appKeyConfigured: Boolean(appKey)
-      }
-    };
-  }
-}
-
 async function lookupGoogleSafeBrowsing(normalizedUrl) {
+  const startedAt = performance.now();
   const config = await getRuntimeConfig();
-  const checkedAt = Date.now();
+  const healthCheckedAt = Date.now();
   const key = String(config.GSB_API_KEY || "").trim();
 
   if (!key) {
@@ -1718,20 +1855,22 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
       lastStatus: "not-configured",
       lastHttpStatus: null,
       lastError: missingKeyMessage,
-      lastCheckedAt: checkedAt
+      lastCheckedAt: healthCheckedAt
     });
 
-    return {
+    return withProviderOutcomeSummary({
       provider: "gsb",
       configured: false,
       checked: false,
+      checkedUrl: normalizedUrl,
+      ...createProviderTelemetry(startedAt),
       flagged: false,
       category: null,
       details: {
         status: "not-configured",
         message: missingKeyMessage
       }
-    };
+    });
   }
 
   let response = null;
@@ -1766,13 +1905,15 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
         lastStatus: "error",
         lastHttpStatus: response.status,
         lastError: errorMessage,
-        lastCheckedAt: checkedAt
+        lastCheckedAt: healthCheckedAt
       });
 
-      return {
+      return withProviderOutcomeSummary({
         provider: "gsb",
         configured: true,
         checked: true,
+        checkedUrl: normalizedUrl,
+        ...createProviderTelemetry(startedAt),
         flagged: false,
         category: null,
         details: {
@@ -1780,11 +1921,12 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
           httpStatus: response.status,
           message: errorMessage
         }
-      };
+      });
     }
 
     const payload = await response.json();
     const matches = Array.isArray(payload.matches) ? payload.matches : [];
+    const flagged = matches.length > 0;
     const category = matches[0]?.threatType || null;
 
     updateGsbHealth({
@@ -1793,21 +1935,24 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
       lastStatus: "ok",
       lastHttpStatus: response.status,
       lastError: null,
-      lastCheckedAt: checkedAt
+      lastCheckedAt: healthCheckedAt
     });
 
-    return {
+    return withProviderOutcomeSummary({
       provider: "gsb",
       configured: true,
       checked: true,
-      flagged: matches.length > 0,
+      checkedUrl: normalizedUrl,
+      ...createProviderTelemetry(startedAt),
+      flagged,
       category,
       details: {
         status: "checked",
+        httpStatus: response.status,
         matchesCount: matches.length,
-        matches
+        queryStatus: flagged ? "matches" : "no-matches"
       }
-    };
+    });
   } catch (error) {
     updateGsbHealth({
       configured: true,
@@ -1815,13 +1960,15 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
       lastStatus: "error",
       lastHttpStatus: response?.status ?? null,
       lastError: safeErrorMessage(error, "Unknown Safe Browsing error."),
-      lastCheckedAt: checkedAt
+      lastCheckedAt: healthCheckedAt
     });
 
-    return {
+    return withProviderOutcomeSummary({
       provider: "gsb",
       configured: true,
       checked: true,
+      checkedUrl: normalizedUrl,
+      ...createProviderTelemetry(startedAt),
       flagged: false,
       category: null,
       details: {
@@ -1829,120 +1976,246 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
         httpStatus: response?.status ?? null,
         message: safeErrorMessage(error, "Unknown Safe Browsing error.")
       }
-    };
+    });
   }
 }
 
 async function lookupUrlhaus(normalizedUrl) {
+  const startedAt = performance.now();
   const config = await getRuntimeConfig();
-  const checkedAt = Date.now();
+  const healthCheckedAt = Date.now();
   const authKey = String(config.URLHAUS_AUTH_KEY || config.URLHAUS_API_KEY || "").trim();
-  const mode = authKey ? "authenticated" : "public";
+  let publicFallbackUsed = false;
+  let firstFailure = null;
+  let result = null;
+
+  if (authKey) {
+    result = await requestUrlhausLookup(normalizedUrl, { authKey });
+    if (!result.ok && shouldFallbackToUrlhausPublic(result)) {
+      publicFallbackUsed = true;
+      firstFailure = result;
+      result = await requestUrlhausLookupWithPublicRetry(normalizedUrl);
+    }
+  } else {
+    result = await requestUrlhausLookupWithPublicRetry(normalizedUrl);
+  }
+
+  const authConfigured = Boolean(authKey);
+  const checkedResult = result || firstFailure || {
+    ok: false,
+    mode: authConfigured ? "authenticated" : "public",
+    httpStatus: null,
+    errorMessage: "URLhaus lookup did not return a result."
+  };
+
+  const queryStatus = String(checkedResult.payload?.query_status || "").toLowerCase();
+  const flagged = checkedResult.ok && queryStatus === "ok";
+  const category = flagged
+    ? String(checkedResult.payload?.threat || checkedResult.payload?.tags?.[0] || "malware-oriented")
+    : null;
+  const status = checkedResult.ok ? "checked" : "error";
+  const healthStatus = getUrlhausHealthStatus({
+    result: checkedResult,
+    authConfigured,
+    publicFallbackUsed,
+    firstFailure
+  });
+  const message = getUrlhausResultMessage({
+    result: checkedResult,
+    firstFailure,
+    publicFallbackUsed
+  });
+
+  updateUrlhausHealth({
+    configured: authConfigured,
+    mode: checkedResult.mode || (authConfigured ? "authenticated" : "public"),
+    authKeyConfigured: authConfigured,
+    available: checkedResult.ok,
+    lastStatus: healthStatus,
+    lastHttpStatus: checkedResult.httpStatus ?? null,
+    lastError: checkedResult.ok ? null : checkedResult.errorMessage || "URLhaus lookup unavailable.",
+    lastCheckedAt: healthCheckedAt
+  });
+
+  return withProviderOutcomeSummary({
+    provider: "urlhaus",
+    configured: authConfigured,
+    checked: true,
+    checkedUrl: normalizedUrl,
+    ...createProviderTelemetry(startedAt),
+    flagged,
+    category,
+    details: {
+      status,
+      httpStatus: checkedResult.httpStatus ?? null,
+      mode: checkedResult.mode || (authConfigured ? "authenticated" : "public"),
+      authConfigured,
+      authKeyConfigured: authConfigured,
+      publicModeAvailable: true,
+      publicFallbackUsed,
+      queryStatus: checkedResult.payload?.query_status || "",
+      message
+    }
+  });
+}
+
+async function requestUrlhausLookupWithPublicRetry(normalizedUrl) {
+  let result = await requestUrlhausLookup(normalizedUrl, { authKey: "" });
+  if (!result.ok && shouldRetryUrlhausPublic(result)) {
+    await sleep(300);
+    result = await requestUrlhausLookup(normalizedUrl, { authKey: "" });
+  }
+
+  return result;
+}
+
+async function requestUrlhausLookup(normalizedUrl, { authKey = "", timeoutMs = 4500 } = {}) {
   const headers = {
     "Content-Type": "application/x-www-form-urlencoded"
   };
+
   if (authKey) {
     headers["Auth-Key"] = authKey;
   }
 
-  let response = null;
-
   try {
-    const body = new URLSearchParams({
-      url: normalizedUrl
-    });
-
-    response = await fetch("https://urlhaus-api.abuse.ch/v1/url/", {
+    const response = await fetchWithTimeout("https://urlhaus-api.abuse.ch/v1/url/", {
       method: "POST",
       headers,
-      body: body.toString()
-    });
+      body: new URLSearchParams({ url: normalizedUrl }).toString()
+    }, timeoutMs);
 
+    const httpStatus = response.status;
     if (!response.ok) {
-      const errorMessage = `URLhaus lookup returned HTTP ${response.status}.`;
-
-      updateUrlhausHealth({
-        mode,
-        available: false,
-        lastStatus: "error",
-        lastHttpStatus: response.status,
-        lastError: errorMessage,
-        lastCheckedAt: checkedAt
-      });
-
       return {
-        provider: "urlhaus",
-        configured: true,
-        checked: true,
-        flagged: false,
-        category: null,
-        details: {
-          status: "error",
-          httpStatus: response.status,
-          message: errorMessage,
-          mode,
-          authConfigured: Boolean(authKey),
-          authKeyConfigured: Boolean(authKey)
-        }
+        ok: false,
+        response,
+        payload: null,
+        mode: authKey ? "authenticated" : "public",
+        httpStatus,
+        errorMessage: `URLhaus lookup returned HTTP ${httpStatus}.`
       };
     }
 
-    const payload = await response.json();
-    const status = String(payload.query_status || "").toLowerCase();
-    const flagged = status === "ok" || status === "online";
-    const category = payload.threat || payload.tags?.[0] || "malware-oriented";
-
-    updateUrlhausHealth({
-      mode,
-      available: true,
-      lastStatus: "ok",
-      lastHttpStatus: response.status,
-      lastError: null,
-      lastCheckedAt: checkedAt
-    });
-
-    return {
-      provider: "urlhaus",
-      configured: true,
-      checked: true,
-      flagged,
-      category: flagged ? String(category) : null,
-      details: {
-        status: "checked",
-        queryStatus: payload.query_status || null,
-        source: payload.urlhaus_reference || payload.reporter || null,
-        mode,
-        authConfigured: Boolean(authKey),
-        authKeyConfigured: Boolean(authKey),
-        payload
-      }
-    };
+    try {
+      const payload = await response.json();
+      return {
+        ok: true,
+        response,
+        payload,
+        mode: authKey ? "authenticated" : "public",
+        httpStatus,
+        errorMessage: ""
+      };
+    } catch {
+      return {
+        ok: false,
+        response,
+        payload: null,
+        mode: authKey ? "authenticated" : "public",
+        httpStatus,
+        errorMessage: "URLhaus returned an unreadable response."
+      };
+    }
   } catch (error) {
-    updateUrlhausHealth({
-      mode,
-      available: false,
-      lastStatus: "error",
-      lastHttpStatus: response?.status ?? null,
-      lastError: safeErrorMessage(error, "Unknown URLhaus lookup error."),
-      lastCheckedAt: checkedAt
-    });
-
     return {
-      provider: "urlhaus",
-      configured: true,
-      checked: true,
-      flagged: false,
-      category: null,
-      details: {
-        status: "error",
-        httpStatus: response?.status ?? null,
-        message: safeErrorMessage(error, "Unknown URLhaus lookup error."),
-        mode,
-        authConfigured: Boolean(authKey),
-        authKeyConfigured: Boolean(authKey)
-      }
+      ok: false,
+      response: null,
+      payload: null,
+      mode: authKey ? "authenticated" : "public",
+      httpStatus: null,
+      errorMessage: safeErrorMessage(error, "Unknown URLhaus lookup error.")
     };
   }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldFallbackToUrlhausPublic(result = {}) {
+  if (result.ok) {
+    return false;
+  }
+
+  const status = Number(result.httpStatus);
+  return (
+    status === 401 ||
+    status === 403 ||
+    status === 429 ||
+    status >= 500 ||
+    /unreadable|parse/i.test(String(result.errorMessage || "")) ||
+    isUrlhausTimeoutError(result.errorMessage) ||
+    !status
+  );
+}
+
+function shouldRetryUrlhausPublic(result = {}) {
+  if (result.ok) {
+    return false;
+  }
+
+  const status = Number(result.httpStatus);
+  return (
+    status === 429 ||
+    status >= 500 ||
+    isUrlhausTimeoutError(result.errorMessage) ||
+    !status
+  );
+}
+
+function isUrlhausTimeoutError(message = "") {
+  return /abort|timeout|timed out|network/i.test(String(message || ""));
+}
+
+function getUrlhausHealthStatus({ result = {}, authConfigured = false, publicFallbackUsed = false, firstFailure = null } = {}) {
+  if (result.ok) {
+    if (publicFallbackUsed && firstFailure) {
+      return "auth-failed-public-ok";
+    }
+
+    return result.mode === "public" ? "public-ok" : "ok";
+  }
+
+  if (Number(result.httpStatus) === 429) {
+    return "rate-limited";
+  }
+
+  if (isUrlhausTimeoutError(result.errorMessage)) {
+    return "timeout";
+  }
+
+  return "error";
+}
+
+function getUrlhausResultMessage({ result = {}, firstFailure = null, publicFallbackUsed = false } = {}) {
+  if (result.ok && publicFallbackUsed && firstFailure) {
+    return "Authenticated lookup failed; public lookup succeeded.";
+  }
+
+  if (result.ok) {
+    return result.payload?.urlhaus_reference || result.payload?.reporter || "";
+  }
+
+  if (publicFallbackUsed && firstFailure) {
+    return `Authenticated lookup failed; public lookup also failed. ${result.errorMessage || ""}`.trim();
+  }
+
+  return result.errorMessage || "URLhaus lookup unavailable.";
 }
 
 async function buildPopupSummary(tabUrl) {
@@ -2166,16 +2439,13 @@ async function getRuntimeConfig() {
   try {
     const stored = await chromeStorageGet([
       "dili:config:gsbApiKey",
-      "dili:config:phishtankAppKey",
       "dili:config:urlhausAuthKey",
       "dili:config:urlhausApiKey"
     ]);
 
     runtimeConfig.GSB_API_KEY = String(stored["dili:config:gsbApiKey"] || GSB_API_KEY || "").trim();
-    runtimeConfig.PHISHTANK_APP_KEY = String(stored["dili:config:phishtankAppKey"] || PHISHTANK_APP_KEY || "").trim();
     runtimeConfig.URLHAUS_AUTH_KEY = String(stored["dili:config:urlhausAuthKey"] || URLHAUS_AUTH_KEY || URLHAUS_API_KEY || "").trim();
     runtimeConfig.URLHAUS_API_KEY = String(stored["dili:config:urlhausApiKey"] || URLHAUS_API_KEY || "").trim();
-    runtimeConfig.PHISHTANK_ENABLED = PHISHTANK_ENABLED !== false;
     runtimeConfig.configLoaded = true;
     runtimeConfig.configSource = hasStoredProviderConfig(stored) ? "chrome.storage.local" : CONFIG_FILE_NAME;
     runtimeConfig.configError = null;
@@ -2192,8 +2462,6 @@ function createRuntimeConfig() {
     GSB_API_KEY: String(GSB_API_KEY || "").trim(),
     URLHAUS_AUTH_KEY: String(URLHAUS_AUTH_KEY || URLHAUS_API_KEY || "").trim(),
     URLHAUS_API_KEY: String(URLHAUS_API_KEY || "").trim(),
-    PHISHTANK_APP_KEY: String(PHISHTANK_APP_KEY || "").trim(),
-    PHISHTANK_ENABLED: PHISHTANK_ENABLED !== false,
     configLoaded: true,
     configSource: CONFIG_FILE_NAME,
     configError: null
@@ -2216,7 +2484,6 @@ function chromeStorageGet(keys) {
 function hasStoredProviderConfig(stored = {}) {
   return Boolean(
     stored["dili:config:gsbApiKey"] ||
-    stored["dili:config:phishtankAppKey"] ||
     stored["dili:config:urlhausAuthKey"] ||
     stored["dili:config:urlhausApiKey"]
   );
@@ -2236,6 +2503,7 @@ function createInitialProviderHealth() {
       lastCheckedAt: null
     },
     urlhaus: {
+      configured: false,
       mode: "public",
       authKeyConfigured: false,
       available: true,
@@ -2244,16 +2512,7 @@ function createInitialProviderHealth() {
       lastError: null,
       lastCheckedAt: null
     },
-    phishtank: {
-      enabled: true,
-      appKeyConfigured: false,
-      configured: false,
-      available: false,
-      lastStatus: "not-yet-run",
-      lastHttpStatus: null,
-      lastError: null,
-      lastCheckedAt: null
-    }
+    
   };
 }
 
@@ -2286,21 +2545,18 @@ function applyConfigDiagnostics(config) {
   }
 
   providerHealth.urlhaus.mode = urlhausAuthKeyLoaded ? "authenticated" : "public";
+  providerHealth.urlhaus.configured = urlhausAuthKeyLoaded;
   providerHealth.urlhaus.authKeyConfigured = urlhausAuthKeyLoaded;
-  providerHealth.urlhaus.available = providerHealth.urlhaus.lastStatus !== "error";
+  providerHealth.urlhaus.available = !["error", "timeout", "rate-limited"].includes(providerHealth.urlhaus.lastStatus);
 
   if (providerHealth.urlhaus.lastStatus === "not-yet-run") {
+    providerHealth.urlhaus.lastStatus = urlhausAuthKeyLoaded ? "not-yet-run" : "not-configured-public-mode";
+    providerHealth.urlhaus.lastError = null;
+  } else if (urlhausAuthKeyLoaded && providerHealth.urlhaus.lastStatus === "not-configured-public-mode") {
+    providerHealth.urlhaus.lastStatus = "not-yet-run";
     providerHealth.urlhaus.lastError = null;
   }
 
-  providerHealth.phishtank.enabled = config.PHISHTANK_ENABLED !== false;
-  providerHealth.phishtank.appKeyConfigured = Boolean(String(config.PHISHTANK_APP_KEY || "").trim());
-  providerHealth.phishtank.configured = providerHealth.phishtank.enabled;
-  providerHealth.phishtank.available = providerHealth.phishtank.lastStatus !== "error" && providerHealth.phishtank.lastStatus !== "rate-limited" && providerHealth.phishtank.lastStatus !== "parse-error" && providerHealth.phishtank.lastStatus !== "disabled";
-
-  if (providerHealth.phishtank.lastStatus === "not-yet-run") {
-    providerHealth.phishtank.lastError = null;
-  }
 }
 
 function updateGsbHealth(patch) {
@@ -2309,10 +2565,6 @@ function updateGsbHealth(patch) {
 
 function updateUrlhausHealth(patch) {
   Object.assign(providerHealth.urlhaus, patch);
-}
-
-function updatePhishTankHealth(patch) {
-  Object.assign(providerHealth.phishtank, patch);
 }
 
 function getProviderHealthSnapshot() {
@@ -2329,6 +2581,7 @@ function getProviderHealthSnapshot() {
       lastCheckedAt: providerHealth.gsb.lastCheckedAt
     },
     urlhaus: {
+      configured: providerHealth.urlhaus.configured,
       mode: providerHealth.urlhaus.mode,
       authKeyConfigured: providerHealth.urlhaus.authKeyConfigured,
       available: providerHealth.urlhaus.available,
@@ -2337,16 +2590,6 @@ function getProviderHealthSnapshot() {
       lastError: providerHealth.urlhaus.lastError,
       lastCheckedAt: providerHealth.urlhaus.lastCheckedAt
     },
-    phishtank: {
-      enabled: providerHealth.phishtank.enabled,
-      appKeyConfigured: providerHealth.phishtank.appKeyConfigured,
-      configured: providerHealth.phishtank.configured,
-      available: providerHealth.phishtank.available,
-      lastStatus: providerHealth.phishtank.lastStatus,
-      lastHttpStatus: providerHealth.phishtank.lastHttpStatus,
-      lastError: providerHealth.phishtank.lastError,
-      lastCheckedAt: providerHealth.phishtank.lastCheckedAt
-    }
   };
 }
 
@@ -2367,13 +2610,8 @@ function buildCompactProviderSummary() {
     urlhaus: {
       label: "URLhaus",
       state: getUrlhausProviderState(snapshot.urlhaus || {}),
-      text: formatCompactProviderText(getUrlhausProviderState(snapshot.urlhaus || {}))
+      text: formatUrlhausProviderText(snapshot.urlhaus || {})
     },
-    phishtank: {
-      label: "PhishTank",
-      state: getPhishTankProviderState(snapshot.phishtank || {}),
-      text: formatCompactProviderText(getPhishTankProviderState(snapshot.phishtank || {}))
-    }
   };
 }
 
@@ -2390,31 +2628,18 @@ function getGsbProviderState(gsb = {}) {
 }
 
 function getUrlhausProviderState(urlhaus = {}) {
-  if (urlhaus.lastStatus === "error" || urlhaus.available === false) {
+  if (["error", "timeout", "rate-limited"].includes(urlhaus.lastStatus) || urlhaus.available === false) {
     return "error";
   }
 
-  if (urlhaus.mode === "public") {
+  if (
+    urlhaus.mode === "public" ||
+    ["public-ok", "auth-failed-public-ok", "not-configured-public-mode"].includes(urlhaus.lastStatus)
+  ) {
     return "public";
   }
 
   return "ready";
-}
-
-function getPhishTankProviderState(phishtank = {}) {
-  if (!phishtank.enabled) {
-    return "off";
-  }
-
-  if (phishtank.lastStatus === "error" || phishtank.lastStatus === "rate-limited" || phishtank.lastStatus === "parse-error") {
-    return "error";
-  }
-
-  if (!phishtank.appKeyConfigured) {
-    return "public";
-  }
-
-  return phishtank.available ? "ready" : "ready";
 }
 
 function formatCompactProviderText(state) {
@@ -2430,32 +2655,143 @@ function formatCompactProviderText(state) {
   }
 }
 
-function createSkippedUrlhausProviderResult() {
+function formatUrlhausProviderText(urlhaus = {}) {
+  switch (urlhaus.lastStatus) {
+    case "auth-failed-public-ok":
+      return "Public fallback";
+    case "public-ok":
+    case "not-configured-public-mode":
+      return "Public";
+    case "timeout":
+      return "Timeout";
+    case "rate-limited":
+      return "Rate limited";
+    case "ok":
+      return "Ready";
+    default:
+      return formatCompactProviderText(getUrlhausProviderState(urlhaus));
+  }
+}
+
+function getProviderDurationMs(startedAt) {
+  const elapsed = performance.now() - Number(startedAt);
+  return Number.isFinite(elapsed) ? Math.max(0, Math.round(elapsed)) : null;
+}
+
+function createProviderTelemetry(startedAt) {
   return {
+    checkedAt: new Date().toISOString(),
+    durationMs: getProviderDurationMs(startedAt)
+  };
+}
+
+function withProviderOutcomeSummary(result) {
+  return {
+    ...result,
+    resultSummary: getProviderOutcomeSummary(result)
+  };
+}
+
+function getProviderOutcomeSummary(result = {}) {
+  const provider = String(result.provider || "").toLowerCase();
+  const status = String(result.details?.status || "").toLowerCase();
+
+  if (provider === "urlhaus" && status === "error") {
+    return "Lookup unavailable after retry.";
+  }
+
+  if (provider !== "urlhaus" && (!result.configured || status === "not-configured")) {
+    return "Provider not configured.";
+  }
+
+  if (status === "error" || status === "rate-limited" || status === "parse-error") {
+    return "Request failed.";
+  }
+
+  if (!result.checked || status === "skipped" || status === "not-configured") {
+    return "Provider not configured.";
+  }
+
+  if (provider === "gsb") {
+    return result.flagged ? "Unsafe URL reported." : "No unsafe matches reported.";
+  }
+
+  if (provider === "urlhaus") {
+    return result.flagged ? "Known malware record found." : "No known malware record found.";
+  }
+
+  return result.flagged ? "Provider reported a match." : "No provider match reported.";
+}
+
+function getProviderAuditStatus(result = {}) {
+  const provider = String(result.provider || "").toLowerCase();
+  const status = String(result.details?.status || "").toLowerCase();
+
+  if (
+    (provider !== "urlhaus" && !result.configured) ||
+    status === "not-configured" ||
+    status === "skipped" ||
+    !result.checked
+  ) {
+    return "skipped";
+  }
+
+  if (status === "error" || status === "rate-limited" || status === "parse-error") {
+    return "failed";
+  }
+
+  return "completed";
+}
+
+function createSkippedUrlhausProviderResult(checkedUrl = "") {
+  return withProviderOutcomeSummary({
     provider: "urlhaus",
     configured: true,
     checked: false,
+    checkedUrl,
+    checkedAt: new Date().toISOString(),
+    durationMs: 0,
     flagged: false,
     category: null,
     details: {
       status: "skipped",
-      message: "URLhaus skipped because GSB and PhishTank completed without provider flags."
+      message: "URLhaus skipped because GSB completed without provider flags."
     }
-  };
+  });
 }
 
-function createDefaultProviderResult(provider) {
-  return {
+function createDefaultProviderResult(provider, checkedUrl = "") {
+  return withProviderOutcomeSummary({
     provider,
     configured: false,
     checked: false,
+    checkedUrl,
+    checkedAt: "",
+    durationMs: null,
     flagged: false,
     category: null,
     details: {
       status: "not-configured",
-      message: provider === "phishtank" ? "PhishTank fallback result." : "Provider fallback result."
+      message: "Provider fallback result."
     }
-  };
+  });
+}
+
+function createProviderErrorResult(provider, checkedUrl, error) {
+  return withProviderOutcomeSummary({
+    provider,
+    configured: true,
+    checked: true,
+    checkedUrl,
+    checkedAt: new Date().toISOString(),
+    durationMs: null,
+    flagged: false,
+    category: null,
+    details: {
+      status: "error",
+      message: safeErrorMessage(error, `${provider} lookup failed.`)
+    }
+  });
 }
 
 function isSupportedFacebookUrl(url) {

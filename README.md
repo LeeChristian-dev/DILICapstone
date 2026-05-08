@@ -18,6 +18,33 @@ DILI is a Manifest V3 Chrome extension for Facebook link monitoring. It fingerpr
 - Multi-link Facebook post analysis with one DILI panel per owning post
 - Endpoint resolution for Facebook wrappers, shorteners, and final redirect destinations
 
+### Endpoint stages
+
+DILI displays endpoint stages as:
+
+- Visible post URL/text — the visible URL or link text shown in the Facebook post.
+- Facebook click wrapper URL — the full `l.facebook.com` wrapper when Facebook exposes one.
+- Unwrapped URL — the URL obtained after removing known wrappers when possible.
+- Full endpoint URL — the final destination DILI uses for provider checks and Safety Score analysis.
+
+This clarifies that shortened links are resolved to their final endpoint before provider checks whenever resolution succeeds.
+
+DILI prefers full clickable or embedded URLs over visible-domain fallbacks. A visible-domain fallback is used only when Facebook does not expose a usable full destination in the same post/card.
+
+Facebook wrappers are shown in Technical Details for auditability, but normal user-facing summaries prefer the visible post URL/text or unwrapped target.
+
+When Facebook only exposes a visible domain for a sponsored card and does not expose the full href/data-url/data-lynx-uri to the extension, DILI labels the scan as a visible-domain fallback. When a full clickable URL is available, DILI prefers that full URL over the visible-domain fallback.
+
+### Full endpoint extraction limitation
+
+DILI attempts three levels of endpoint discovery:
+
+1. Passive full URL extraction from `href`, `data-url`, `data-lynx-uri`, and hidden encoded attributes.
+2. Redirect resolution in the background service worker.
+3. Click-time reanalysis when Facebook only exposed a root-domain fallback during passive scanning.
+
+Passive visible-domain fallback is a limited check. It can still receive a normal Safety Score classification based on the exposed domain and configured checks, but Technical Details must clearly state that only the visible domain was checked. DILI re-checks the actual clicked destination when click-time data exposes a fuller URL.
+
 ## File Structure
 
 ```text
@@ -42,14 +69,15 @@ icons/
 storage/
 ```
 
-## Setup Configuration (GSB + PhishTank + URLhaus)
+## Setup Configuration (GSB + URLhaus)
+
+**Active Providers:** Google Safe Browsing (GSB) and URLhaus.
 
 1. Open `config.example.js` for the key template.
 2. Copy `config.example.js` to `config.local.js` and add your own values.
 3. For local development, save provider keys through `chrome.storage.local` using these keys:
 
 - `dili:config:gsbApiKey`
-- `dili:config:phishtankAppKey`
 - `dili:config:urlhausAuthKey`
 - `dili:config:urlhausApiKey`
 
@@ -58,35 +86,37 @@ Notes:
 - Never commit real provider credentials.
 - If no key is configured, extension fallback behavior is safe:
 - GSB returns `configured: false`, `checked: false`, `flagged: false`
-- PhishTank can still attempt a public lookup when enabled, but an app key improves rate limits.
 - URLhaus still attempts public-mode lookup when available
 
 ## Host Permissions
 
-DILI requests broad `http://*/*` and `https://*/*` host permissions so the MV3 service worker can resolve shortened URLs that may redirect to any domain. Google Safe Browsing and URLhaus still appear as explicit provider entries, and PhishTank is covered by the broad HTTPS/HTTP permissions.
+DILI requests broad `http://*/*` and `https://*/*` host permissions so the MV3 service worker can resolve shortened URLs that may redirect to any domain. Google Safe Browsing and URLhaus are covered by these host permissions for API requests.
 
 ## Safety Score Model
 
-DILI now computes a Safety Score instead of additive risk:
+DILI computes a **Safety Score** using a subtractive model:
 
-- Start at `100`
-- Deduct weighted points for suspicious indicators
-- Clamp final score to `0..100`
+- **Starting point:** 100 (neutral/safe baseline)
+- **Deduction:** Points are deducted for suspicious indicators
+- **Final range:** `0..100` (clamped)
+- **Interpretation:**
+  - **Higher score = Safer** (e.g., 95 is safer than 50)
+  - **Lower score = More concerning** (e.g., 20 indicates more risk signs)
 
-Classification:
+### Safety Score Classifications
 
-- `90-100`: Safe - no major warning signs
-- `75-89`: Low Caution - minor uncertainty, no hard navigation pause by default
-- `60-74`: Caution - review the destination, no hard navigation pause by default unless combined with strong risk signs
-- `40-59`: Suspicious - navigation pause/interception recommended
-- `0-39`: High Risk - strong warning/interception recommended
-- `Unverified`: DILI could not fully verify the destination; this is separate from suspicious unless other risk signs are present
-- Provider-flagged URLs from Google Safe Browsing, PhishTank, or URLhaus should become High Risk.
-- Provider errors and rate limits do not deduct score by themselves.
+- `90-100`: **Safe** — no major warning signs detected
+- `75-89`: **Low Caution** — minor uncertainty; DILI does not pause navigation by default
+- `60-74`: **Caution** — review the destination; no hard pause unless combined with strong risk signs
+- `40-59`: **Suspicious** — navigation pause/interception recommended
+- `0-39`: **High Risk** — strong warning/interception recommended
+- `Unverified`: DILI could not fully verify the destination; this is independent of suspicious unless other risk signs are also present
+
+**Provider-flagged results:** URLs flagged by Google Safe Browsing or URLhaus are classified as High Risk. Provider errors and rate limits do not directly deduct score points.
 
 ### Local domain memory
 
-DILI only stores a local flagged-domain memory when an external provider, such as Google Safe Browsing, PhishTank, or URLhaus, flags the destination. Heuristic-only High Risk results do not permanently flag a domain.
+DILI only stores a local flagged-domain memory when an external provider, such as Google Safe Browsing or URLhaus, flags the destination. Heuristic-only High Risk results do not permanently flag a domain.
 
 Clearing session logs also clears local flagged-domain records so test runs are not contaminated by earlier false positives.
 
@@ -113,7 +143,7 @@ The popup shows:
 - **Current tab context** (Facebook vs unsupported / non-scannable URLs)
 - **Session stats:** current page candidates, current page analyses, visible panels, total compact analyses in storage
 - **Session started** timestamp (when the background session began)
-- **Provider chips:** config readiness, Google Safe Browsing, PhishTank, and URLhaus compact status
+- **Provider chips:** config readiness, Google Safe Browsing, and URLhaus compact status
 - **Recent activity** list (latest stored analyses)
 - Action buttons:
 - Export CSV
@@ -137,12 +167,20 @@ Each row includes:
 - `urlHash`
 - `safetyScore`
 - `classification`
+- `gsbStatus`
+- `urlhausStatus`
 - `gsbConfigured`
 - `gsbFlagged`
-- `phishtankConfigured`
-- `phishtankFlagged`
-- `urlhausConfigured`
+- `gsbCheckedUrl`
+- `gsbCheckedAt`
+- `gsbDurationMs`
+- `gsbResultSummary`
+- `urlhausConfigured` (URLhaus auth-key configured; public mode can still run when this is false)
 - `urlhausFlagged`
+- `urlhausCheckedUrl`
+- `urlhausCheckedAt`
+- `urlhausDurationMs`
+- `urlhausResultSummary`
 - `redirectCount`
 - `usedShortener`
 - `suspiciousTld`
@@ -157,14 +195,28 @@ Each row includes:
 - `isCorrect`
 - `accuracyNotes`
 
+## Provider Verification Evidence
+
+DILI records compact verification evidence for Google Safe Browsing and URLhaus:
+
+- checked URL
+- provider outcome
+- scan timestamp
+- provider response duration
+
+This evidence is shown in Technical Details and included in CSV/report exports to improve auditability, demonstrate that provider scans ran, and support cybersecurity awareness and transparency during evaluation.
+
+Provider telemetry is informational only. It does not directly affect Safety Score deductions, classification thresholds, or warning/interception decisions.
+
 ## Provider Caveats
 
 - Google Safe Browsing requires an API key and is subject to quota and provider policies.
-- PhishTank is phishing-specific and works best with an app key; the app key is optional but improves rate limits.
-- PhishTank requires a descriptive User-Agent, but direct Chrome extension fetch calls may not reliably set a custom User-Agent header. If lookups are rate-limited or blocked, a backend proxy or local database approach may be needed.
-- URLhaus is malware-oriented telemetry, not purely phishing classification.
-- URLhaus remains a malware-oriented supplement and may be skipped when Google Safe Browsing and PhishTank complete cleanly, depending on lookup policy.
-- External lookups can fail due to network, CORS, quota, or endpoint changes. DILI logs failures and continues with local heuristics.
+- Google Safe Browsing remains DILI's primary phishing and social-engineering threat provider.
+- URLhaus is malware-oriented telemetry, not a complete phishing verdict.
+- URLhaus may run in authenticated or public mode. If authenticated mode fails, DILI attempts a public lookup fallback.
+- URLhaus lookup failures do not automatically reduce the Safety Score.
+- External lookups can fail due to network, CORS, quota, authentication, or endpoint changes. DILI logs failures and continues with local heuristics.
+- PhishTank was deprecated from active checks because its API behavior is unreliable for direct browser-extension use.
 
 ## Loading Unpacked Extension
 

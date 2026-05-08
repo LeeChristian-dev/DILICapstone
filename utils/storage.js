@@ -8,8 +8,6 @@ const DEDUPE_WINDOW_MS = 10 * 60 * 1000;
 const STORED_TEXT_LIMIT = 260;
 const PROTECTED_KEYS = new Set([
   "dili:config:gsbApiKey",
-  "dili:config:phishtankAppKey",
-  "dili:config:phishtankEnabled",
   "dili:config:urlhausAuthKey",
   "dili:config:urlhausApiKey",
   "dili:scan:enabled"
@@ -265,6 +263,7 @@ function compactPersistentRecord(record = {}) {
     ...(record.limitations || []),
     ...(endpointResult.warnings || [])
   ];
+  const providerResults = Array.isArray(record.providerResults) ? record.providerResults : [];
 
   return {
     postId: clampText(record.postId || ""),
@@ -292,7 +291,22 @@ function compactPersistentRecord(record = {}) {
     mainRiskReasons: clampList(record.mainRiskReasons || extractMainReasons(record.deductions), 8),
     limitations: clampList(limitations, 8),
     domainChain: clampList(record.domainChain || chainToDomains(record.redirectAnalysis?.redirectChain || endpointResult.resolutionChain), 8),
+    providerResults: compactProviderResults(providerResults),
     providerOverride: Boolean(record.providerOverride),
+    candidateSource: clampText(record.candidateSource || record.candidateContext?.candidateSource || ""),
+    candidateUrlCompleteness: clampText(record.candidateUrlCompleteness || record.candidateContext?.candidateUrlCompleteness || ""),
+    candidateIsDomainOnlyFallback: record.candidateIsDomainOnlyFallback === true || record.candidateContext?.candidateIsDomainOnlyFallback === true,
+    candidateContext: {
+      displayText: clampText(record.candidateContext?.displayText || ""),
+      visibleText: clampText(record.candidateContext?.visibleText || ""),
+      rawHref: clampText(record.candidateContext?.rawHref || "", 500),
+      facebookWrapperUrl: clampText(record.candidateContext?.facebookWrapperUrl || "", 500),
+      unwrappedCandidateUrl: clampText(record.candidateContext?.unwrappedCandidateUrl || "", 500),
+      selectedNormalizedTarget: clampText(record.candidateContext?.selectedNormalizedTarget || record.selectedNormalizedTarget || "", 500),
+      candidateSource: clampText(record.candidateContext?.candidateSource || record.candidateSource || ""),
+      candidateUrlCompleteness: clampText(record.candidateContext?.candidateUrlCompleteness || record.candidateUrlCompleteness || ""),
+      candidateIsDomainOnlyFallback: record.candidateContext?.candidateIsDomainOnlyFallback === true || record.candidateIsDomainOnlyFallback === true
+    },
     postIdentityStable: record.postIdentityStable === true,
     integrityComparisonStatus: clampText(record.integrityComparisonStatus || ""),
     linkInsertedAfterBaseline: record.linkInsertedAfterBaseline === true,
@@ -395,7 +409,31 @@ function clampText(value, maxLength = STORED_TEXT_LIMIT) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
 }
+function compactProviderResults(providerResults) {
+  if (!Array.isArray(providerResults)) {
+    return [];
+  }
 
+  return providerResults.map((item) => ({
+    provider: clampText(item?.provider || ""),
+    configured: item?.configured === true,
+    checked: item?.checked === true,
+    checkedUrl: clampText(item?.checkedUrl || "", 500),
+    checkedAt: clampText(item?.checkedAt || "", 80),
+    durationMs: Number.isFinite(Number(item?.durationMs)) ? Number(item.durationMs) : null,
+    resultSummary: clampText(item?.resultSummary || "", 200),
+    flagged: item?.flagged === true,
+    category: clampText(item?.category || ""),
+    details: {
+      status: clampText(item?.details?.status || ""),
+      httpStatus: item?.details?.httpStatus ?? null,
+      mode: clampText(item?.details?.mode || ""),
+      message: clampText(item?.details?.message || "", 300),
+      queryStatus: clampText(item?.details?.queryStatus || ""),
+      matchesCount: Number(item?.details?.matchesCount || 0)
+    }
+  }));
+}
 function safeHostname(rawUrl) {
   try {
     return new URL(rawUrl).hostname.toLowerCase();

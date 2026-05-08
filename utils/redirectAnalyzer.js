@@ -9,7 +9,7 @@ import {
 } from "./urlAnalyzer.js";
 
 const MAX_REDIRECT_DEPTH = 6;
-const FETCH_TIMEOUT_MS = 3500;
+const FETCH_TIMEOUT_MS = 4000;
 const ACTIVE_PROBE_REDIRECT_HOSTS = new Set([
   "l.facebook.com",
   "lm.facebook.com",
@@ -93,7 +93,14 @@ export async function analyzeRedirects(rawUrl) {
 
   const probeInputUrl = safelyCanonicalize(redirectChain[redirectChain.length - 1] || currentUrl, { stripTracking: true }) || (redirectChain[redirectChain.length - 1] || currentUrl);
   const probeInputHost = safeHostname(probeInputUrl);
-  const fetchResolution = await attemptNetworkResolution(probeInputUrl);
+  const fetchResolution = await attemptNetworkResolution(probeInputUrl, {
+    originalUrl: rawUrl,
+    redirectChain
+  });
+  if (fetchResolution.note && (fetchResolution.fetchAttempted || fetchResolution.shouldReportNote)) {
+    pushUniqueNote(notes, fetchResolution.note);
+  }
+
   if (fetchResolution.success && fetchResolution.finalUrl && !isSameComparableUrl(fetchResolution.finalUrl, redirectChain[redirectChain.length - 1])) {
     const finalCanonical = safelyCanonicalize(fetchResolution.finalUrl, { stripTracking: false }) || fetchResolution.finalUrl;
     redirectChain.push(finalCanonical);
@@ -149,6 +156,8 @@ export async function analyzeRedirects(rawUrl) {
     uniqueRegistrableDomains: redirectSummary.uniqueRegistrableDomains,
     resolvedUrl: normalizeUrl(currentUrl),
     resolutionMethod: fetchResolution.fetchAllowed ? fetchResolution.method : "heuristic-only",
+    fetchMethod: fetchResolution.method,
+    fetchStatus: fetchResolution.status || "",
     notes,
     fetchAttempted: fetchResolution.fetchAttempted,
     fetchAllowed: fetchResolution.fetchAllowed,
@@ -163,18 +172,20 @@ export async function analyzeRedirects(rawUrl) {
   };
 }
 
-async function attemptNetworkResolution(rawUrl) {
+async function attemptNetworkResolution(rawUrl, context = {}) {
   const host = safeHostname(rawUrl);
-  const probeable = isActivelyProbeableHost(host);
+  const probePolicy = getActiveProbePolicy(rawUrl, context);
 
-  if (!probeable) {
+  if (!probePolicy.allowed) {
     return {
       fetchAllowed: false,
       fetchAttempted: false,
       success: false,
       method: "heuristic-only",
       finalUrl: null,
-      note: "Active redirect probing is restricted to an allowlist of wrapper and shortener hosts."
+      status: "skipped",
+      shouldReportNote: probePolicy.shouldReportNote,
+      note: probePolicy.note
     };
   }
 
@@ -185,6 +196,8 @@ async function attemptNetworkResolution(rawUrl) {
       success: false,
       method: "heuristic-only",
       finalUrl: null,
+      status: "skipped",
+      shouldReportNote: true,
       note: "Fetch is not available in the current extension context."
     };
   }
@@ -220,20 +233,123 @@ async function attemptFetch(rawUrl, method) {
       fetchAttempted: true,
       success: true,
       method: method.toLowerCase() + "-follow",
+      status: `http-${response.status}`,
       finalUrl: response.url || rawUrl,
       note: ""
     };
   } catch (error) {
+    const timedOut = error?.name === "AbortError";
     return {
       fetchAllowed: true,
       fetchAttempted: true,
       success: false,
       method: method.toLowerCase() + "-follow",
+      status: timedOut ? "timeout" : "failed",
       finalUrl: null,
-      note: `Redirect probing failed with ${method}: ${error?.message || "unknown error"}.`
+      note: timedOut
+        ? "Active redirect probing timed out before a final endpoint was confirmed."
+        : "DILI could not fully confirm whether this custom shortlink redirects further."
     };
   } finally {
     self.clearTimeout(timeoutId);
+  }
+}
+
+function getActiveProbePolicy(rawUrl, context = {}) {
+  const host = safeHostname(rawUrl);
+  const normalizedHost = String(host || "").toLowerCase();
+  const originalUrl = String(context.originalUrl || "").trim();
+  const chain = Array.isArray(context.redirectChain) ? context.redirectChain : [];
+  const chainHosts = chain.map((url) => safeHostname(url)).filter(Boolean);
+
+  if (!isHttpUrl(rawUrl)) {
+    return {
+      allowed: false,
+      shouldReportNote: false,
+      note: "Active redirect probing was skipped for this domain."
+    };
+  }
+
+  if (isProviderApiHost(normalizedHost) || isInternalFacebookProbeUrl(rawUrl)) {
+    return {
+      allowed: false,
+      shouldReportNote: false,
+      note: "Active redirect probing was skipped for this domain."
+    };
+  }
+
+  const cameFromFacebookWrapper = chainHosts.some((candidateHost) => isFacebookWrapperHost(candidateHost)) || isFacebookWrapperHost(safeHostname(originalUrl));
+  const sourceWasKnownShortener = chainHosts.some((candidateHost) => isShortenerHost(candidateHost)) || isShortenerHost(safeHostname(originalUrl));
+  const hostIsProbeable = isActivelyProbeableHost(normalizedHost);
+  const looksLikeShortlink = looksLikeCustomShortlinkUrl(rawUrl);
+
+  if (hostIsProbeable || cameFromFacebookWrapper || sourceWasKnownShortener || looksLikeShortlink) {
+    return {
+      allowed: true,
+      shouldReportNote: false,
+      note: ""
+    };
+  }
+
+  return {
+    allowed: false,
+    shouldReportNote: looksLikeShortlink,
+    note: "Active redirect probing was skipped for this domain."
+  };
+}
+
+function isHttpUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isProviderApiHost(hostname) {
+  const normalized = String(hostname || "").toLowerCase();
+  return (
+    normalized === "safebrowsing.googleapis.com" ||
+    normalized.endsWith(".safebrowsing.googleapis.com") ||
+    normalized === "urlhaus-api.abuse.ch" ||
+    normalized.endsWith(".urlhaus-api.abuse.ch") ||
+    normalized === "abuse.ch" ||
+    normalized.endsWith(".abuse.ch")
+  );
+}
+
+function isInternalFacebookProbeUrl(rawUrl) {
+  const host = safeHostname(rawUrl);
+  if (!isFacebookWrapperHost(host)) {
+    return false;
+  }
+
+  return !extractLikelyRedirectTarget(rawUrl);
+}
+
+function looksLikeCustomShortlinkUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    const registrable = getRegistrableDomain(host);
+    const pathSegments = parsed.pathname.split("/").filter(Boolean);
+
+    if (isShortenerHost(host) || isFacebookWrapperHost(host)) {
+      return true;
+    }
+
+    if (pathSegments.length !== 1) {
+      return false;
+    }
+
+    const slug = pathSegments[0] || "";
+    const compactDomain = registrable && registrable.split(".")[0]?.length <= 7;
+    const compactSlug = slug.length >= 4 && slug.length <= 40 && /^[a-z0-9][a-z0-9_-]*$/i.test(slug);
+
+    return Boolean(compactDomain && compactSlug && !parsed.search);
+  } catch {
+    return false;
   }
 }
 

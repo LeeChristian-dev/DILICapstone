@@ -6,12 +6,6 @@ const DEDUCTION_RULES = [
     label: "Google Safe Browsing flagged the URL."
   },
   {
-    id: "phishtankFlagged",
-    category: "provider_reputation",
-    deduction: 70,
-    label: "PhishTank verified this URL as phishing."
-  },
-  {
     id: "urlhausFlagged",
     category: "provider_reputation",
     deduction: 60,
@@ -138,7 +132,6 @@ const COMBINATION_RULES = [
       features.shortenedUrl &&
       (
         features.googleSafeBrowsingFlagged ||
-        features.phishtankFlagged ||
         features.urlhausFlagged ||
         features.textMismatch ||
         features.suspiciousTld ||
@@ -166,7 +159,6 @@ const COMBINATION_RULES = [
       return Boolean(
         (
           features.googleSafeBrowsingFlagged ||
-          features.phishtankFlagged ||
           features.urlhausFlagged
         ) &&
         (

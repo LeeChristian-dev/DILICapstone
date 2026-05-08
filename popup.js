@@ -471,7 +471,7 @@ function renderProviderChips(providerSummary) {
     return;
   }
 
-  const order = ["config", "gsb", "phishtank", "urlhaus"];
+  const order = ["config", "gsb", "urlhaus"];
   for (const key of order) {
     const entry = providerSummary[key];
     if (!entry || typeof entry !== "object") {
@@ -572,12 +572,20 @@ function convertRecordsToCsv(records) {
     "urlHash",
     "safetyScore",
     "classification",
+    "gsbStatus",
+    "urlhausStatus",
     "gsbConfigured",
     "gsbFlagged",
-    "phishtankConfigured",
-    "phishtankFlagged",
+    "gsbCheckedUrl",
+    "gsbCheckedAt",
+    "gsbDurationMs",
+    "gsbResultSummary",
     "urlhausConfigured",
     "urlhausFlagged",
+    "urlhausCheckedUrl",
+    "urlhausCheckedAt",
+    "urlhausDurationMs",
+    "urlhausResultSummary",
     "redirectCount",
     "usedShortener",
     "suspiciousTld",
@@ -595,23 +603,30 @@ function convertRecordsToCsv(records) {
 
   const rows = records.map((record) => {
     const gsb = findProviderResult(record.providerResults, "gsb");
-    const phishtank = findProviderResult(record.providerResults, "phishtank");
     const urlhaus = findProviderResult(record.providerResults, "urlhaus");
     const features = record.features || {};
     return [
       formatTimestamp(record.timestamp),
       record.postId || "",
-      record.url || "",
+      record.url || record.analysisUrl || record.normalizedUrl || "",
       record.domain || "",
       record.urlHash || "",
       record.safetyScore ?? "",
       record.classification || "",
+      gsb?.details?.status ?? "",
+      urlhaus?.details?.status ?? "",
       gsb?.configured ?? "",
       gsb?.flagged ?? "",
-      phishtank?.configured ?? "",
-      phishtank?.flagged ?? "",
-      urlhaus?.configured ?? "",
+      gsb?.checkedUrl ?? "",
+      gsb?.checkedAt ?? "",
+      gsb?.durationMs ?? "",
+      gsb?.resultSummary || getProviderOutcomeSummary(gsb),
+      urlhaus?.details?.authKeyConfigured ?? urlhaus?.details?.authConfigured ?? urlhaus?.configured ?? "",
       urlhaus?.flagged ?? "",
+      urlhaus?.checkedUrl ?? "",
+      urlhaus?.checkedAt ?? "",
+      urlhaus?.durationMs ?? "",
+      urlhaus?.resultSummary || getProviderOutcomeSummary(urlhaus),
       features.redirectCount ?? "",
       features.shortenedUrl ?? "",
       features.suspiciousTld ?? "",
@@ -638,10 +653,9 @@ function inferInterceptionRecommended(record = {}) {
   const score = Number(record.safetyScore);
   const classification = String(record.classification || "").toLowerCase();
   const gsb = findProviderResult(record.providerResults, "gsb");
-  const phishtank = findProviderResult(record.providerResults, "phishtank");
   const urlhaus = findProviderResult(record.providerResults, "urlhaus");
 
-  if (gsb?.flagged || phishtank?.flagged || urlhaus?.flagged) {
+  if (gsb?.flagged || urlhaus?.flagged) {
     return true;
   }
 
@@ -675,6 +689,41 @@ function downloadCsv(csvText) {
 function csvEscape(value) {
   const text = String(value ?? "");
   return `"${text.replace(/"/g, '""')}"`;
+}
+
+function getProviderOutcomeSummary(provider = {}) {
+  if (!provider || typeof provider !== "object") {
+    return "";
+  }
+
+  const providerName = String(provider.provider || "").toLowerCase();
+  const status = String(provider.details?.status || "").toLowerCase();
+
+  if (providerName === "urlhaus" && status === "error") {
+    return "Lookup unavailable after retry.";
+  }
+
+  if (providerName !== "urlhaus" && (!provider.configured || status === "not-configured")) {
+    return "Provider not configured.";
+  }
+
+  if (status === "error" || status === "rate-limited" || status === "parse-error") {
+    return "Request failed.";
+  }
+
+  if (!provider.checked || status === "skipped" || status === "not-configured") {
+    return "Provider not configured.";
+  }
+
+  if (providerName === "gsb") {
+    return provider.flagged ? "Unsafe URL reported." : "No unsafe matches reported.";
+  }
+
+  if (providerName === "urlhaus") {
+    return provider.flagged ? "Known malware record found." : "No known malware record found.";
+  }
+
+  return provider.flagged ? "Provider reported a match." : "No provider match reported.";
 }
 
 function setMessage(text) {
