@@ -1,7 +1,8 @@
 import {
   GSB_API_KEY,
   URLHAUS_API_KEY,
-  URLHAUS_AUTH_KEY
+  URLHAUS_AUTH_KEY,
+  VIRUSTOTAL_API_KEY
 } from "./config.local.js";
 import { calculateSafetyScore, classifySafetyScore } from "./riskEngine.js";
 import { sha256Hex } from "./utils/hash.js";
@@ -22,6 +23,8 @@ import {
   updatePostAnalysis
 } from "./utils/storage.js";
 const CONFIG_FILE_NAME = "config.local.js";
+const DEMO_SCORE_BIAS_STORAGE_KEY = "dili:debug:scoreBiasEnabled";
+const DEMO_SCORE_BIAS_AMOUNT_STORAGE_KEY = "dili:debug:scoreBiasAmount";
 
 const MESSAGE_TYPES = {
   ANALYZE_LINK: "DILI_ANALYZE_LINK",
@@ -50,14 +53,36 @@ const performanceStats = {
   maxProviderMs: 0,
   maxStorageMs: 0,
   lastCacheHit: false,
-  lastAnalyzedDomain: ""
+  lastAnalyzedDomain: "",
+  providerCacheHits: 0,
+  providerCacheMisses: 0,
+  providerInFlightJoins: 0,
+  providerRequestsStarted: 0,
+  providerRequestsCompleted: 0,
+  providerRequestsFailed: 0,
+  providerTimeouts: 0,
+  providerErrorCacheHits: 0,
+  lastProviderCacheStatus: ""
 };
 const providerHealth = createInitialProviderHealth();
 const runtimeConfig = createRuntimeConfig();
 const CURRENT_ANALYSIS_SCHEMA_VERSION = 4;
 const SESSION_TTL_MS = 60 * 60 * 1000;
 const URL_ANALYSIS_CACHE_TTL_MS = 10 * 60 * 1000;
+const PROVIDER_RESULT_CACHE_TTL_MS = 10 * 60 * 1000;
+const PROVIDER_ERROR_CACHE_TTL_MS = 60 * 1000;
+const PROVIDER_PENDING_CACHE_TTL_MS = 15 * 1000;
+const PROVIDER_CACHE_MAX_ENTRIES = 300;
+const VIRUSTOTAL_MIN_REQUEST_INTERVAL_MS = 20 * 1000;
+const VIRUSTOTAL_SOFT_DEADLINE_MS = 2800;
+const VIRUSTOTAL_PENDING_FOLLOWUP_INTERVAL_MS = 20 * 1000;
+const VIRUSTOTAL_PENDING_TTL_MS = 30 * 60 * 1000;
 const urlAnalysisCache = new Map();
+const providerResultCache = new Map();
+const providerRequestInFlight = new Map();
+const virusTotalPendingAnalysisCache = new Map();
+let providerCacheGeneration = 0;
+let lastVirusTotalRequestAt = 0;
 const sessionInfo = createSessionState();
 
 applyConfigDiagnostics(runtimeConfig);
@@ -80,6 +105,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return true;
 });
+
+if (chrome.storage?.onChanged) {
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "local") {
+      return;
+    }
+
+    const providerConfigKeys = [
+    "dili:config:gsbApiKey",
+    "dili:config:urlhausAuthKey",
+    "dili:config:urlhausApiKey",
+    "dili:config:virustotalApiKey",
+    DEMO_SCORE_BIAS_STORAGE_KEY,
+    DEMO_SCORE_BIAS_AMOUNT_STORAGE_KEY
+  ];
+
+    if (!providerConfigKeys.some((key) => Object.prototype.hasOwnProperty.call(changes, key))) {
+      return;
+    }
+
+    clearProviderCaches({ clearUrlAnalysis: true, clearPendingVirusTotal: true });
+    getRuntimeConfig().catch((error) => {
+      logDebug(`Provider config refresh after storage change failed: ${safeErrorMessage(error, "unknown error")}`);
+    });
+  });
+}
 
 async function handleMessage(message) {
   switch (message?.type) {
@@ -165,6 +216,7 @@ case MESSAGE_TYPES.CLEAR_ANALYSIS_RECORDS:
   {
     await clearAnalysisRecords();
     const clearedDomainFlags = await clearDomainFlagRecords();
+    clearProviderCaches({ clearUrlAnalysis: true });
 
     logDebug(`Analysis records cleared from storage. Local domain flags cleared: ${clearedDomainFlags}.`);
 
@@ -281,6 +333,8 @@ async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candi
     throw new Error(limitations[0] || "No links could be analyzed.");
   }
 
+  // The post-level result intentionally follows the lowest-scoring successful link
+  // so one risky link cannot be hidden by several safe links.
   const worst = analyses
     .slice()
     .sort((left, right) => {
@@ -288,12 +342,41 @@ async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candi
       const rightScore = Number.isFinite(right.safetyScore) ? right.safetyScore : 101;
       return leftScore - rightScore;
     })[0];
-  const persistedWorst = await persistPostLevelAnalysis(postId, worst);
+  const linkScoreSummary = analyses.map((item, index) => ({
+    index: index + 1,
+    url: item.analysisUrl || item.normalizedUrl || "",
+    domain:
+      item.endpointResult?.effectiveDomain ||
+      item.urlFeatureAnalysis?.finalDomain ||
+      item.domain ||
+      "",
+    safetyScore: item.safetyScore,
+    classification: item.classification
+  })).slice(0, 8);
+  const enrichedWorst = {
+    ...worst,
+    analyzedLinkCount: analyses.length,
+    failedLinkCount: limitations.length,
+    multiLinkPost: analyses.length > 1,
+    lowestScoringLinkUrl: worst.analysisUrl || worst.normalizedUrl || "",
+    lowestScoringLinkDomain:
+      worst.endpointResult?.effectiveDomain ||
+      worst.urlFeatureAnalysis?.finalDomain ||
+      worst.domain ||
+      "",
+    linkScoreSummary
+  };
+  const persistedWorst = await persistPostLevelAnalysis(postId, enrichedWorst);
 
   return {
     ...persistedWorst,
     linkAnalyses: analyses.map(compactLiveLinkAnalysis),
     analyzedLinkCount: analyses.length,
+    failedLinkCount: limitations.length,
+    multiLinkPost: analyses.length > 1,
+    lowestScoringLinkUrl: enrichedWorst.lowestScoringLinkUrl,
+    lowestScoringLinkDomain: enrichedWorst.lowestScoringLinkDomain,
+    linkScoreSummary,
     failedLinkLimitations: limitations,
     limitations: [...(worst.limitations || []), ...limitations].slice(0, 8)
   };
@@ -327,7 +410,7 @@ recordMaxPerformanceStat("maxEndpointMs", endpointMs);
         internalFacebook: true
       },
       deductions: [],
-      providerResults: [createDefaultProviderResult("gsb"), createDefaultProviderResult("urlhaus")],
+      providerResults: [createDefaultProviderResult("gsb"), createDefaultProviderResult("urlhaus"), createDefaultProviderResult("virustotal")],
       redirectAnalysis: {
         redirectCount: 0,
         redirectChain: endpointResult.resolutionChain,
@@ -379,6 +462,7 @@ performanceStats.lastCacheHit = Boolean(reusableUrlAnalysis.cacheHit);
   const domainPreviouslyFlagged = await checkDomainPreviouslyFlagged(domain);
   const gsbResult = getNormalizedProviderResult(providerResults, "gsb");
   const urlhausResult = getNormalizedProviderResult(providerResults, "urlhaus");
+  const virusTotalResult = getNormalizedProviderResult(providerResults, "virustotal");
   const detectedAt = Date.now();
   const baselineFirstSeenAt = Number(existingBaseline?.baselineFirstSeenAt || existingBaseline?.firstSeenAt || detectedAt);
 const currentPostTextHash = String(postTextHash || "");
@@ -439,6 +523,8 @@ const canUseNoLinkInjectionBaseline = Boolean(
   }, reusableUrlAnalysis, endpointResult);
   urlLevelFeatures = applyFacebookWrapperOnlyRedirectMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
   urlLevelFeatures = applySameDomainMarketingEncodingMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
+  urlLevelFeatures = applyKnownBrandedCampaignRedirectMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
+  urlLevelFeatures = applyKnownGoogleFormsRedirectMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
   const combinedFeaturesBase = {
     ...urlLevelFeatures,
     ...postContextFeatures
@@ -449,8 +535,10 @@ const canUseNoLinkInjectionBaseline = Boolean(
   }, reusableUrlAnalysis, endpointResult);
   features = applyFacebookWrapperOnlyRedirectMitigation(features, reusableUrlAnalysis, endpointResult);
   features = applySameDomainMarketingEncodingMitigation(features, reusableUrlAnalysis, endpointResult);
+  features = applyKnownBrandedCampaignRedirectMitigation(features, reusableUrlAnalysis, endpointResult);
+  features = applyKnownGoogleFormsRedirectMitigation(features, reusableUrlAnalysis, endpointResult);
   const urlLevelScoring = calculateSafetyScore(urlLevelFeatures);
-  const providerOverride = Boolean(gsbResult.flagged || urlhausResult.flagged);
+  const providerOverride = Boolean(gsbResult.flagged || urlhausResult.flagged || virusTotalResult.flagged);
   const urlLevelClassification = providerOverride ? "High Risk" : classifySafetyScore(urlLevelScoring.score);
 const scoringStartedAt = nowMs();
 const scoring = calculateSafetyScore(features);
@@ -466,6 +554,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     features.integrityHashMismatch ||
     features.googleSafeBrowsingFlagged ||
     features.urlhausFlagged ||
+    features.virusTotalFlagged ||
     features.usernamePasswordTrick ||
     features.suspiciousRedirectPattern ||
     features.shortenerToUnrelatedDomain ||
@@ -495,6 +584,31 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
   } else if (!providerOverride && concreteRiskSignals && verificationState === "low-confidence") {
     finalScore = Math.min(finalScore, 79);
   }
+  const cappedScore = applySoftUncertaintyCap(finalScore, {
+    features,
+    endpointResult,
+    domain,
+    providerOverride
+  });
+  const softUncertaintyCapApplied = Number(cappedScore) !== Number(finalScore);
+  finalScore = cappedScore;
+  let finalFeatures = softUncertaintyCapApplied
+    ? {
+        ...features,
+        softUncertaintyCapApplied: true
+      }
+    : features;
+  const originalFinalScore = finalScore;
+  const demoScoreBias = await getDemoScoreBiasConfig();
+  if (demoScoreBias.enabled) {
+    finalScore = Math.max(0, finalScore - demoScoreBias.amount);
+    finalFeatures = {
+      ...finalFeatures,
+      demoScoreBiasApplied: true,
+      originalSafetyScore: originalFinalScore,
+      demoScoreBiasAmount: demoScoreBias.amount
+    };
+  }
   const classification = providerOverride
     ? "High Risk"
     : verificationOnlyUnknown
@@ -503,10 +617,10 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
   const interceptionRecommended = shouldRecommendInterceptionForStoredAnalysis({
     classification,
     safetyScore: finalScore,
-    features,
+    features: finalFeatures,
     providerResults
   });
-  const nextState = features.integrityHashMismatch ? "changed" : "monitored";
+  const nextState = finalFeatures.integrityHashMismatch ? "changed" : "monitored";
   const record = {
     postId,
     analysisSchemaVersion: CURRENT_ANALYSIS_SCHEMA_VERSION,
@@ -535,7 +649,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     verificationOnlyUnknown,
     concreteRiskSignals,
     interceptionRecommended,
-    features,
+    features: finalFeatures,
     deductions: scoring.deductions,
     providerOverride,
     providerResults,
@@ -549,12 +663,13 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         baselineFirstSeenAt,
         previousPostTextHash,
         currentPostTextHash,
-        candidateContext: normalizedCandidateContext
+        candidateContext: normalizedCandidateContext,
+        features: finalFeatures
       },
       providerResults
     }),
     endpointConfidence: endpointResult.endpointConfidence,
-    limitations: buildAnalysisLimitations({ endpointResult, providerResults, candidateContext: normalizedCandidateContext }),
+    limitations: buildAnalysisLimitations({ endpointResult, providerResults, candidateContext: normalizedCandidateContext, domain }),
     postIdentityStable: normalizedCandidateContext.postIdentityStable === true,
     integrityComparisonStatus: normalizedCandidateContext.postIdentityStable === true ? "checked" : "skipped-unstable-post-identity",
     redirectAnalysis,
@@ -586,7 +701,8 @@ recordMaxPerformanceStat("maxStorageMs", storageMs);
 
 const providerFlaggedDomain = Boolean(
   gsbResult.flagged ||
-  urlhausResult.flagged
+  urlhausResult.flagged ||
+  virusTotalResult.flagged
 );
 
 if (providerFlaggedDomain) {
@@ -608,7 +724,7 @@ if (providerFlaggedDomain) {
       verificationOnlyUnknown,
       concreteRiskSignals,
       interceptionRecommended,
-      features,
+      features: finalFeatures,
       providerResults,
       endpointResult,
       endpointConfidence: endpointResult.endpointConfidence,
@@ -620,7 +736,7 @@ if (providerFlaggedDomain) {
 
   sessionInfo.lastActivityAt = Date.now();
 
-  if (features.integrityHashMismatch) {
+  if (finalFeatures.integrityHashMismatch) {
     logDebug(`Edit detection for ${postId}: integrity hash changed.`);
   }
 
@@ -891,12 +1007,13 @@ async function getReusableUrlAnalysis(rawUrl, urlFeatures, endpointResult = null
     logDebug(`URL analysis cache hit: ${cacheKey}`);
     logDebug(`Reused cached redirect/provider analysis for ${cachedEntry.analysisUrl}`);
 
-    const aliasKeys = buildUrlAnalysisCacheKeys(urlFeatures, cachedEntry.analysisUrl);
-    setUrlAnalysisCacheEntry(aliasKeys, stripUrlAnalysisCacheMetadata(cachedEntry), cachedEntry.cachedAt);
+    const refreshedEntry = await maybeRefreshCachedVirusTotalProviderResult(cachedEntry, urlFeatures);
+    const aliasKeys = buildUrlAnalysisCacheKeys(urlFeatures, refreshedEntry.analysisUrl);
+    setUrlAnalysisCacheEntry(aliasKeys, stripUrlAnalysisCacheMetadata(refreshedEntry), refreshedEntry.cachedAt);
 performanceStats.lastProviderMs = 0;
 performanceStats.lastCacheHit = true;
     return {
-      ...normalizeReusableUrlAnalysis(cachedEntry),
+      ...normalizeReusableUrlAnalysis(refreshedEntry),
       cacheHit: true,
       cacheKey
     };
@@ -971,16 +1088,70 @@ recordMaxPerformanceStat("maxProviderMs", providerMs);
   };
 }
 
+async function maybeRefreshCachedVirusTotalProviderResult(cachedEntry = {}, urlFeatures = {}) {
+  const providerResults = normalizeProviderResults(cachedEntry.providerResults || []);
+  const vt = providerResults.find((item) => item.provider === "virustotal");
+
+  if (String(vt?.details?.status || "").toLowerCase() !== "pending") {
+    return cachedEntry;
+  }
+
+  const config = await getRuntimeConfig();
+  if (!String(config.VIRUSTOTAL_API_KEY || "").trim()) {
+    return cachedEntry;
+  }
+
+  const checkedAtMs = Date.parse(vt.checkedAt || "");
+  const cacheAgeMs = Number(vt.details?.cacheAgeMs);
+  const oldEnough = Number.isFinite(cacheAgeMs)
+    ? cacheAgeMs >= VIRUSTOTAL_PENDING_FOLLOWUP_INTERVAL_MS
+    : Number.isFinite(checkedAtMs) && Date.now() - checkedAtMs >= VIRUSTOTAL_PENDING_FOLLOWUP_INTERVAL_MS;
+
+  if (!oldEnough) {
+    return cachedEntry;
+  }
+
+  const providerCheckedUrl =
+    vt.checkedUrl ||
+    cachedEntry.providerCheckedUrl ||
+    cachedEntry.analysisUrl ||
+    urlFeatures.normalizedUrl ||
+    "";
+
+  if (!providerCheckedUrl) {
+    return cachedEntry;
+  }
+
+  const refreshedVt = await getCachedOrInFlightProviderResult(
+    "virustotal",
+    providerCheckedUrl,
+    () => lookupVirusTotalUrl(providerCheckedUrl)
+  );
+  const nextProviderResults = providerResults.map((item) => (
+    item.provider === "virustotal" ? refreshedVt : item
+  ));
+  const nextEntry = {
+    ...cachedEntry,
+    providerResults: nextProviderResults
+  };
+  const cacheKeys = buildUrlAnalysisCacheKeys(urlFeatures, cachedEntry.analysisUrl);
+  setUrlAnalysisCacheEntry(cacheKeys, stripUrlAnalysisCacheMetadata(nextEntry), cachedEntry.cachedAt || Date.now());
+
+  return nextEntry;
+}
+
 function buildUrlLevelFeatures({ redirectAnalysis, providerResults, urlFeatureAnalysis }) {
   const safeProviderResults = normalizeProviderResults(providerResults);
   const safeRedirectAnalysis = normalizeRedirectAnalysis(redirectAnalysis);
   const safeUrlFeatureAnalysis = urlFeatureAnalysis || {};
   const gsbResult = safeProviderResults.find((item) => item.provider === "gsb");
   const urlhausResult = safeProviderResults.find((item) => item.provider === "urlhaus");
+  const virusTotalResult = safeProviderResults.find((item) => item.provider === "virustotal");
 
   const baseFeatures = {
     googleSafeBrowsingFlagged: gsbResult.flagged,
     urlhausFlagged: urlhausResult.flagged,
+    virusTotalFlagged: virusTotalResult.flagged,
     domainPreviouslyFlagged: false,
     redirectCount: safeRedirectAnalysis.redirectCount,
     multipleRedirects: safeRedirectAnalysis.multipleRedirects,
@@ -1017,7 +1188,7 @@ function isTrustedEndpointMitigationEligible(features = {}) {
     return false;
   }
 
-  if (features.googleSafeBrowsingFlagged || features.urlhausFlagged) {
+  if (features.googleSafeBrowsingFlagged || features.urlhausFlagged || features.virusTotalFlagged) {
     return false;
   }
 
@@ -1059,7 +1230,8 @@ function normalizeProviderResults(providerResults) {
   const values = Array.isArray(providerResults) ? providerResults : [];
   const gsb = values.find((item) => item?.provider === "gsb") || createDefaultProviderResult("gsb", "");
   const urlhaus = values.find((item) => item?.provider === "urlhaus") || createDefaultProviderResult("urlhaus", "");
-  return [gsb, urlhaus];
+  const virustotal = values.find((item) => item?.provider === "virustotal") || createDefaultProviderResult("virustotal", "");
+  return [gsb, urlhaus, virustotal];
 }
 
 function getNormalizedProviderResult(providerResults, providerName) {
@@ -1179,6 +1351,7 @@ function applyMainstreamResolvedShortlinkMitigation(features = {}, reusableUrlAn
     features.httpsEndpoint &&
     !features.googleSafeBrowsingFlagged &&
     !features.urlhausFlagged &&
+    !features.virusTotalFlagged &&
     !features.suspiciousPath &&
     !features.suspiciousTld &&
     !features.usernamePasswordTrick &&
@@ -1238,7 +1411,7 @@ function isSameDomainOrTrackingCleanupRedirect({ endpointResult, redirectAnalysi
 }
 
 function applyFacebookWrapperOnlyRedirectMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
-  const providerFlagged = Boolean(features.googleSafeBrowsingFlagged || features.urlhausFlagged);
+  const providerFlagged = Boolean(features.googleSafeBrowsingFlagged || features.urlhausFlagged || features.virusTotalFlagged);
   const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
   const sameDomainTrackingCleanup = isSameDomainOrTrackingCleanupRedirect({
     endpointResult,
@@ -1262,7 +1435,7 @@ function applyFacebookWrapperOnlyRedirectMitigation(features = {}, reusableUrlAn
 }
 
 function applySameDomainMarketingEncodingMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
-  const providerFlagged = Boolean(features.googleSafeBrowsingFlagged || features.urlhausFlagged);
+  const providerFlagged = Boolean(features.googleSafeBrowsingFlagged || features.urlhausFlagged || features.virusTotalFlagged);
   const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
   const sameDomainTrackingCleanup = isSameDomainOrTrackingCleanupRedirect({
     endpointResult,
@@ -1290,6 +1463,207 @@ function applySameDomainMarketingEncodingMitigation(features = {}, reusableUrlAn
     obfuscatedUrl: false,
     excessiveQueryComplexity: false
   };
+}
+
+const KNOWN_BRANDED_CAMPAIGN_REDIRECTS = [
+  {
+    sourceDomain: "hoyo.link",
+    allowedFinalDomains: ["twitch.tv", "youtube.com", "hoyoverse.com", "hoyolab.com"],
+    requiredPathHints: ["genshinimpactofficial", "hoyoverse", "hoyolab", "genshin"]
+  }
+];
+
+function applyKnownBrandedCampaignRedirectMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
+  const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
+  const finalUrl = endpointResult?.effectiveEndpoint || reusableUrlAnalysis.analysisUrl || "";
+  const eligible = Boolean(
+    isKnownBrandedCampaignRedirect({
+      endpointResult,
+      redirectAnalysis: reusableUrlAnalysis.redirectAnalysis,
+      finalDomain,
+      finalUrl
+    }) &&
+    !features.googleSafeBrowsingFlagged &&
+    !features.urlhausFlagged &&
+    !features.virusTotalFlagged &&
+    features.httpsEndpoint &&
+    !features.suspiciousTld &&
+    !features.suspiciousPath &&
+    !features.usernamePasswordTrick &&
+    !features.integrityHashMismatch &&
+    !features.rawIpHost &&
+    !features.suspiciousFileExtension
+  );
+
+  if (!eligible) {
+    return features;
+  }
+
+  return {
+    ...features,
+    suspiciousRedirectPattern: false,
+    shortenerToUnrelatedDomain: false,
+    trackingHopToUnrelatedDomain: false,
+    crossDomainRedirectChain: false,
+    redirectChainToDifferentRegistrantLikeTarget: false,
+    wrapperToExternalDestination: false,
+    textMismatch: false,
+    obfuscatedUrl: false,
+    excessiveQueryComplexity: false,
+    trustedEndpoint: true,
+    trustedEndpointMitigationEligible: true,
+    knownBrandedCampaignRedirect: true
+  };
+}
+
+function applyKnownGoogleFormsRedirectMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
+  const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
+  const finalUrl = endpointResult?.effectiveEndpoint || reusableUrlAnalysis.analysisUrl || "";
+  const rawChain =
+    Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
+      ? endpointResult.resolutionChain
+      : Array.isArray(reusableUrlAnalysis.redirectAnalysis?.redirectChain)
+        ? reusableUrlAnalysis.redirectAnalysis.redirectChain
+        : [];
+  const sourceDomain = getRedirectSourceDomain(rawChain);
+  const isFormsGleRedirect = sourceDomain === "forms.gle";
+  const isGenericShortenerFormsRedirect = Boolean(!isFormsGleRedirect && features.shortenedUrl);
+  const eligible = Boolean(
+    (
+      isKnownGoogleFormsRedirect({
+        endpointResult,
+        redirectAnalysis: reusableUrlAnalysis.redirectAnalysis,
+        finalDomain,
+        finalUrl
+      }) ||
+      (
+        isKnownGoogleFormsFinalEndpoint(finalUrl, finalDomain) &&
+        isGenericShortenerFormsRedirect
+      )
+    ) &&
+    !features.googleSafeBrowsingFlagged &&
+    !features.urlhausFlagged &&
+    !features.virusTotalFlagged &&
+    features.httpsEndpoint &&
+    !features.suspiciousTld &&
+    !features.usernamePasswordTrick &&
+    !features.integrityHashMismatch &&
+    !features.rawIpHost &&
+    !features.suspiciousFileExtension
+  );
+
+  if (!eligible) {
+    return features;
+  }
+
+  return {
+    ...features,
+    suspiciousRedirectPattern: false,
+    shortenerToUnrelatedDomain: false,
+    trackingHopToUnrelatedDomain: false,
+    crossDomainRedirectChain: false,
+    redirectChainToDifferentRegistrantLikeTarget: false,
+    wrapperToExternalDestination: false,
+    textMismatch: false,
+    obfuscatedUrl: false,
+    excessiveQueryComplexity: false,
+    knownGoogleFormsRedirect: true,
+    softExternalFormCaution: true,
+    googleFormsViaGenericShortener: isGenericShortenerFormsRedirect
+  };
+}
+
+function isKnownGoogleFormsFinalEndpoint(finalUrl = "", finalDomain = "") {
+  const domain = getRegistrableDomain(finalDomain || safeHostname(finalUrl));
+  const text = String(finalUrl || "").toLowerCase();
+
+  return (
+    domain === "google.com" &&
+    /docs\.google\.com\/forms\//i.test(text)
+  );
+}
+
+function isKnownGoogleFormsRedirect({ endpointResult = {}, redirectAnalysis = {}, finalDomain = "", finalUrl = "" } = {}) {
+  const rawChain =
+    Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
+      ? endpointResult.resolutionChain
+      : Array.isArray(redirectAnalysis?.redirectChain)
+        ? redirectAnalysis.redirectChain
+        : [];
+  const sourceDomain = getRedirectSourceDomain(rawChain);
+
+  return (
+    sourceDomain === "forms.gle" &&
+    isKnownGoogleFormsFinalEndpoint(finalUrl, finalDomain)
+  );
+}
+
+function applySoftUncertaintyCap(finalScore, {
+  features = {},
+  endpointResult = {},
+  domain = "",
+  providerOverride = false
+} = {}) {
+  let score = Number(finalScore);
+
+  if (!Number.isFinite(score)) {
+    return finalScore;
+  }
+
+  if (providerOverride) {
+    return score;
+  }
+
+  const effectiveDomain = getRegistrableDomain(endpointResult?.effectiveDomain || domain || "");
+  const isMessagingPlatform = isMessagingOrCommunityInviteDomain(effectiveDomain);
+
+  if (score === 100 && isMessagingPlatform) {
+    score = 95;
+  }
+
+  if (score === 100 && features.knownBrandedCampaignRedirect) {
+    score = 95;
+  }
+
+  if (score === 100 && features.knownGoogleFormsRedirect) {
+    score = 90;
+  }
+
+  return score;
+}
+
+function isKnownBrandedCampaignRedirect({ endpointResult = {}, redirectAnalysis = {}, finalDomain = "", finalUrl = "" } = {}) {
+  const rawChain =
+    Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
+      ? endpointResult.resolutionChain
+      : Array.isArray(redirectAnalysis?.redirectChain)
+        ? redirectAnalysis.redirectChain
+        : [];
+  const sourceDomain = getRedirectSourceDomain(rawChain);
+  const normalizedFinalDomain = getRegistrableDomain(finalDomain);
+  const finalText = String(finalUrl || "").toLowerCase();
+
+  for (const rule of KNOWN_BRANDED_CAMPAIGN_REDIRECTS) {
+    if (sourceDomain !== rule.sourceDomain) {
+      continue;
+    }
+
+    if (!rule.allowedFinalDomains.includes(normalizedFinalDomain)) {
+      continue;
+    }
+
+    if (
+      Array.isArray(rule.requiredPathHints) &&
+      rule.requiredPathHints.length > 0 &&
+      !rule.requiredPathHints.some((hint) => finalText.includes(String(hint).toLowerCase()))
+    ) {
+      continue;
+    }
+
+    return true;
+  }
+
+  return false;
 }
 
 function getKnownShortenerOwnerDomain(shortenerDomain) {
@@ -1335,7 +1709,7 @@ function getRedirectSourceDomain(chain = []) {
   return "";
 }
 
-function buildAnalysisLimitations({ endpointResult, providerResults, candidateContext = {} }) {
+function buildAnalysisLimitations({ endpointResult, providerResults, candidateContext = {}, domain = "" }) {
   const limitations = [];
   const safeProviderResults = normalizeProviderResults(providerResults);
   const gsb = safeProviderResults.find((item) => item.provider === "gsb");
@@ -1357,6 +1731,11 @@ function buildAnalysisLimitations({ endpointResult, providerResults, candidateCo
 
   if (!endpointResult?.effectiveEndpoint) {
     limitations.push("DILI could not confidently resolve the final endpoint.");
+  }
+
+  const effectiveDomain = getRegistrableDomain(endpointResult?.effectiveDomain || domain || "");
+  if (isMessagingOrCommunityInviteDomain(effectiveDomain)) {
+    limitations.push("DILI verified the link destination, but it cannot verify the trustworthiness of content inside this messaging or community platform.");
   }
 
   if (
@@ -1414,6 +1793,50 @@ function formatCompactRedirectChainDetail(chain = []) {
   }
 
   return `Redirect chain: ${compactDomains.join(" -> ")} (${hopText}).`;
+}
+
+function isMessagingOrCommunityInviteDomain(domain) {
+  const value = String(domain || "").toLowerCase().replace(/^www\./, "");
+  return [
+    "t.me",
+    "telegram.me",
+    "discord.gg",
+    "discord.com",
+    "whatsapp.com",
+    "wa.me"
+  ].includes(value);
+}
+
+function shouldShowRedirectNoteAfterMitigation(note, features = {}) {
+  const text = String(note || "");
+  const isHarshRedirectWarning =
+    /multiple redirects|hands the user across different domains|commonly seen in deceptive links|different website/i.test(text);
+
+  if (!isHarshRedirectWarning) {
+    return true;
+  }
+
+  const explicitlyMitigated = Boolean(
+    features.knownBrandedCampaignRedirect ||
+    features.knownGoogleFormsRedirect ||
+    features.googleFormsViaGenericShortener ||
+    features.mainstreamResolvedShortlink ||
+    features.knownShortenerOwnerRedirect ||
+    features.softExternalFormCaution ||
+    features.trustedEndpointMitigationEligible
+  );
+
+  if (explicitlyMitigated) {
+    return false;
+  }
+
+  return Boolean(
+    features.suspiciousRedirectPattern ||
+    features.shortenerToUnrelatedDomain ||
+    features.trackingHopToUnrelatedDomain ||
+    features.redirectChainToDifferentRegistrantLikeTarget ||
+    features.crossDomainRedirectChain
+  );
 }
 
 function isFacebookPlatformWrapperUrl(rawUrl) {
@@ -1489,6 +1912,7 @@ function buildTechnicalDetails({ endpointResult = {}, redirectAnalysis = {}, url
   const details = [];
   const effectiveDomain = endpointResult.effectiveDomain || urlFeatureAnalysis.finalDomain || "";
   const candidateContext = analysis.candidateContext || {};
+  const finalFeatures = analysis.features || {};
 const redirectChain =
   redirectAnalysis.redirectChain ||
   endpointResult.resolutionChain ||
@@ -1546,6 +1970,26 @@ if (
     details.push(`Endpoint confidence: ${endpointResult.endpointConfidence}.`);
   }
 
+  if (isMessagingOrCommunityInviteDomain(getRegistrableDomain(effectiveDomain))) {
+    details.push("DILI verified the link destination, but it cannot verify the trustworthiness of content inside this messaging or community platform.");
+  }
+
+  if (finalFeatures.knownBrandedCampaignRedirect) {
+    details.push("Known branded campaign redirect recognized; DILI treated the redirect as lower risk because providers were clean and the final destination matched an expected campaign platform.");
+  }
+
+  if (finalFeatures.knownGoogleFormsRedirect) {
+    details.push("Known Google Forms redirect recognized; DILI treated the redirect as lower risk because providers were clean and the final destination matched docs.google.com/forms.");
+  }
+
+  if (finalFeatures.googleFormsViaGenericShortener) {
+    details.push("Google Forms final endpoint recognized through a generic shortener; DILI treated redirect mechanics as lower risk because providers were clean, but form ownership should still be verified.");
+  }
+
+  if (finalFeatures.softUncertaintyCapApplied) {
+    details.push("Safety score was softly capped because DILI can verify URL reputation, but some destination content remains outside URL-reputation scope.");
+  }
+
   if (analysis.postIntegrityEvent) {
     details.push(`Post integrity event: ${String(analysis.postIntegrityEvent).replace(/_/g, " ")}.`);
   }
@@ -1580,17 +2024,22 @@ if (
 
   for (const note of redirectAnalysis?.notes || []) {
     const text = String(note || "").trim();
-    if (text) {
+    if (text && shouldShowRedirectNoteAfterMitigation(text, finalFeatures)) {
       details.push(text);
     }
   }
 
 const providerLabels = {
   gsb: "Google Safe Browsing",
-  urlhaus: "URLhaus"
+  urlhaus: "URLhaus",
+  virustotal: "VirusTotal"
 };
 
 for (const provider of normalizeProviderResults(providerResults)) {
+  if (provider.provider === "virustotal" && !isVirusTotalResultDisplayRelevant(provider)) {
+    continue;
+  }
+
   if (!provider?.checkedUrl) {
     continue;
   }
@@ -1611,9 +2060,32 @@ for (const provider of normalizeProviderResults(providerResults)) {
   if (Number.isFinite(durationMs)) {
     details.push(`${label} response time: ${durationMs} ms`);
   }
+
+  if (provider.details?.fromCache === true || provider.details?.cacheStatus === "hit") {
+    details.push(`${label} cache: reused recent result.`);
+  }
+
+  if (provider.provider === "virustotal" && auditStatus === "completed") {
+    if (Number.isFinite(Number(provider.details?.maliciousCount))) {
+      details.push(`${label} malicious detections: ${Number(provider.details.maliciousCount)}.`);
+    }
+    if (Number.isFinite(Number(provider.details?.suspiciousCount))) {
+      details.push(`${label} suspicious detections: ${Number(provider.details.suspiciousCount)}.`);
+    }
+  }
 }
   return [...new Set(details)];
 
+}
+
+function isVirusTotalResultDisplayRelevant(provider = {}) {
+  const status = String(provider.details?.status || "").toLowerCase();
+  return Boolean(
+    provider.configured ||
+    provider.checked ||
+    provider.flagged ||
+    ["pending", "rate-limited", "error", "timeout", "parse-error", "checked"].includes(status)
+  );
 }
 
 function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
@@ -1623,8 +2095,9 @@ function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
   const providerResults = normalizeProviderResults(analysis.providerResults || []);
   const gsb = providerResults.find((item) => item.provider === "gsb");
   const urlhaus = providerResults.find((item) => item.provider === "urlhaus");
+  const virusTotal = providerResults.find((item) => item.provider === "virustotal");
 
-  if (gsb?.flagged || urlhaus?.flagged) {
+  if (gsb?.flagged || urlhaus?.flagged || virusTotal?.flagged) {
     return true;
   }
   if (classification.includes("high risk") || classification.includes("suspicious")) {
@@ -1688,6 +2161,12 @@ async function persistPostLevelAnalysis(postId, analysis) {
       normalizedVisiblePostText: analysis.normalizedVisiblePostText,
       safetyScore: analysis.safetyScore,
       classification: analysis.classification,
+      analyzedLinkCount: analysis.analyzedLinkCount,
+      failedLinkCount: analysis.failedLinkCount,
+      multiLinkPost: analysis.multiLinkPost,
+      lowestScoringLinkDomain: analysis.lowestScoringLinkDomain,
+      lowestScoringLinkUrl: analysis.lowestScoringLinkUrl,
+      linkScoreSummary: analysis.linkScoreSummary,
       features: analysis.features,
       providerResults: analysis.providerResults,
       endpointResult: analysis.endpointResult,
@@ -1800,6 +2279,211 @@ function pruneUrlAnalysisCache() {
   }
 }
 
+function clearProviderCaches({ clearUrlAnalysis = false, clearPendingVirusTotal = false } = {}) {
+  providerCacheGeneration += 1;
+  providerResultCache.clear();
+  providerRequestInFlight.clear();
+  if (clearPendingVirusTotal) {
+    virusTotalPendingAnalysisCache.clear();
+  }
+
+  if (clearUrlAnalysis) {
+    urlAnalysisCache.clear();
+  }
+
+  logDebug("Provider cache cleared.");
+}
+
+function getProviderCacheKey(providerName, checkedUrl) {
+  const provider = String(providerName || "").trim().toLowerCase();
+  const url = String(checkedUrl || "").trim();
+  if (!provider || !url) {
+    return "";
+  }
+
+  return `${provider}::${url}`;
+}
+
+function getProviderCacheEntry(providerName, checkedUrl) {
+  pruneProviderResultCache();
+  const cacheKey = getProviderCacheKey(providerName, checkedUrl);
+  if (!cacheKey) {
+    return null;
+  }
+
+  const entry = providerResultCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+
+  if (entry.expiresAt <= Date.now()) {
+    providerResultCache.delete(cacheKey);
+    return null;
+  }
+
+  const ageMs = Math.max(0, Date.now() - Number(entry.cachedAt || Date.now()));
+  const result = cloneProviderResultForCache(entry.providerResult);
+  result.details = {
+    ...(result.details || {}),
+    fromCache: true,
+    cacheAgeMs: ageMs,
+    cacheStatus: "hit"
+  };
+
+  return result;
+}
+
+function setProviderCacheEntry(providerName, checkedUrl, providerResult, ttlMs) {
+  const cacheKey = getProviderCacheKey(providerName, checkedUrl);
+  if (!cacheKey || !providerResult || !ttlMs || ttlMs <= 0) {
+    return;
+  }
+
+  const storedResult = cloneProviderResultForCache(providerResult);
+  storedResult.details = {
+    ...(storedResult.details || {}),
+    fromCache: false,
+    cacheStatus: "stored"
+  };
+
+  const cachedAt = Date.now();
+  providerResultCache.set(cacheKey, {
+    cachedAt,
+    expiresAt: cachedAt + ttlMs,
+    providerResult: storedResult
+  });
+
+  pruneProviderResultCache();
+}
+
+function pruneProviderResultCache() {
+  const now = Date.now();
+
+  for (const [cacheKey, entry] of providerResultCache.entries()) {
+    if (entry.expiresAt <= now) {
+      providerResultCache.delete(cacheKey);
+    }
+  }
+
+  while (providerResultCache.size > PROVIDER_CACHE_MAX_ENTRIES) {
+    const oldestKey = providerResultCache.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    providerResultCache.delete(oldestKey);
+  }
+}
+
+function cloneProviderResultForCache(providerResult) {
+  return cloneValue(providerResult || {});
+}
+
+function getProviderResultCacheTtl(providerResult) {
+  const status = String(providerResult?.details?.status || "").toLowerCase();
+
+  if (!providerResult?.checkedUrl) {
+    return 0;
+  }
+
+  if (status === "not-configured" || status === "skipped") {
+    return 0;
+  }
+
+  if (status === "pending") {
+    return PROVIDER_PENDING_CACHE_TTL_MS;
+  }
+
+  if (status === "error" || status === "timeout" || status === "rate-limited" || status === "parse-error") {
+    return PROVIDER_ERROR_CACHE_TTL_MS;
+  }
+
+  return PROVIDER_RESULT_CACHE_TTL_MS;
+}
+
+async function getCachedOrInFlightProviderResult(providerName, checkedUrl, lookupFn) {
+  const cacheKey = getProviderCacheKey(providerName, checkedUrl);
+  if (!cacheKey) {
+    performanceStats.providerCacheMisses += 1;
+    performanceStats.lastProviderCacheStatus = "miss-invalid-key";
+    return lookupFn();
+  }
+
+  const cachedResult = getProviderCacheEntry(providerName, checkedUrl);
+  if (cachedResult) {
+    performanceStats.providerCacheHits += 1;
+    if (String(cachedResult.details?.status || "").toLowerCase() === "error") {
+      performanceStats.providerErrorCacheHits += 1;
+    }
+    performanceStats.lastProviderCacheStatus = "hit";
+    return cachedResult;
+  }
+
+  performanceStats.providerCacheMisses += 1;
+
+  if (providerRequestInFlight.has(cacheKey)) {
+    performanceStats.providerInFlightJoins += 1;
+    performanceStats.lastProviderCacheStatus = "in-flight-joined";
+    const joinedResult = await providerRequestInFlight.get(cacheKey);
+    const cloned = cloneProviderResultForCache(joinedResult);
+    cloned.details = {
+      ...(cloned.details || {}),
+      fromCache: false,
+      cacheStatus: "in-flight-joined"
+    };
+    return cloned;
+  }
+
+  performanceStats.providerRequestsStarted += 1;
+  performanceStats.lastProviderCacheStatus = "miss-started";
+  const requestGeneration = providerCacheGeneration;
+
+  const requestPromise = Promise.resolve()
+    .then(() => lookupFn())
+    .then((providerResult) => {
+      const result = cloneProviderResultForCache(providerResult);
+      const status = String(result.details?.status || "").toLowerCase();
+      const message = String(result.details?.message || "");
+
+      if (status === "error" || status === "timeout" || status === "rate-limited" || status === "parse-error") {
+        performanceStats.providerRequestsFailed += 1;
+      } else {
+        performanceStats.providerRequestsCompleted += 1;
+      }
+
+      if (status === "timeout" || /abort|timeout|timed out/i.test(message)) {
+        performanceStats.providerTimeouts += 1;
+      }
+
+      const ttlMs = getProviderResultCacheTtl(result);
+      if (requestGeneration === providerCacheGeneration) {
+        setProviderCacheEntry(providerName, checkedUrl, result, ttlMs);
+      }
+      if (ttlMs > 0 && requestGeneration === providerCacheGeneration) {
+        result.details = {
+          ...(result.details || {}),
+          fromCache: false,
+          cacheStatus: "stored"
+        };
+      }
+      return result;
+    })
+    .catch((error) => {
+      performanceStats.providerRequestsFailed += 1;
+      if (/abort|timeout|timed out/i.test(safeErrorMessage(error, ""))) {
+        performanceStats.providerTimeouts += 1;
+      }
+      throw error;
+    })
+    .finally(() => {
+      if (providerRequestInFlight.get(cacheKey) === requestPromise) {
+        providerRequestInFlight.delete(cacheKey);
+      }
+    });
+
+  providerRequestInFlight.set(cacheKey, requestPromise);
+  return requestPromise;
+}
+
 function cloneValue(value) {
   if (value === null || value === undefined) {
     return value;
@@ -1822,8 +2506,9 @@ function stripUrlAnalysisCacheMetadata(entry) {
 }
 async function runThreatIntelligenceChecks(normalizedUrl) {
   const providerTasks = [
-    lookupGoogleSafeBrowsing(normalizedUrl),
-    lookupUrlhaus(normalizedUrl)
+    getCachedOrInFlightProviderResult("gsb", normalizedUrl, () => lookupGoogleSafeBrowsing(normalizedUrl)),
+    getCachedOrInFlightProviderResult("urlhaus", normalizedUrl, () => lookupUrlhaus(normalizedUrl)),
+    getCachedOrInFlightProviderResult("virustotal", normalizedUrl, () => lookupVirusTotalUrl(normalizedUrl))
   ];
 
   const settled = await Promise.allSettled(providerTasks);
@@ -1835,7 +2520,11 @@ async function runThreatIntelligenceChecks(normalizedUrl) {
 
     settled[1].status === "fulfilled"
       ? settled[1].value
-      : createProviderErrorResult("urlhaus", normalizedUrl, settled[1].reason)
+      : createProviderErrorResult("urlhaus", normalizedUrl, settled[1].reason),
+
+    settled[2].status === "fulfilled"
+      ? settled[2].value
+      : createProviderErrorResult("virustotal", normalizedUrl, settled[2].reason)
   ];
 }
 async function lookupGoogleSafeBrowsing(normalizedUrl) {
@@ -1877,7 +2566,7 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
 
   try {
     const endpoint = `https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${encodeURIComponent(key)}`;
-    response = await fetch(endpoint, {
+    response = await fetchWithTimeout(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
@@ -1894,7 +2583,7 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
           threatEntries: [{ url: normalizedUrl }]
         }
       })
-    });
+    }, 4500);
 
     if (!response.ok) {
       const errorMessage = `Safe Browsing lookup returned HTTP ${response.status}.`;
@@ -1954,12 +2643,17 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
       }
     });
   } catch (error) {
+    const isTimeout = error?.name === "AbortError" || /abort|timeout|timed out/i.test(safeErrorMessage(error, ""));
+    const errorMessage = isTimeout
+      ? "Google Safe Browsing request timed out."
+      : safeErrorMessage(error, "Unknown Safe Browsing error.");
+
     updateGsbHealth({
       configured: true,
       available: false,
-      lastStatus: "error",
+      lastStatus: isTimeout ? "timeout" : "error",
       lastHttpStatus: response?.status ?? null,
-      lastError: safeErrorMessage(error, "Unknown Safe Browsing error."),
+      lastError: errorMessage,
       lastCheckedAt: healthCheckedAt
     });
 
@@ -1972,9 +2666,9 @@ async function lookupGoogleSafeBrowsing(normalizedUrl) {
       flagged: false,
       category: null,
       details: {
-        status: "error",
+        status: isTimeout ? "timeout" : "error",
         httpStatus: response?.status ?? null,
-        message: safeErrorMessage(error, "Unknown Safe Browsing error.")
+        message: errorMessage
       }
     });
   }
@@ -2057,6 +2751,557 @@ async function lookupUrlhaus(normalizedUrl) {
       message
     }
   });
+}
+
+async function lookupVirusTotalUrl(normalizedUrl) {
+  const startedAt = performance.now();
+
+  return Promise.race([
+    lookupVirusTotalUrlWithinBudget(normalizedUrl, startedAt),
+    sleep(VIRUSTOTAL_SOFT_DEADLINE_MS).then(() => buildVirusTotalStatusResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt: Date.now(),
+      status: "pending",
+      httpStatus: null,
+      message: "VirusTotal scan submitted or deferred; result pending."
+    }))
+  ]);
+}
+
+async function lookupVirusTotalUrlWithinBudget(normalizedUrl, startedAt = performance.now()) {
+  const config = await getRuntimeConfig();
+  const healthCheckedAt = Date.now();
+  const key = String(config.VIRUSTOTAL_API_KEY || "").trim();
+
+  if (!key) {
+    updateVirusTotalHealth({
+      configured: false,
+      available: true,
+      lastStatus: "off",
+      lastHttpStatus: null,
+      lastError: null,
+      lastCheckedAt: null
+    });
+
+    return withProviderOutcomeSummary({
+      provider: "virustotal",
+      configured: false,
+      checked: false,
+      checkedUrl: normalizedUrl,
+      ...createProviderTelemetry(startedAt),
+      flagged: false,
+      category: null,
+      details: {
+        status: "not-configured",
+        message: "VirusTotal not configured."
+      }
+    });
+  }
+
+  const pendingEntry = getVirusTotalPendingAnalysisEntry(normalizedUrl);
+  if (pendingEntry?.analysisId) {
+    const nowForFollowup = Date.now();
+    const followupWaitMs = VIRUSTOTAL_PENDING_FOLLOWUP_INTERVAL_MS - (nowForFollowup - Number(pendingEntry.lastFollowupAt || 0));
+
+    if (followupWaitMs > 0) {
+      return buildVirusTotalStatusResult({
+        normalizedUrl,
+        startedAt,
+        healthCheckedAt,
+        status: "pending",
+        message: "VirusTotal analysis is still pending.",
+        analysisId: pendingEntry.analysisId
+      });
+    }
+
+    const globalWaitMs = VIRUSTOTAL_MIN_REQUEST_INTERVAL_MS - (nowForFollowup - lastVirusTotalRequestAt);
+    if (globalWaitMs > 0) {
+      return buildVirusTotalStatusResult({
+        normalizedUrl,
+        startedAt,
+        healthCheckedAt,
+        status: "pending",
+        message: "VirusTotal local rate limit active; result pending.",
+        analysisId: pendingEntry.analysisId
+      });
+    }
+
+    lastVirusTotalRequestAt = nowForFollowup;
+    pendingEntry.lastFollowupAt = nowForFollowup;
+
+    const followupResult = await fetchVirusTotalAnalysisResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      key,
+      analysisId: pendingEntry.analysisId,
+      pendingMessage: "VirusTotal analysis is still pending."
+    });
+
+    if (followupResult.details?.status === "checked") {
+      virusTotalPendingAnalysisCache.delete(normalizedUrl);
+    }
+
+    return followupResult;
+  }
+
+  const existingReportResult = await lookupExistingVirusTotalUrlReport({
+    normalizedUrl,
+    startedAt,
+    healthCheckedAt,
+    key
+  });
+
+  if (existingReportResult) {
+    return existingReportResult;
+  }
+
+  const now = Date.now();
+  const waitMs = VIRUSTOTAL_MIN_REQUEST_INTERVAL_MS - (now - lastVirusTotalRequestAt);
+  if (waitMs > 0) {
+    updateVirusTotalHealth({
+      configured: true,
+      available: true,
+      lastStatus: "pending",
+      lastHttpStatus: null,
+      lastError: "Local VirusTotal rate limiter deferred this lookup.",
+      lastCheckedAt: healthCheckedAt
+    });
+
+    return withProviderOutcomeSummary({
+      provider: "virustotal",
+      configured: true,
+      checked: true,
+      checkedUrl: normalizedUrl,
+      ...createProviderTelemetry(startedAt),
+      flagged: false,
+      category: null,
+      details: {
+        status: "pending",
+        httpStatus: null,
+        message: "VirusTotal local rate limit active; result pending."
+      }
+    });
+  }
+
+  lastVirusTotalRequestAt = now;
+
+  try {
+    const submitResponse = await fetchWithTimeout("https://www.virustotal.com/api/v3/urls", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "x-apikey": key
+      },
+      body: new URLSearchParams({ url: normalizedUrl }).toString()
+    }, 5000);
+
+    if (submitResponse.status === 429) {
+      return buildVirusTotalStatusResult({
+        normalizedUrl,
+        startedAt,
+        healthCheckedAt,
+        status: "rate-limited",
+        httpStatus: submitResponse.status,
+        message: "VirusTotal rate limit reached."
+      });
+    }
+
+    if (!submitResponse.ok) {
+      return buildVirusTotalStatusResult({
+        normalizedUrl,
+        startedAt,
+        healthCheckedAt,
+        status: "error",
+        httpStatus: submitResponse.status,
+        message: `VirusTotal URL submission returned HTTP ${submitResponse.status}.`
+      });
+    }
+
+    const submitPayload = await submitResponse.json();
+    const analysisId = String(submitPayload?.data?.id || "").trim();
+
+    if (!analysisId) {
+      return buildVirusTotalStatusResult({
+        normalizedUrl,
+        startedAt,
+        healthCheckedAt,
+        status: "parse-error",
+        httpStatus: submitResponse.status,
+        message: "VirusTotal URL submission did not return an analysis ID."
+      });
+    }
+
+    return fetchVirusTotalAnalysisResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      key,
+      analysisId,
+      pendingMessage: "VirusTotal scan submitted; result pending."
+    });
+  } catch (error) {
+    const isTimeout = error?.name === "AbortError" || /abort|timeout|timed out/i.test(safeErrorMessage(error, ""));
+    return buildVirusTotalStatusResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      status: isTimeout ? "timeout" : "error",
+      httpStatus: null,
+      message: isTimeout
+        ? "VirusTotal verification timed out."
+        : safeErrorMessage(error, "VirusTotal lookup failed.")
+    });
+  }
+}
+
+async function lookupExistingVirusTotalUrlReport({
+  normalizedUrl,
+  startedAt,
+  healthCheckedAt,
+  key
+} = {}) {
+  const urlId = getVirusTotalUrlId(normalizedUrl);
+  if (!urlId) {
+    return buildVirusTotalStatusResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      status: "parse-error",
+      message: "VirusTotal URL identifier could not be generated."
+    });
+  }
+
+  try {
+    const response = await fetchWithTimeout(`https://www.virustotal.com/api/v3/urls/${encodeURIComponent(urlId)}`, {
+      method: "GET",
+      headers: {
+        "x-apikey": key
+      }
+    }, 2200);
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (response.status === 429) {
+      return buildVirusTotalStatusResult({
+        normalizedUrl,
+        startedAt,
+        healthCheckedAt,
+        status: "rate-limited",
+        httpStatus: response.status,
+        message: "VirusTotal rate limit reached."
+      });
+    }
+
+    if (!response.ok) {
+      return buildVirusTotalStatusResult({
+        normalizedUrl,
+        startedAt,
+        healthCheckedAt,
+        status: response.status === 401 || response.status === 403 ? "error" : "timeout",
+        httpStatus: response.status,
+        message: response.status === 401 || response.status === 403
+          ? `VirusTotal URL report lookup returned HTTP ${response.status}.`
+          : "VirusTotal URL report lookup was unavailable."
+      });
+    }
+
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      return buildVirusTotalStatusResult({
+        normalizedUrl,
+        startedAt,
+        healthCheckedAt,
+        status: "parse-error",
+        httpStatus: response.status,
+        message: "VirusTotal returned an unreadable URL report."
+      });
+    }
+
+    const stats = payload?.data?.attributes?.last_analysis_stats;
+    if (!stats || typeof stats !== "object") {
+      return buildVirusTotalStatusResult({
+        normalizedUrl,
+        startedAt,
+        healthCheckedAt,
+        status: "parse-error",
+        httpStatus: response.status,
+        message: "VirusTotal URL report did not include analysis stats."
+      });
+    }
+
+    return buildVirusTotalCheckedResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      httpStatus: response.status,
+      analysisId: "",
+      stats
+    });
+  } catch (error) {
+    const isTimeout = error?.name === "AbortError" || /abort|timeout|timed out/i.test(safeErrorMessage(error, ""));
+    return buildVirusTotalStatusResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      status: isTimeout ? "timeout" : "error",
+      httpStatus: null,
+      message: isTimeout
+        ? "VirusTotal verification timed out."
+        : safeErrorMessage(error, "VirusTotal request failed.")
+    });
+  }
+}
+
+async function fetchVirusTotalAnalysisResult({
+  normalizedUrl,
+  startedAt,
+  healthCheckedAt,
+  key,
+  analysisId,
+  pendingMessage = "VirusTotal scan submitted; result pending."
+} = {}) {
+  const analysisResponse = await fetchWithTimeout(`https://www.virustotal.com/api/v3/analyses/${encodeURIComponent(analysisId)}`, {
+    method: "GET",
+    headers: {
+      "x-apikey": key
+    }
+  }, 2200);
+
+  if (analysisResponse.status === 429) {
+    storeVirusTotalPendingAnalysis(normalizedUrl, analysisId);
+    return buildVirusTotalStatusResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      status: "rate-limited",
+      httpStatus: analysisResponse.status,
+      message: "VirusTotal rate limit reached.",
+      analysisId
+    });
+  }
+
+  if (!analysisResponse.ok) {
+    storeVirusTotalPendingAnalysis(normalizedUrl, analysisId);
+    return buildVirusTotalStatusResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      status: "pending",
+      httpStatus: analysisResponse.status,
+      message: pendingMessage,
+      analysisId
+    });
+  }
+
+  let analysisPayload = null;
+  try {
+    analysisPayload = await analysisResponse.json();
+  } catch {
+    return buildVirusTotalStatusResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      status: "parse-error",
+      httpStatus: analysisResponse.status,
+      message: "VirusTotal returned an unreadable analysis response.",
+      analysisId
+    });
+  }
+
+  const attributes = analysisPayload?.data?.attributes || {};
+  const analysisStatus = String(attributes.status || "").toLowerCase();
+  const stats = attributes.stats || {};
+
+  if (analysisStatus && analysisStatus !== "completed") {
+    storeVirusTotalPendingAnalysis(normalizedUrl, analysisId);
+    return buildVirusTotalStatusResult({
+      normalizedUrl,
+      startedAt,
+      healthCheckedAt,
+      status: "pending",
+      httpStatus: analysisResponse.status,
+      message: pendingMessage,
+      analysisId
+    });
+  }
+
+  virusTotalPendingAnalysisCache.delete(normalizedUrl);
+  return buildVirusTotalCheckedResult({
+    normalizedUrl,
+    startedAt,
+    healthCheckedAt,
+    httpStatus: analysisResponse.status,
+    analysisId,
+    stats
+  });
+}
+
+function buildVirusTotalCheckedResult({
+  normalizedUrl,
+  startedAt,
+  healthCheckedAt,
+  httpStatus = null,
+  analysisId = "",
+  stats = {}
+} = {}) {
+  const maliciousCount = Number(stats.malicious || 0);
+  const suspiciousCount = Number(stats.suspicious || 0);
+  const harmlessCount = Number(stats.harmless || 0);
+  const undetectedCount = Number(stats.undetected || 0);
+  const timeoutCount = Number(stats.timeout || 0);
+  const flagged = maliciousCount > 0 || suspiciousCount > 0;
+
+  updateVirusTotalHealth({
+    configured: true,
+    available: true,
+    lastStatus: flagged ? "flagged" : "ok",
+    lastHttpStatus: httpStatus,
+    lastError: null,
+    lastCheckedAt: healthCheckedAt
+  });
+
+  return withProviderOutcomeSummary({
+    provider: "virustotal",
+    configured: true,
+    checked: true,
+    checkedUrl: normalizedUrl,
+    ...createProviderTelemetry(startedAt),
+    flagged,
+    category: flagged ? "malicious-or-suspicious" : null,
+    details: {
+      status: "checked",
+      httpStatus,
+      message: flagged
+        ? "VirusTotal reported malicious/suspicious detections."
+        : "VirusTotal reported no malicious detections.",
+      analysisId,
+      maliciousCount,
+      suspiciousCount,
+      harmlessCount,
+      undetectedCount,
+      timeoutCount
+    }
+  });
+}
+
+function buildVirusTotalStatusResult({
+  normalizedUrl,
+  startedAt,
+  healthCheckedAt,
+  status,
+  httpStatus = null,
+  message = "",
+  analysisId = ""
+} = {}) {
+  const available = !["error", "timeout", "rate-limited", "parse-error"].includes(status);
+  if (status === "pending" && analysisId) {
+    storeVirusTotalPendingAnalysis(normalizedUrl, analysisId);
+  }
+
+  updateVirusTotalHealth({
+    configured: true,
+    available,
+    lastStatus: status,
+    lastHttpStatus: httpStatus,
+    lastError: available ? null : message,
+    lastCheckedAt: healthCheckedAt
+  });
+
+  return withProviderOutcomeSummary({
+    provider: "virustotal",
+    configured: true,
+    checked: true,
+    checkedUrl: normalizedUrl,
+    ...createProviderTelemetry(startedAt),
+    flagged: false,
+    category: null,
+    details: {
+      status,
+      httpStatus,
+      message,
+      analysisId,
+      maliciousCount: 0,
+      suspiciousCount: 0,
+      harmlessCount: 0,
+      undetectedCount: 0,
+      timeoutCount: 0
+    }
+  });
+}
+
+function getVirusTotalPendingAnalysisEntry(checkedUrl) {
+  const key = String(checkedUrl || "").trim();
+  if (!key) {
+    return null;
+  }
+
+  const entry = virusTotalPendingAnalysisCache.get(key);
+  if (!entry) {
+    return null;
+  }
+
+  if (Number(entry.expiresAt || 0) <= Date.now()) {
+    virusTotalPendingAnalysisCache.delete(key);
+    return null;
+  }
+
+  return entry;
+}
+
+function storeVirusTotalPendingAnalysis(checkedUrl, analysisId) {
+  const key = String(checkedUrl || "").trim();
+  const id = String(analysisId || "").trim();
+  if (!key || !id) {
+    return;
+  }
+
+  const existing = virusTotalPendingAnalysisCache.get(key) || {};
+  const now = Date.now();
+  virusTotalPendingAnalysisCache.set(key, {
+    checkedUrl: key,
+    analysisId: id,
+    submittedAt: Number(existing.submittedAt || now),
+    lastFollowupAt: Number(existing.lastFollowupAt || 0),
+    expiresAt: now + VIRUSTOTAL_PENDING_TTL_MS
+  });
+}
+
+function getVirusTotalUrlId(normalizedUrl = "") {
+  const value = String(normalizedUrl || "").trim();
+  if (!value) {
+    return "";
+  }
+
+  try {
+    const bytes = new TextEncoder().encode(value);
+    let binary = "";
+    const chunkSize = 0x8000;
+
+    for (let index = 0; index < bytes.length; index += chunkSize) {
+      const chunk = bytes.slice(index, index + chunkSize);
+      binary += String.fromCharCode(...chunk);
+    }
+
+    return btoa(binary)
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+  } catch {
+    try {
+      return btoa(unescape(encodeURIComponent(value)))
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+    } catch {
+      return "";
+    }
+  }
 }
 
 async function requestUrlhausLookupWithPublicRetry(normalizedUrl) {
@@ -2368,6 +3613,7 @@ async function ensureActiveSession(reason) {
 }
 async function resetSession(reason, options = {}) {
   const shouldClearRecords = options.clearRecords === true;
+  clearProviderCaches({ clearUrlAnalysis: true, clearPendingVirusTotal: true });
 
   if (shouldClearRecords) {
     await clearAnalysisRecords();
@@ -2440,12 +3686,14 @@ async function getRuntimeConfig() {
     const stored = await chromeStorageGet([
       "dili:config:gsbApiKey",
       "dili:config:urlhausAuthKey",
-      "dili:config:urlhausApiKey"
+      "dili:config:urlhausApiKey",
+      "dili:config:virustotalApiKey"
     ]);
 
     runtimeConfig.GSB_API_KEY = String(stored["dili:config:gsbApiKey"] || GSB_API_KEY || "").trim();
     runtimeConfig.URLHAUS_AUTH_KEY = String(stored["dili:config:urlhausAuthKey"] || URLHAUS_AUTH_KEY || URLHAUS_API_KEY || "").trim();
     runtimeConfig.URLHAUS_API_KEY = String(stored["dili:config:urlhausApiKey"] || URLHAUS_API_KEY || "").trim();
+    runtimeConfig.VIRUSTOTAL_API_KEY = String(stored["dili:config:virustotalApiKey"] || VIRUSTOTAL_API_KEY || "").trim();
     runtimeConfig.configLoaded = true;
     runtimeConfig.configSource = hasStoredProviderConfig(stored) ? "chrome.storage.local" : CONFIG_FILE_NAME;
     runtimeConfig.configError = null;
@@ -2462,10 +3710,33 @@ function createRuntimeConfig() {
     GSB_API_KEY: String(GSB_API_KEY || "").trim(),
     URLHAUS_AUTH_KEY: String(URLHAUS_AUTH_KEY || URLHAUS_API_KEY || "").trim(),
     URLHAUS_API_KEY: String(URLHAUS_API_KEY || "").trim(),
+    VIRUSTOTAL_API_KEY: String(VIRUSTOTAL_API_KEY || "").trim(),
     configLoaded: true,
     configSource: CONFIG_FILE_NAME,
     configError: null
   };
+}
+
+async function getDemoScoreBiasConfig() {
+  try {
+    const stored = await chromeStorageGet([
+      DEMO_SCORE_BIAS_STORAGE_KEY,
+      DEMO_SCORE_BIAS_AMOUNT_STORAGE_KEY
+    ]);
+    const enabled = stored[DEMO_SCORE_BIAS_STORAGE_KEY] === true;
+    const amount = Number(stored[DEMO_SCORE_BIAS_AMOUNT_STORAGE_KEY] ?? 35);
+
+    return {
+      enabled,
+      amount: Number.isFinite(amount) ? Math.max(0, Math.min(100, Math.round(amount))) : 35
+    };
+  } catch (error) {
+    logDebug(`Demo score bias config read failed: ${safeErrorMessage(error, "unknown error")}`);
+    return {
+      enabled: false,
+      amount: 35
+    };
+  }
 }
 
 function chromeStorageGet(keys) {
@@ -2485,7 +3756,8 @@ function hasStoredProviderConfig(stored = {}) {
   return Boolean(
     stored["dili:config:gsbApiKey"] ||
     stored["dili:config:urlhausAuthKey"] ||
-    stored["dili:config:urlhausApiKey"]
+    stored["dili:config:urlhausApiKey"] ||
+    stored["dili:config:virustotalApiKey"]
   );
 }
 
@@ -2512,13 +3784,21 @@ function createInitialProviderHealth() {
       lastError: null,
       lastCheckedAt: null
     },
-    
+    virustotal: {
+      configured: false,
+      available: true,
+      lastStatus: "off",
+      lastHttpStatus: null,
+      lastError: null,
+      lastCheckedAt: null
+    }
   };
 }
 
 function applyConfigDiagnostics(config) {
   const gsbKeyLoaded = Boolean(String(config.GSB_API_KEY || "").trim());
   const urlhausAuthKeyLoaded = Boolean(String(config.URLHAUS_AUTH_KEY || "").trim());
+  const virusTotalKeyLoaded = Boolean(String(config.VIRUSTOTAL_API_KEY || "").trim());
   const configError = config.configLoaded ? null : config.configError || `Unable to load ${CONFIG_FILE_NAME}.`;
 
   providerHealth.configLoaded = Boolean(config.configLoaded);
@@ -2557,6 +3837,19 @@ function applyConfigDiagnostics(config) {
     providerHealth.urlhaus.lastError = null;
   }
 
+  providerHealth.virustotal.configured = virusTotalKeyLoaded;
+  if (!virusTotalKeyLoaded) {
+    providerHealth.virustotal.available = true;
+    providerHealth.virustotal.lastStatus = "off";
+    providerHealth.virustotal.lastHttpStatus = null;
+    providerHealth.virustotal.lastError = null;
+  } else if (providerHealth.virustotal.lastStatus === "off") {
+    providerHealth.virustotal.lastStatus = "not-yet-run";
+    providerHealth.virustotal.lastHttpStatus = null;
+    providerHealth.virustotal.lastError = null;
+    providerHealth.virustotal.available = true;
+  }
+
 }
 
 function updateGsbHealth(patch) {
@@ -2565,6 +3858,10 @@ function updateGsbHealth(patch) {
 
 function updateUrlhausHealth(patch) {
   Object.assign(providerHealth.urlhaus, patch);
+}
+
+function updateVirusTotalHealth(patch) {
+  Object.assign(providerHealth.virustotal, patch);
 }
 
 function getProviderHealthSnapshot() {
@@ -2590,6 +3887,14 @@ function getProviderHealthSnapshot() {
       lastError: providerHealth.urlhaus.lastError,
       lastCheckedAt: providerHealth.urlhaus.lastCheckedAt
     },
+    virustotal: {
+      configured: providerHealth.virustotal.configured,
+      available: providerHealth.virustotal.available,
+      lastStatus: providerHealth.virustotal.lastStatus,
+      lastHttpStatus: providerHealth.virustotal.lastHttpStatus,
+      lastError: providerHealth.virustotal.lastError,
+      lastCheckedAt: providerHealth.virustotal.lastCheckedAt
+    }
   };
 }
 
@@ -2611,6 +3916,11 @@ function buildCompactProviderSummary() {
       label: "URLhaus",
       state: getUrlhausProviderState(snapshot.urlhaus || {}),
       text: formatUrlhausProviderText(snapshot.urlhaus || {})
+    },
+    virustotal: {
+      label: "VT",
+      state: getVirusTotalProviderState(snapshot.virustotal || {}),
+      text: formatVirusTotalProviderText(snapshot.virustotal || {})
     },
   };
 }
@@ -2673,6 +3983,47 @@ function formatUrlhausProviderText(urlhaus = {}) {
   }
 }
 
+function getVirusTotalProviderState(vt = {}) {
+  if (!vt.configured || vt.lastStatus === "off") {
+    return "off";
+  }
+
+  if (vt.lastStatus === "pending") {
+    return "pending";
+  }
+
+  if (vt.lastStatus === "rate-limited") {
+    return "rate-limited";
+  }
+
+  if (["error", "timeout", "parse-error"].includes(vt.lastStatus) || vt.available === false) {
+    return "error";
+  }
+
+  return "ready";
+}
+
+function formatVirusTotalProviderText(vt = {}) {
+  switch (vt.lastStatus) {
+    case "off":
+      return "Off";
+    case "pending":
+      return "Pending";
+    case "rate-limited":
+      return "Rate limited";
+    case "error":
+    case "timeout":
+    case "parse-error":
+      return "Error";
+    case "ok":
+    case "flagged":
+    case "not-yet-run":
+      return "Ready";
+    default:
+      return formatCompactProviderText(getVirusTotalProviderState(vt));
+  }
+}
+
 function getProviderDurationMs(startedAt) {
   const elapsed = performance.now() - Number(startedAt);
   return Number.isFinite(elapsed) ? Math.max(0, Math.round(elapsed)) : null;
@@ -2696,12 +4047,37 @@ function getProviderOutcomeSummary(result = {}) {
   const provider = String(result.provider || "").toLowerCase();
   const status = String(result.details?.status || "").toLowerCase();
 
+  if (provider === "virustotal") {
+    if (!result.configured || status === "not-configured") {
+      return "VirusTotal not configured.";
+    }
+    if (status === "pending") {
+      return "VirusTotal scan submitted; result pending.";
+    }
+    if (status === "rate-limited") {
+      return "VirusTotal rate limit reached.";
+    }
+    if (status === "timeout") {
+      return "VirusTotal verification timed out.";
+    }
+    if (status === "error" || status === "parse-error") {
+      return "VirusTotal request failed.";
+    }
+    return result.flagged
+      ? "VirusTotal reported malicious/suspicious detections."
+      : "VirusTotal reported no malicious detections.";
+  }
+
   if (provider === "urlhaus" && status === "error") {
     return "Lookup unavailable after retry.";
   }
 
   if (provider !== "urlhaus" && (!result.configured || status === "not-configured")) {
     return "Provider not configured.";
+  }
+
+  if (status === "timeout") {
+    return "Verification timed out.";
   }
 
   if (status === "error" || status === "rate-limited" || status === "parse-error") {
@@ -2734,6 +4110,18 @@ function getProviderAuditStatus(result = {}) {
     !result.checked
   ) {
     return "skipped";
+  }
+
+  if (status === "timeout") {
+    return "timeout";
+  }
+
+  if (status === "pending") {
+    return "pending";
+  }
+
+  if (status === "rate-limited") {
+    return "rate-limited";
   }
 
   if (status === "error" || status === "rate-limited" || status === "parse-error") {

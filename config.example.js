@@ -9,3 +9,6 @@ export const URLHAUS_AUTH_TOKEN = "";
 
 // Legacy name used by some builds.
 export const URLHAUS_AUTH_KEY = "";
+
+// Optional enrichment provider. Leave empty to disable.
+export const VIRUSTOTAL_API_KEY = "";

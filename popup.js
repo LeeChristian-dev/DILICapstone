@@ -403,6 +403,15 @@ function logPerformanceDiagnostics(summary = {}) {
       maxProviderMs: bg.maxProviderMs || 0,
       maxStorageMs: bg.maxStorageMs || 0,
       cacheHit: Boolean(bg.lastCacheHit),
+      providerCacheHits: bg.providerCacheHits || 0,
+      providerCacheMisses: bg.providerCacheMisses || 0,
+      providerInFlightJoins: bg.providerInFlightJoins || 0,
+      providerRequestsStarted: bg.providerRequestsStarted || 0,
+      providerRequestsCompleted: bg.providerRequestsCompleted || 0,
+      providerRequestsFailed: bg.providerRequestsFailed || 0,
+      providerTimeouts: bg.providerTimeouts || 0,
+      providerErrorCacheHits: bg.providerErrorCacheHits || 0,
+      lastProviderCacheStatus: bg.lastProviderCacheStatus || "",
       domain: bg.lastAnalyzedDomain || ""
     }
   });
@@ -471,7 +480,7 @@ function renderProviderChips(providerSummary) {
     return;
   }
 
-  const order = ["config", "gsb", "urlhaus"];
+  const order = ["config", "gsb", "urlhaus", "virustotal"];
   for (const key of order) {
     const entry = providerSummary[key];
     if (!entry || typeof entry !== "object") {
@@ -496,7 +505,7 @@ function renderProviderChips(providerSummary) {
 }
 
 function sanitizeProviderStateClass(state) {
-  if (state === "ready" || state === "public" || state === "off" || state === "error") {
+  if (state === "ready" || state === "public" || state === "off" || state === "error" || state === "pending" || state === "rate-limited") {
     return state;
   }
 
@@ -572,6 +581,9 @@ function convertRecordsToCsv(records) {
     "urlHash",
     "safetyScore",
     "classification",
+    "analyzedLinkCount",
+    "lowestScoringLinkDomain",
+    "lowestScoringLinkUrl",
     "gsbStatus",
     "urlhausStatus",
     "gsbConfigured",
@@ -586,6 +598,15 @@ function convertRecordsToCsv(records) {
     "urlhausCheckedAt",
     "urlhausDurationMs",
     "urlhausResultSummary",
+    "vtStatus",
+    "vtConfigured",
+    "vtFlagged",
+    "vtCheckedUrl",
+    "vtCheckedAt",
+    "vtResultSummary",
+    "vtMaliciousCount",
+    "vtSuspiciousCount",
+    "vtAnalysisId",
     "redirectCount",
     "usedShortener",
     "suspiciousTld",
@@ -604,7 +625,11 @@ function convertRecordsToCsv(records) {
   const rows = records.map((record) => {
     const gsb = findProviderResult(record.providerResults, "gsb");
     const urlhaus = findProviderResult(record.providerResults, "urlhaus");
+    const vt = findProviderResult(record.providerResults, "virustotal");
     const features = record.features || {};
+    const analyzedLinkCount =
+      record.analyzedLinkCount ??
+      (Array.isArray(record.linkScoreSummary) ? record.linkScoreSummary.length : "");
     return [
       formatTimestamp(record.timestamp),
       record.postId || "",
@@ -613,6 +638,9 @@ function convertRecordsToCsv(records) {
       record.urlHash || "",
       record.safetyScore ?? "",
       record.classification || "",
+      analyzedLinkCount,
+      record.lowestScoringLinkDomain || "",
+      record.lowestScoringLinkUrl || "",
       gsb?.details?.status ?? "",
       urlhaus?.details?.status ?? "",
       gsb?.configured ?? "",
@@ -627,6 +655,15 @@ function convertRecordsToCsv(records) {
       urlhaus?.checkedAt ?? "",
       urlhaus?.durationMs ?? "",
       urlhaus?.resultSummary || getProviderOutcomeSummary(urlhaus),
+      vt?.details?.status ?? "",
+      vt?.configured ?? "",
+      vt?.flagged ?? "",
+      vt?.checkedUrl ?? "",
+      vt?.checkedAt ?? "",
+      vt?.resultSummary || getProviderOutcomeSummary(vt),
+      vt?.details?.maliciousCount ?? "",
+      vt?.details?.suspiciousCount ?? "",
+      vt?.details?.analysisId ?? "",
       features.redirectCount ?? "",
       features.shortenedUrl ?? "",
       features.suspiciousTld ?? "",
@@ -699,12 +736,37 @@ function getProviderOutcomeSummary(provider = {}) {
   const providerName = String(provider.provider || "").toLowerCase();
   const status = String(provider.details?.status || "").toLowerCase();
 
+  if (providerName === "virustotal") {
+    if (!provider.configured || status === "not-configured") {
+      return "VirusTotal not configured.";
+    }
+    if (status === "pending") {
+      return "VirusTotal scan submitted; result pending.";
+    }
+    if (status === "rate-limited") {
+      return "VirusTotal rate limit reached.";
+    }
+    if (status === "timeout") {
+      return "VirusTotal verification timed out.";
+    }
+    if (status === "error" || status === "parse-error") {
+      return "VirusTotal request failed.";
+    }
+    return provider.flagged
+      ? "VirusTotal reported malicious/suspicious detections."
+      : "VirusTotal reported no malicious detections.";
+  }
+
   if (providerName === "urlhaus" && status === "error") {
     return "Lookup unavailable after retry.";
   }
 
   if (providerName !== "urlhaus" && (!provider.configured || status === "not-configured")) {
     return "Provider not configured.";
+  }
+
+  if (status === "timeout") {
+    return "Verification timed out.";
   }
 
   if (status === "error" || status === "rate-limited" || status === "parse-error") {

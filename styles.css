@@ -524,6 +524,39 @@ html.dili-warning-open body {
   box-shadow: 0 8px 20px rgba(185, 28, 28, 0.22);
 }
 
+.dili-report-instructions {
+  max-width: 720px;
+}
+
+.dili-proceed-confirmation {
+  z-index: 2147483647;
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.76), rgba(15, 23, 42, 0.84)),
+    radial-gradient(circle at top, rgba(185, 28, 28, 0.2), transparent 42%);
+}
+
+.dili-proceed-confirmation .dili-warning-modal {
+  width: min(94vw, 560px);
+  border-color: rgba(127, 29, 29, 0.22);
+}
+
+.dili-proceed-confirmation .dili-warning-actions {
+  justify-content: flex-end;
+}
+
+.dili-report-steps {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.dili-report-steps li {
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 /* ── Responsive ──────────────────────────────────────────────── */
 @media (max-width: 600px) {
   .dili-warning-summary {

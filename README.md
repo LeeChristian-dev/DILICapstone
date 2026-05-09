@@ -112,11 +112,11 @@ DILI computes a **Safety Score** using a subtractive model:
 - `0-39`: **High Risk** — strong warning/interception recommended
 - `Unverified`: DILI could not fully verify the destination; this is independent of suspicious unless other risk signs are also present
 
-**Provider-flagged results:** URLs flagged by Google Safe Browsing or URLhaus are classified as High Risk. Provider errors and rate limits do not directly deduct score points.
+**Provider-flagged results:** URLs flagged by Google Safe Browsing, URLhaus, or optional VirusTotal are classified as High Risk. Provider errors and rate limits do not directly deduct score points.
 
 ### Local domain memory
 
-DILI only stores a local flagged-domain memory when an external provider, such as Google Safe Browsing or URLhaus, flags the destination. Heuristic-only High Risk results do not permanently flag a domain.
+DILI only stores a local flagged-domain memory when an external provider, such as Google Safe Browsing, URLhaus, or optional VirusTotal, flags the destination. Heuristic-only High Risk results do not permanently flag a domain.
 
 Clearing session logs also clears local flagged-domain records so test runs are not contaminated by earlier false positives.
 
@@ -143,7 +143,7 @@ The popup shows:
 - **Current tab context** (Facebook vs unsupported / non-scannable URLs)
 - **Session stats:** current page candidates, current page analyses, visible panels, total compact analyses in storage
 - **Session started** timestamp (when the background session began)
-- **Provider chips:** config readiness, Google Safe Browsing, and URLhaus compact status
+- **Provider chips:** config readiness, Google Safe Browsing, URLhaus, and optional VirusTotal compact status
 - **Recent activity** list (latest stored analyses)
 - Action buttons:
 - Export CSV
@@ -181,6 +181,15 @@ Each row includes:
 - `urlhausCheckedAt`
 - `urlhausDurationMs`
 - `urlhausResultSummary`
+- `vtStatus`
+- `vtConfigured`
+- `vtFlagged`
+- `vtCheckedUrl`
+- `vtCheckedAt`
+- `vtResultSummary`
+- `vtMaliciousCount`
+- `vtSuspiciousCount`
+- `vtAnalysisId`
 - `redirectCount`
 - `usedShortener`
 - `suspiciousTld`
@@ -197,7 +206,7 @@ Each row includes:
 
 ## Provider Verification Evidence
 
-DILI records compact verification evidence for Google Safe Browsing and URLhaus:
+DILI records compact verification evidence for Google Safe Browsing, URLhaus, and optional VirusTotal:
 
 - checked URL
 - provider outcome
@@ -208,13 +217,23 @@ This evidence is shown in Technical Details and included in CSV/report exports t
 
 Provider telemetry is informational only. It does not directly affect Safety Score deductions, classification thresholds, or warning/interception decisions.
 
+## Provider Result Cache
+
+DILI caches Google Safe Browsing, URLhaus, and optional VirusTotal results per checked endpoint for a short time during a session. This reduces duplicate provider calls, improves panel speed, and lowers quota pressure when multiple posts resolve to the same URL.
+
+Cached provider results preserve their original `checkedAt` timestamp and do not change Safety Score rules. The provider cache is cleared when session logs are cleared, the session is restarted, or provider keys change.
+
+DILI may apply conservative false-positive mitigation for explicitly mapped branded campaign redirectors when providers are clean and the final destination matches the expected campaign platform. This does not apply to unknown shorteners or provider-flagged links.
+
 ## Provider Caveats
 
 - Google Safe Browsing requires an API key and is subject to quota and provider policies.
 - Google Safe Browsing remains DILI's primary phishing and social-engineering threat provider.
+- Google Safe Browsing and URLhaus requests use short timeouts so provider delays do not block the rest of the analysis.
 - URLhaus is malware-oriented telemetry, not a complete phishing verdict.
 - URLhaus may run in authenticated or public mode. If authenticated mode fails, DILI attempts a public lookup fallback.
 - URLhaus lookup failures do not automatically reduce the Safety Score.
+- VirusTotal is an optional enrichment provider. It is disabled by default, quota-sensitive, cached/rate-limited, and does not reduce Safety Score when unavailable, pending, or rate-limited. A positive malicious/suspicious VirusTotal result can escalate a URL to High Risk.
 - External lookups can fail due to network, CORS, quota, authentication, or endpoint changes. DILI logs failures and continues with local heuristics.
 - PhishTank was deprecated from active checks because its API behavior is unreliable for direct browser-extension use.
 
@@ -229,8 +248,16 @@ Provider telemetry is informational only. It does not directly affect Safety Sco
 ## Current Limitations
 
 - Facebook DOM changes frequently. Selectors in `content.js` may require periodic tuning.
-- DILI analyzes up to eight meaningful external hyperlinks per post and uses the lowest-scoring successful link as the post result.
+- DILI analyzes up to eight meaningful external links per post. For safety, the post-level result follows the lowest-scoring successful link rather than an average, so one risky link cannot be hidden by several safe links. When multiple links are analyzed, the panel shows how many links were found and which link determined the post result.
 - Redirect analysis remains best-effort and cannot guarantee complete redirect-chain visibility in all cases.
+- Known owner shortlinks such as `youtu.be` -> `youtube.com` are treated as lower-risk when providers are clean and the resolved endpoint matches the expected owner domain, but they are not exempt from provider flags or stronger warning signs.
+- Technical Details are grouped into readable sections. Provider checked URLs and final endpoint evidence remain visible, while advanced audit data is kept in an expanded subsection to reduce clutter.
+- DILI checks URL structure, redirect behavior, and provider reputation. It does not verify the legitimacy of claims inside external messaging groups, community channels, or pages that require joining or logging in, such as Telegram or Discord invites.
+- Messaging/community invite links may receive a normal Safe classification when provider checks are clean, but DILI may softly cap perfect scores because it cannot verify group/channel content, future messages, members, or claims inside the platform. This soft cap is not a provider flag and does not mean the URL is malicious.
+- DILI pauses navigation for Suspicious or High Risk links. Clicking Proceed anyway opens a second confirmation dialog before the destination is opened. DILI does not automatically report posts to Facebook; it provides instructions for using Facebook's built-in report menu and choosing the closest available report reason.
+- Facebook's report flow varies between normal posts and ads. Users may see options such as Report post, Find support or report post, Report ad, Scam/Fraud/Impersonation, Spam, False information, or related subcategories; choose the closest available reason shown by Facebook.
+- Plain email addresses are not treated as destination links unless Facebook exposes them as actual clickable links.
+- Known Google Forms redirects, including generic shorteners that resolve to `docs.google.com/forms`, may be reduced from High Risk when providers are clean, but users should still verify the form owner before submitting information.
 - Service worker lifecycle affects session counters in popup; historical logs remain in storage.
 
 ## Manual Follow-Up Required
@@ -240,3 +267,55 @@ Provider telemetry is informational only. It does not directly affect Safety Sco
 - `icons/icon48.png`
 - `icons/icon128.png`
 - Configure real provider credentials in `chrome.storage.local`, not in committed files.
+
+## Optional VirusTotal Enrichment
+
+VirusTotal is off unless an API key is configured. It supplements Google Safe Browsing and URLhaus; it does not replace them. It is quota-sensitive and rate-limited, so it may initially show as pending. DILI first checks for an existing VirusTotal URL report when possible. If no report exists, DILI may submit the URL for analysis. DILI stores the returned VirusTotal analysis ID in memory and may follow up on later rescans instead of repeatedly submitting the same URL.
+
+Clearing session logs does not necessarily clear pending VirusTotal analysis IDs unless provider configuration changes or the session is fully reset. Pending, timeout, error, and rate-limited VirusTotal states do not reduce Safety Score. Positive malicious/suspicious VirusTotal detections can escalate a URL to High Risk. Do not use demo score bias during real provider accuracy testing.
+
+Enable VirusTotal:
+
+```js
+chrome.storage.local.set({
+  "dili:config:virustotalApiKey": "YOUR_VIRUSTOTAL_API_KEY",
+});
+```
+
+Disable VirusTotal:
+
+```js
+chrome.storage.local.remove([
+  "dili:config:virustotalApiKey",
+]);
+```
+
+## Debug/Test Mode
+
+Temporary demo score bias is disabled by default and should only be used for warning-modal testing. Adjusted results are labeled as DEMO MODE and keep the original score visible.
+
+Enable demo score bias:
+
+```js
+chrome.storage.local.set({
+  "dili:debug:scoreBiasEnabled": true,
+  "dili:debug:scoreBiasAmount": 60,
+});
+```
+
+Disable demo score bias:
+
+```js
+chrome.storage.local.set({
+  "dili:debug:scoreBiasEnabled": false,
+});
+```
+
+Clear debug settings:
+
+```js
+chrome.storage.local.remove([
+  "dili:debug:scoreBiasEnabled",
+  "dili:debug:scoreBiasAmount",
+]);
+```

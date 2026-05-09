@@ -10,6 +10,7 @@ const PROTECTED_KEYS = new Set([
   "dili:config:gsbApiKey",
   "dili:config:urlhausAuthKey",
   "dili:config:urlhausApiKey",
+  "dili:config:virustotalApiKey",
   "dili:scan:enabled"
 ]);
 
@@ -279,6 +280,12 @@ function compactPersistentRecord(record = {}) {
     score: normalizeScore(record.score ?? record.safetyScore),
     safetyScore: normalizeScore(record.safetyScore ?? record.score),
     classification: clampText(record.classification || ""),
+    analyzedLinkCount: Number(record.analyzedLinkCount || 0),
+    failedLinkCount: Number(record.failedLinkCount || 0),
+    multiLinkPost: record.multiLinkPost === true || Number(record.analyzedLinkCount || 0) > 1,
+    lowestScoringLinkDomain: clampText(record.lowestScoringLinkDomain || ""),
+    lowestScoringLinkUrl: clampText(record.lowestScoringLinkUrl || ""),
+    linkScoreSummary: compactLinkScoreSummary(record.linkScoreSummary),
     endpointConfidence: clampText(record.endpointConfidence || endpointResult.endpointConfidence || ""),
     baselineState: clampText(record.baselineState || ""),
     hadLinkAtBaseline: record.hadLinkAtBaseline === true,
@@ -291,6 +298,7 @@ function compactPersistentRecord(record = {}) {
     mainRiskReasons: clampList(record.mainRiskReasons || extractMainReasons(record.deductions), 8),
     limitations: clampList(limitations, 8),
     domainChain: clampList(record.domainChain || chainToDomains(record.redirectAnalysis?.redirectChain || endpointResult.resolutionChain), 8),
+    features: compactFeatureFlags(features),
     providerResults: compactProviderResults(providerResults),
     providerOverride: Boolean(record.providerOverride),
     candidateSource: clampText(record.candidateSource || record.candidateContext?.candidateSource || ""),
@@ -318,6 +326,22 @@ function compactPersistentRecord(record = {}) {
     lastSeenAt: Number(record.lastSeenAt || record.lastChecked || record.timestamp || Date.now()),
     state: clampText(record.state || "")
   };
+}
+
+function compactLinkScoreSummary(summary = []) {
+  if (!Array.isArray(summary)) {
+    return [];
+  }
+
+  return summary
+    .slice(0, 8)
+    .map((item, index) => ({
+      index: Number(item?.index || index + 1),
+      domain: clampText(item?.domain || safeHostname(item?.url || ""), 120),
+      url: clampText(item?.url || "", 220),
+      safetyScore: Number.isFinite(Number(item?.safetyScore)) ? Number(item.safetyScore) : null,
+      classification: clampText(item?.classification || "", 60)
+    }));
 }
 
 function isDuplicateAnalysisRecord(existing, next) {
@@ -409,6 +433,42 @@ function clampText(value, maxLength = STORED_TEXT_LIMIT) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
 }
+
+function compactFeatureFlags(features = {}) {
+  return {
+    redirectCount: Number(features.redirectCount || 0),
+    shortenedUrl: features.shortenedUrl === true,
+    suspiciousTld: features.suspiciousTld === true,
+    obfuscatedUrl: features.obfuscatedUrl === true,
+    textMismatch: features.textMismatch === true,
+    integrityHashMismatch: features.integrityHashMismatch === true,
+    suspiciousRedirectPattern: features.suspiciousRedirectPattern === true,
+    crossDomainRedirectChain: features.crossDomainRedirectChain === true,
+    shortenerToUnrelatedDomain: features.shortenerToUnrelatedDomain === true,
+    trackingHopToUnrelatedDomain: features.trackingHopToUnrelatedDomain === true,
+    usernamePasswordTrick: features.usernamePasswordTrick === true,
+    suspiciousPath: features.suspiciousPath === true,
+    providerOverride: features.providerOverride === true,
+    virusTotalFlagged: features.virusTotalFlagged === true,
+    domainPreviouslyFlagged: features.domainPreviouslyFlagged === true,
+    mainstreamResolvedShortlink: features.mainstreamResolvedShortlink === true,
+    knownShortenerOwnerRedirect: features.knownShortenerOwnerRedirect === true,
+    knownBrandedCampaignRedirect: features.knownBrandedCampaignRedirect === true,
+    knownGoogleFormsRedirect: features.knownGoogleFormsRedirect === true,
+    googleFormsViaGenericShortener: features.googleFormsViaGenericShortener === true,
+    softExternalFormCaution: features.softExternalFormCaution === true,
+    trustedEndpointMitigationEligible: features.trustedEndpointMitigationEligible === true,
+    softUncertaintyCapApplied: features.softUncertaintyCapApplied === true,
+    demoScoreBiasApplied: features.demoScoreBiasApplied === true,
+    originalSafetyScore: Number.isFinite(Number(features.originalSafetyScore))
+      ? Number(features.originalSafetyScore)
+      : null,
+    demoScoreBiasAmount: Number.isFinite(Number(features.demoScoreBiasAmount))
+      ? Number(features.demoScoreBiasAmount)
+      : null
+  };
+}
+
 function compactProviderResults(providerResults) {
   if (!Array.isArray(providerResults)) {
     return [];
@@ -430,7 +490,13 @@ function compactProviderResults(providerResults) {
       mode: clampText(item?.details?.mode || ""),
       message: clampText(item?.details?.message || "", 300),
       queryStatus: clampText(item?.details?.queryStatus || ""),
-      matchesCount: Number(item?.details?.matchesCount || 0)
+      matchesCount: Number(item?.details?.matchesCount || 0),
+      analysisId: clampText(item?.details?.analysisId || "", 160),
+      maliciousCount: Number(item?.details?.maliciousCount || 0),
+      suspiciousCount: Number(item?.details?.suspiciousCount || 0),
+      harmlessCount: Number(item?.details?.harmlessCount || 0),
+      undetectedCount: Number(item?.details?.undetectedCount || 0),
+      timeoutCount: Number(item?.details?.timeoutCount || 0)
     }
   }));
 }

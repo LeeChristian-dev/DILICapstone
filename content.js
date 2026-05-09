@@ -56,6 +56,29 @@
   ];
 const DOMAIN_TEXT_PATTERN =
   /\b(?:www\.)?[a-z0-9][a-z0-9.-]*\.(?:academy|agency|ai|app|biz|click|cloud|co|com|dev|edu|finance|gov|info|io|me|net|online|org|ph|shop|site|store|xyz)\b/i;
+
+function isDomainPartOfEmail(text, domain, matchIndex = -1) {
+  const source = String(text || "");
+  const value = String(domain || "").toLowerCase();
+
+  if (!source || !value) {
+    return false;
+  }
+
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const emailPattern = new RegExp(`\\b[A-Z0-9._%+-]+@${escaped}\\b`, "i");
+
+  if (emailPattern.test(source)) {
+    return true;
+  }
+
+  if (matchIndex > 0 && source[matchIndex - 1] === "@") {
+    return true;
+  }
+
+  return false;
+}
+
   const CTA_TEXT_PATTERNS = [
     /\bsign up\b/i,
     /\bclaim now\b/i,
@@ -830,8 +853,9 @@ function shouldShowWarningModal(analysis) {
 
   const gsb = findProviderResult(analysis.providerResults, "gsb");
   const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
+  const vt = findProviderResult(analysis.providerResults, "virustotal");
 
-  if (gsb?.flagged || urlhaus?.flagged) {
+  if (gsb?.flagged || urlhaus?.flagged || vt?.flagged) {
     return true;
   }
 
@@ -942,8 +966,9 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
   function buildWarningReasons(analysis) {
     const reasons = [];
     const features = analysis?.features || {};
-    const gsb = findProviderResult(analysis?.providerResults, "gsb");
-    const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
+  const gsb = findProviderResult(analysis?.providerResults, "gsb");
+  const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
+  const vt = findProviderResult(analysis?.providerResults, "virustotal");
     const redirectCount = Number(analysis?.redirectAnalysis?.redirectCount ?? features.redirectCount ?? 0);
 
     if (gsb?.flagged) {
@@ -952,6 +977,10 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
 
     if (urlhaus?.flagged) {
       reasons.push("URLhaus flagged this destination as suspicious or malicious.");
+    }
+
+    if (vt?.flagged) {
+      reasons.push("VirusTotal reported malicious or suspicious detections for this destination.");
     }
 
     if (features.domainPreviouslyFlagged) {
@@ -1000,10 +1029,11 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
   function buildWarningExplanation(analysis) {
     const gsb = findProviderResult(analysis?.providerResults, "gsb");
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
+    const vt = findProviderResult(analysis?.providerResults, "virustotal");
     const classification = String(analysis?.classification || "").toLowerCase();
     const score = Number(analysis?.safetyScore);
 
-    if (gsb?.flagged || urlhaus?.flagged) {
+    if (gsb?.flagged || urlhaus?.flagged || vt?.flagged) {
       return "DILI paused navigation because this destination was flagged by a threat-intelligence provider and may expose you to phishing, malware, or other unsafe behavior.";
     }
 
@@ -1069,7 +1099,7 @@ const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain"; 
     const kickerText = modalConfig.kicker || "DILI Link Warning";
     const reportCopyText =
       modalConfig.reportCopy ||
-      "If this post looks malicious or deceptive, you can copy a structured report before deciding what to do next.";
+      "DILI cannot report posts to Facebook automatically. Use Facebook's built-in reporting menu if you want to report this post.";
     const reasonItems = (reasons || [])
       .map((reason) => `<li>${escapeHtml(reason)}</li>`)
       .join("");
@@ -1115,13 +1145,12 @@ const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain"; 
             <h3>Report this post</h3>
             <p class="dili-warning-report-copy">${escapeHtml(reportCopyText)}</p>
             <p class="dili-warning-report-status" data-role="report-status"></p>
-            <textarea class="dili-warning-report-preview" data-role="report-preview" readonly hidden></textarea>
           </div>
         </div>
 
         <div class="dili-warning-actions">
           <button type="button" class="dili-warning-button dili-warning-button-secondary" data-action="stay">Stay on Facebook</button>
-          <button type="button" class="dili-warning-button dili-warning-button-neutral" data-action="report">Copy report</button>
+          <button type="button" class="dili-warning-button dili-warning-button-neutral" data-action="report-instructions">How to report this post</button>
           <button type="button" class="dili-warning-button dili-warning-button-danger" data-action="proceed">Proceed anyway</button>
         </div>
 
@@ -1135,55 +1164,44 @@ const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain"; 
     });
 
     const statusNode = overlay.querySelector("[data-role='report-status']");
-    const previewNode = overlay.querySelector("[data-role='report-preview']");
     const stayButton = overlay.querySelector("[data-action='stay']");
-    const reportButton = overlay.querySelector("[data-action='report']");
+    const reportInstructionsButton = overlay.querySelector("[data-action='report-instructions']");
     const proceedButton = overlay.querySelector("[data-action='proceed']");
 
     stayButton?.addEventListener("click", () => {
       closeWarningModal();
     });
 
-    reportButton?.addEventListener("click", async () => {
-    const reportPayload = buildReportPayload(
-    clickContext,
-    analysis,
-    safeDestinationUrl,
-    reasons,
-    modalConfig.reportPayloadOverrides
-  );      
-  const reportText = formatReportText(reportPayload);
-
-      if (previewNode instanceof HTMLTextAreaElement) {
-        previewNode.hidden = false;
-        previewNode.value = reportText;
-      }
-
-      const copied = await copyReportToClipboard(reportText);
-      if (copied) {
-        if (statusNode) {
-          statusNode.textContent = "Report details copied. Paste them into your reporting workflow or share them with an admin.";
-        }
-        return;
-      }
-
-      downloadReportFile(reportText, reportPayload);
-      if (statusNode) {
-        statusNode.textContent = "Clipboard access was unavailable, so DILI downloaded the report as a text file instead.";
-      }
+    reportInstructionsButton?.addEventListener("click", () => {
+      showReportInstructionsPopup({
+        clickContext,
+        analysis,
+        destinationUrl: safeDestinationUrl
+      });
     });
 
 proceedButton?.addEventListener("click", () => {
   if (!navigationDestinationUrl) {
     if (statusNode) {
       statusNode.textContent =
-        "DILI could not find a valid destination URL to open. Stay on Facebook or copy the report instead.";
+        "DILI could not find a valid destination URL to open. Stay on Facebook instead.";
     }
     return;
   }
 
-  closeWarningModal({ restoreFocus: false });
-  continueNavigation(navigationDestinationUrl, clickContext.intent);
+  showProceedConfirmationPopup({
+    destinationUrl: navigationDestinationUrl,
+    clickContext,
+    onCancel: () => {
+      if (proceedButton instanceof HTMLElement) {
+        proceedButton.focus();
+      }
+    },
+    onConfirm: () => {
+      closeWarningModal({ restoreFocus: false });
+      continueNavigation(navigationDestinationUrl, clickContext.intent);
+    }
+  });
 });
 
     clickWarningState.keydownHandler = (event) => {
@@ -1199,6 +1217,156 @@ proceedButton?.addEventListener("click", () => {
 
     if (stayButton instanceof HTMLElement) {
       stayButton.focus();
+    }
+  }
+
+  function showReportInstructionsPopup({ clickContext, analysis, destinationUrl }) {
+    const focusTarget = clickContext?.anchor instanceof HTMLElement ? clickContext.anchor : clickWarningState.focusTarget;
+    closeWarningModal({ restoreFocus: false });
+
+    document.documentElement.classList.add("dili-warning-open");
+
+    const overlay = document.createElement("div");
+    overlay.className = "dili-warning-overlay";
+    overlay.dataset.diliOwned = "true";
+    overlay.innerHTML = `
+      <div class="dili-warning-modal dili-report-instructions" role="dialog" aria-modal="true" aria-labelledby="dili-report-instructions-title">
+        <div class="dili-warning-header">
+          <div class="dili-warning-header-left">
+            <span class="dili-warning-kicker">Facebook Reporting</span>
+            <h2 id="dili-report-instructions-title">How to report this post or ad on Facebook</h2>
+            <p>DILI cannot submit reports to Facebook automatically. Use Facebook's built-in report menu.</p>
+          </div>
+        </div>
+
+        <div class="dili-warning-body">
+          <div class="dili-warning-section">
+            <h3>Report through Facebook</h3>
+            <ol class="dili-report-steps">
+              <li>Close this DILI message.</li>
+              <li>On the Facebook post or ad, click the three-dot menu.</li>
+              <li>Choose "Report post," "Find support or report post," "Report ad," or the closest wording Facebook shows.</li>
+              <li>For suspicious links or deceptive offers, choose the closest available category. Facebook may show options such as "Scam, fraud or impersonation," "Fraud or scam," "Impersonation," or "Spam."</li>
+              <li>If Facebook asks for a subcategory, choose the closest match, such as "Financial or identity scam," "Misleading product or service," or "Fake advertiser."</li>
+              <li>Some options, such as "Spam," may submit the report directly without another subcategory.</li>
+              <li>Submit the report through Facebook's prompts.</li>
+            </ol>
+            <p class="dili-warning-report-copy">Do not open the link while reporting. Use the post/ad menu instead.</p>
+          </div>
+        </div>
+
+        <div class="dili-warning-actions">
+          <button type="button" class="dili-warning-button dili-warning-button-secondary" data-action="back-to-post">Back to post</button>
+        </div>
+      </div>
+    `;
+
+    function closeReportInstructions() {
+      overlay.remove();
+      document.documentElement.classList.remove("dili-warning-open");
+      document.removeEventListener("keydown", handleReportKeydown, true);
+
+      if (focusTarget instanceof HTMLElement && document.contains(focusTarget)) {
+        focusTarget.focus();
+      }
+    }
+
+    function handleReportKeydown(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeReportInstructions();
+      }
+    }
+
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) {
+        closeReportInstructions();
+      }
+    });
+
+    overlay.querySelector("[data-action='back-to-post']")?.addEventListener("click", closeReportInstructions);
+    document.addEventListener("keydown", handleReportKeydown, true);
+    document.body.appendChild(overlay);
+
+    const backButton = overlay.querySelector("[data-action='back-to-post']");
+    if (backButton instanceof HTMLElement) {
+      backButton.focus();
+    }
+  }
+
+  function showProceedConfirmationPopup({ destinationUrl, clickContext, onCancel, onConfirm }) {
+    const safeDestination = normalizeNavigationCandidate(destinationUrl);
+    const overlay = document.createElement("div");
+    overlay.className = "dili-warning-overlay dili-proceed-confirmation";
+    overlay.dataset.diliOwned = "true";
+
+    const bodyText = safeDestination
+      ? "DILI recommends staying on Facebook unless you are certain this destination is legitimate. Opening this link may expose you to phishing, malware, scams, or deceptive pages if the warning is correct."
+      : "DILI could not find a valid destination URL to open.";
+
+    overlay.innerHTML = `
+      <div class="dili-warning-modal" role="dialog" aria-modal="true" aria-labelledby="dili-proceed-confirm-title">
+        <div class="dili-warning-header">
+          <div class="dili-warning-header-left">
+            <span class="dili-warning-kicker">Confirm Navigation</span>
+            <h2 id="dili-proceed-confirm-title">Are you sure you want to open this link?</h2>
+            <p>${escapeHtml(bodyText)}</p>
+          </div>
+        </div>
+
+        <div class="dili-warning-actions">
+          <button type="button" class="dili-warning-button dili-warning-button-secondary" data-action="cancel-proceed">Cancel</button>
+          <button type="button" class="dili-warning-button dili-warning-button-danger" data-action="confirm-proceed"${safeDestination ? "" : " disabled"}>Yes, open link</button>
+        </div>
+      </div>
+    `;
+
+    function closeProceedConfirmation({ confirmed = false } = {}) {
+      overlay.remove();
+      document.removeEventListener("keydown", handleProceedKeydown, true);
+
+      if (!confirmed && typeof onCancel === "function") {
+        onCancel();
+      }
+    }
+
+    function handleProceedKeydown(event) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeProceedConfirmation();
+      }
+    }
+
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) {
+        closeProceedConfirmation();
+      }
+    });
+
+    overlay.querySelector("[data-action='cancel-proceed']")?.addEventListener("click", () => {
+      closeProceedConfirmation();
+    });
+
+    overlay.querySelector("[data-action='confirm-proceed']")?.addEventListener("click", () => {
+      if (!safeDestination) {
+        return;
+      }
+
+      closeProceedConfirmation({ confirmed: true });
+      if (typeof onConfirm === "function") {
+        onConfirm();
+      } else {
+        closeWarningModal({ restoreFocus: false });
+        continueNavigation(safeDestination, clickContext?.intent);
+      }
+    });
+
+    document.addEventListener("keydown", handleProceedKeydown, true);
+    document.body.appendChild(overlay);
+
+    const cancelButton = overlay.querySelector("[data-action='cancel-proceed']");
+    if (cancelButton instanceof HTMLElement) {
+      cancelButton.focus();
     }
   }
 
@@ -1227,10 +1395,12 @@ proceedButton?.addEventListener("click", () => {
   function buildReportPayload(clickContext, analysis, destinationUrl, reasons, overrides = {}) {
     const gsb = findProviderResult(analysis?.providerResults, "gsb");
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
+    const vt = findProviderResult(analysis?.providerResults, "virustotal");
     const features = analysis?.features || {};
     const providerFlags = overrides.providerFlags || {
       googleSafeBrowsing: Boolean(gsb?.flagged),
-      urlhaus: Boolean(urlhaus?.flagged)
+      urlhaus: Boolean(urlhaus?.flagged),
+      virustotal: Boolean(vt?.flagged)
     };
 
     return {
@@ -1247,7 +1417,8 @@ proceedButton?.addEventListener("click", () => {
       providerFlags,
       providerEvidence: overrides.providerEvidence || {
         gsb: buildProviderReportEvidence(gsb),
-        urlhaus: buildProviderReportEvidence(urlhaus)
+        urlhaus: buildProviderReportEvidence(urlhaus),
+        virustotal: buildProviderReportEvidence(vt)
       },
       integrityMismatch: overrides.integrityMismatch !== undefined ? Boolean(overrides.integrityMismatch) : Boolean(features.integrityHashMismatch),
       redirectCount: overrides.redirectCount !== undefined ? Number(overrides.redirectCount || 0) : Number(analysis?.redirectAnalysis?.redirectCount ?? features.redirectCount ?? 0),
@@ -1264,6 +1435,7 @@ proceedButton?.addEventListener("click", () => {
     const providerEvidence = payload.providerEvidence || {};
     const gsbEvidence = providerEvidence.gsb || {};
     const urlhausEvidence = providerEvidence.urlhaus || {};
+    const vtEvidence = providerEvidence.virustotal || {};
 
     return [
       "DILI Suspicious Link Report",
@@ -1288,6 +1460,10 @@ proceedButton?.addEventListener("click", () => {
       `URLhaus result: ${urlhausEvidence.resultSummary || "Unavailable"}`,
       `URLhaus checked at: ${urlhausEvidence.checkedAt || "Unavailable"}`,
       `URLhaus response time: ${Number.isFinite(Number(urlhausEvidence.durationMs)) ? `${Number(urlhausEvidence.durationMs)} ms` : "Unavailable"}`,
+      `VirusTotal flagged: ${payload.providerFlags?.virustotal ? "Yes" : "No"}`,
+      `VirusTotal checked URL: ${vtEvidence.checkedUrl || "Unavailable"}`,
+      `VirusTotal result: ${vtEvidence.resultSummary || "Unavailable"}`,
+      `VirusTotal checked at: ${vtEvidence.checkedAt || "Unavailable"}`,
       `Integrity mismatch detected: ${payload.integrityMismatch ? "Yes" : "No"}`,
       `Redirect count: ${payload.redirectCount ?? 0}`,
       `Analysis state: ${payload.analysisState || ""}`,
@@ -2209,8 +2385,12 @@ function findVisibleDomainFallbackCandidates(post) {
   }
 
   const domainMatches = [...text.matchAll(new RegExp(DOMAIN_TEXT_PATTERN.source, "gi"))]
-    .map((match) => String(match[0] || "").toLowerCase())
-    .filter(Boolean);
+    .map((match) => ({
+      domain: String(match[0] || "").toLowerCase(),
+      index: Number(match.index ?? -1)
+    }))
+    .filter(({ domain, index }) => domain && !isDomainPartOfEmail(text, domain, index))
+    .map(({ domain }) => domain);
 
   const postHasClearDestinationIntent = hasClearDestinationIntent(post, text);
 
@@ -2369,8 +2549,13 @@ if (isInsidePostHeaderArea(element, post)) {
     const cardHasClearDestinationIntent = hasClearDestinationIntent(card, cardText);
 
     const domainMatches = [...cardText.matchAll(new RegExp(DOMAIN_TEXT_PATTERN.source, "gi"))]
-      .map((match) => String(match[0] || "").toLowerCase())
-      .filter((domain) => domain && !isIgnoredVisibleDomain(domain))
+      .map((match) => ({
+        domain: String(match[0] || "").toLowerCase(),
+        index: Number(match.index ?? -1)
+      }))
+      .filter(({ domain, index }) => domain && !isDomainPartOfEmail(cardText, domain, index))
+      .map(({ domain }) => domain)
+      .filter((domain) => !isIgnoredVisibleDomain(domain))
       .filter((domain) => {
         if (!isLikelyImageAttributionDomain(domain)) {
           return true;
@@ -2728,7 +2913,12 @@ function collectVisibleDomains(post) {
   const text = removeHeaderTextFromRenderedText(post, extractRenderedVisibleText(post));
   return new Set(
     [...text.matchAll(new RegExp(DOMAIN_TEXT_PATTERN.source, "gi"))]
-      .map((match) => getRegistrableDomain(String(match[0] || "").toLowerCase()))
+      .map((match) => ({
+        domain: String(match[0] || "").toLowerCase(),
+        index: Number(match.index ?? -1)
+      }))
+      .filter(({ domain, index }) => domain && !isDomainPartOfEmail(text, domain, index))
+      .map(({ domain }) => getRegistrableDomain(domain))
       .filter(Boolean)
   );
 }
@@ -3903,16 +4093,51 @@ function renderPanelReportSections(report = {}) {
     .map((reason) => `<li>${escapeHtml(reason)}</li>`)
     .join("");
 
+  const multiLinkItems = (report.linkScoreSummary || [])
+    .slice(0, 8)
+    .map((item, index) => {
+      const domain = item.domain || safeHostname(item.url) || `Link ${index + 1}`;
+      const classification = item.classification || "Unknown";
+      const score = Number.isFinite(Number(item.safetyScore)) ? Number(item.safetyScore) : "unscored";
+      return `<li>${escapeHtml(`${item.index || index + 1}. ${domain} - ${classification}, ${score}`)}</li>`;
+    })
+    .join("");
+
   const verificationItems = (report.verificationNotes || [])
     .map((note) => `<li>${escapeHtml(note)}</li>`)
     .join("");
 
-  const technicalItems = (report.technicalDetails || [])
-    .map((detail) => `<li>${escapeHtml(detail)}</li>`)
+  const technicalGroups = Array.isArray(report.technicalGroups) && report.technicalGroups.length > 0
+    ? report.technicalGroups
+    : buildTechnicalDetailGroups(report.technicalDetails || []);
+  const technicalGroupHtml = technicalGroups
+    .map((group) => {
+      const items = (group.items || [])
+        .map((detail) => `<li>${escapeHtml(detail)}</li>`)
+        .join("");
+
+      if (!items) {
+        return "";
+      }
+
+      if (group.advanced) {
+        return `
+          <details class="dili-technical-details dili-advanced-audit-details">
+            <summary>${escapeHtml(group.title || "Show advanced audit details")}</summary>
+            <ul class="dili-detail-list">${items}</ul>
+          </details>
+        `;
+      }
+
+      return `
+        <p><strong>${escapeHtml(group.title || "Technical details")}:</strong></p>
+        <ul class="dili-detail-list">${items}</ul>
+      `;
+    })
     .join("");
 
   const technicalSectionHtml =
-    verificationItems || technicalItems
+    verificationItems || technicalGroupHtml
       ? `
         <details class="dili-technical-details">
           <summary>Show technical details</summary>
@@ -3927,12 +4152,7 @@ function renderPanelReportSections(report = {}) {
           }
 
           ${
-            technicalItems
-              ? `
-                <p><strong>Technical details:</strong></p>
-                <ul class="dili-detail-list">${technicalItems}</ul>
-              `
-              : ""
+            technicalGroupHtml
           }
         </details>
       `
@@ -3945,6 +4165,16 @@ function renderPanelReportSections(report = {}) {
       <p><strong>What DILI checked:</strong> ${escapeHtml(
         report.checkedLine || "DILI checked the link and its final destination."
       )}</p>
+
+      ${
+        report.multiLinkNote
+          ? `
+            <p><strong>Multiple links:</strong> ${escapeHtml(report.multiLinkNote)}</p>
+            ${report.lowestScoringLinkDomain ? `<p><strong>Lowest-scoring link shown:</strong> ${escapeHtml(report.lowestScoringLinkDomain)}.</p>` : ""}
+            ${multiLinkItems ? `<p><strong>Analyzed links:</strong></p><ul class="dili-detail-list">${multiLinkItems}</ul>` : ""}
+          `
+          : ""
+      }
 
       <p><strong>Why DILI gave this result:</strong></p>
       <ul class="dili-detail-list">
@@ -3962,6 +4192,50 @@ function renderPanelReportSections(report = {}) {
 function buildPlainResultLine(classification, score, finalDomain) {
   const scoreText = Number.isFinite(score) ? ` with a safety score of ${score}` : "";
   return `${classification}${scoreText} for ${finalDomain}.`;
+}
+
+function buildTechnicalDetailGroups(details = []) {
+  const groups = [
+    { key: "verification", title: "Verification evidence", items: [] },
+    { key: "endpoint", title: "Endpoint and redirect evidence", items: [] },
+    { key: "limitations", title: "Limitations / caveats", items: [] },
+    { key: "advanced", title: "Show advanced audit details", items: [], advanced: true }
+  ];
+
+  const seen = new Set();
+  for (const detail of Array.isArray(details) ? details : []) {
+    const text = String(detail || "").trim();
+    if (!text || seen.has(text)) {
+      continue;
+    }
+
+    seen.add(text);
+    groups.find((group) => group.key === classifyTechnicalDetailGroup(text))?.items.push(text);
+  }
+
+  return groups.filter((group) => group.items.length > 0);
+}
+
+function classifyTechnicalDetailGroup(text) {
+  const value = String(text || "");
+
+  if (/^(Google Safe Browsing|URLhaus|VirusTotal) (checked URL|result|status|malicious detections|suspicious detections):/i.test(value)) {
+    return "verification";
+  }
+
+  if (
+    /^(Visible post URL\/text|Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Facebook wrapper unwrapped)/i.test(value)
+  ) {
+    return "endpoint";
+  }
+
+  if (
+    /DILI verified|Google Forms|visible-domain|Endpoint source note|Provider scan scope|Full endpoint extraction status|Click-time note|not configured|timed out|public mode|could not|limited|limitation|fallback|No full path/i.test(value)
+  ) {
+    return "limitations";
+  }
+
+  return "advanced";
 }
 
   function mapAnalysisToViewModel(analysis) {
@@ -4014,6 +4288,16 @@ detailsSummary: buildInlineDetailsSummary(
   }
 
   function buildEndUserRecommendation(analysis = {}, severityLevel = "unverified") {
+    const finalDomain =
+      analysis.endpointResult?.effectiveDomain ||
+      analysis.urlFeatureAnalysis?.finalDomain ||
+      safeHostname(analysis.analysisUrl) ||
+      "";
+
+    if (isMessagingOrCommunityInviteDomain(finalDomain)) {
+      return "You can open this link, but verify the group, sender, and any instructions before sharing personal information, payment details, or account credentials.";
+    }
+
     if (severityLevel === "safe") {
       return "You can open this link normally, but still avoid entering passwords or payment information unless you trust the site.";
     }
@@ -4093,14 +4377,37 @@ function buildPanelReportSections(analysis = {}) {
   const reasons = buildEndUserRiskReasons(analysis, severityLevel);
   const verificationNotes = buildEndUserVerificationNotes(analysis);
   const technicalDetails = buildTechnicalDetails(analysis);
+  const analyzedLinkCount = Number(analysis.analyzedLinkCount || 0);
+  const linkScoreSummary = Array.isArray(analysis.linkScoreSummary)
+    ? analysis.linkScoreSummary
+    : Array.isArray(analysis.linkAnalyses)
+      ? analysis.linkAnalyses.map((item, index) => ({
+          index: index + 1,
+          url: item.analysisUrl || item.normalizedUrl || "",
+          domain: item.domain || safeHostname(item.analysisUrl || item.normalizedUrl) || "",
+          safetyScore: item.safetyScore,
+          classification: item.classification
+        }))
+      : [];
+  const multiLinkPost = analysis.multiLinkPost === true || analyzedLinkCount > 1 || linkScoreSummary.length > 1;
+  const lowestScoringLinkDomain =
+    analysis.lowestScoringLinkDomain ||
+    finalDomain ||
+    "";
 
   return {
     resultLine: buildPlainResultLine(classification, analysis.safetyScore, finalDomain),
     checkedLine: `DILI checked where the link starts and where it finally leads. The clicked/visible link appears to be ${originalDomain}, and the final site appears to be ${finalDomain}.`,
+    multiLinkNote: multiLinkPost
+      ? `DILI found and analyzed ${analyzedLinkCount || linkScoreSummary.length} links in this post. The post result follows the lowest-scoring link so one risky link cannot be hidden by safer links.`
+      : "",
+    lowestScoringLinkDomain: multiLinkPost ? lowestScoringLinkDomain : "",
+    linkScoreSummary: multiLinkPost ? linkScoreSummary.slice(0, 8) : [],
     reasons,
     recommendation: buildEndUserRecommendation(analysis, severityLevel),
     verificationNotes,
-    technicalDetails
+    technicalDetails,
+    technicalGroups: buildTechnicalDetailGroups(technicalDetails)
   };
 }
 
@@ -4212,9 +4519,15 @@ function getHostnameFromUrlOrDomainText(value) {
 function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
   const features = analysis.features || {};
   const reasons = [];
+  const finalDomain =
+    analysis.endpointResult?.effectiveDomain ||
+    analysis.urlFeatureAnalysis?.finalDomain ||
+    safeHostname(analysis.analysisUrl) ||
+    "";
 
   const gsb = findProviderResult(analysis.providerResults, "gsb");
   const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
+  const vt = findProviderResult(analysis.providerResults, "virustotal");
 
   if (gsb?.flagged) {
     reasons.push("Google Safe Browsing flagged this destination as unsafe.");
@@ -4224,23 +4537,38 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
     reasons.push("URLhaus flagged this destination as suspicious or malicious.");
   }
 
+  if (vt?.flagged) {
+    reasons.push("VirusTotal reported malicious or suspicious detections for this destination.");
+  }
+
+  if (features.demoScoreBiasApplied) {
+    const originalScore = Number.isFinite(Number(features.originalSafetyScore))
+      ? Number(features.originalSafetyScore)
+      : "unavailable";
+    reasons.push(`DEMO MODE: DILI lowered this score for warning-modal testing. Original score: ${originalScore}.`);
+  }
+
   if (features.integrityHashMismatch || analysis.linkInsertedAfterBaseline) {
     reasons.push("The link appears to have changed after DILI first observed the post.");
   }
 
-  if (features.shortenedUrl) {
+  if (features.shortenedUrl && !features.knownBrandedCampaignRedirect) {
     reasons.push("The link uses a shortened URL, so the final website is hidden at first.");
   }
 
-  if (features.shortenerToUnrelatedDomain || features.crossDomainRedirectChain) {
+  if (
+    !features.knownBrandedCampaignRedirect &&
+    !features.knownGoogleFormsRedirect &&
+    (features.shortenerToUnrelatedDomain || features.crossDomainRedirectChain)
+  ) {
     reasons.push("The link redirects to a different website before reaching the final destination.");
   }
 
-  if (features.textMismatch) {
+  if (!features.knownBrandedCampaignRedirect && !features.knownGoogleFormsRedirect && features.textMismatch) {
     reasons.push("The visible link text does not match the final website.");
   }
 
-  if (features.obfuscatedUrl) {
+  if (!features.knownBrandedCampaignRedirect && !features.knownGoogleFormsRedirect && features.obfuscatedUrl) {
     reasons.push("The URL contains encoded or unusual text that can make the destination harder to read.");
   }
 
@@ -4250,6 +4578,26 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
 
   if (features.domainPreviouslyFlagged) {
     reasons.push("This website was previously marked during an earlier DILI scan.");
+  }
+
+  if (isMessagingOrCommunityInviteDomain(finalDomain)) {
+    reasons.push("DILI verified the URL reputation, but it cannot assess messages, members, claims, or future content inside this messaging platform.");
+  }
+
+  if (
+    features.knownBrandedCampaignRedirect &&
+    !gsb?.flagged &&
+    !urlhaus?.flagged
+  ) {
+    reasons.push("The link uses a known branded campaign redirect, and configured threat checks did not report the final destination as unsafe.");
+  }
+
+  if (
+    features.knownGoogleFormsRedirect &&
+    !gsb?.flagged &&
+    !urlhaus?.flagged
+  ) {
+    reasons.push("The link opens a Google Form. DILI checked the form URL reputation, but users should verify the form owner before submitting personal information.");
   }
 
   if (reasons.length === 0) {
@@ -4265,19 +4613,60 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
   return [...new Set(reasons)].slice(0, 4);
 }
 
+function isMessagingOrCommunityInviteDomain(domain) {
+  const value = String(domain || "").toLowerCase().replace(/^www\./, "");
+  return [
+    "t.me",
+    "telegram.me",
+    "discord.gg",
+    "discord.com",
+    "whatsapp.com",
+    "wa.me"
+  ].includes(value);
+}
+
 function getProviderOutcomeSummary(provider = {}) {
   const providerName = String(provider.provider || "").toLowerCase();
   const status = String(provider.details?.status || "").toLowerCase();
 
-  if (!provider.configured || status === "not-configured") {
+  if (providerName === "virustotal") {
+    if (!provider.configured || status === "not-configured") {
+      return "VirusTotal not configured.";
+    }
+    if (status === "pending") {
+      return "VirusTotal scan submitted; result pending.";
+    }
+    if (status === "rate-limited") {
+      return "VirusTotal rate limit reached.";
+    }
+    if (status === "timeout") {
+      return "VirusTotal verification timed out.";
+    }
+    if (status === "error" || status === "parse-error") {
+      return "VirusTotal request failed.";
+    }
+    return provider.flagged
+      ? "VirusTotal reported malicious/suspicious detections."
+      : "VirusTotal reported no malicious detections.";
+  }
+
+  if (providerName === "urlhaus" && status === "error") {
+    return "Lookup unavailable after retry.";
+  }
+
+  if (providerName !== "urlhaus" && (!provider.configured || status === "not-configured")) {
     return "Provider not configured.";
+  }
+
+  if (status === "timeout") {
+    return "Verification timed out.";
   }
 
   if (status === "error" || status === "rate-limited" || status === "parse-error") {
     return "Request failed.";
   }
 
-  if (!provider.checked || status === "skipped") {
+  if (!provider.checked || status === "skipped" || status === "not-configured") {
     return "Provider not configured.";
   }
 
@@ -4293,10 +4682,28 @@ function getProviderOutcomeSummary(provider = {}) {
 }
 
 function getProviderAuditStatus(provider = {}) {
+  const providerName = String(provider.provider || "").toLowerCase();
   const status = String(provider.details?.status || "").toLowerCase();
 
-  if (!provider.configured || status === "not-configured" || status === "skipped" || !provider.checked) {
+  if (
+    (providerName !== "urlhaus" && !provider.configured) ||
+    status === "not-configured" ||
+    status === "skipped" ||
+    !provider.checked
+  ) {
     return "skipped";
+  }
+
+  if (status === "timeout") {
+    return "timeout";
+  }
+
+  if (status === "pending") {
+    return "pending";
+  }
+
+  if (status === "rate-limited") {
+    return "rate-limited";
   }
 
   if (status === "error" || status === "rate-limited" || status === "parse-error") {
@@ -4314,7 +4721,21 @@ function pushProviderVerificationNote(notes, provider, providerName) {
   const providerKey = String(provider.provider || "").toLowerCase();
   const status = String(provider.details?.status || "").toLowerCase();
 
-  if (!provider.configured || status === "not-configured" || status === "skipped") {
+  if (
+    (providerKey !== "urlhaus" && !provider.configured) ||
+    status === "not-configured" ||
+    status === "skipped"
+  ) {
+    return;
+  }
+
+  if (status === "timeout") {
+    notes.push(`${providerName} verification timed out during this scan.`);
+    return;
+  }
+
+  if (status === "pending") {
+    notes.push(`${providerName} scan was submitted; the provider result is still pending.`);
     return;
   }
 
@@ -4329,6 +4750,11 @@ function pushProviderVerificationNote(notes, provider, providerName) {
       return;
     }
 
+    if (providerKey === "virustotal") {
+      notes.push("VirusTotal reported malicious or suspicious detections for this link.");
+      return;
+    }
+
     notes.push("URLhaus reported known malware activity for this link.");
     return;
   }
@@ -4339,17 +4765,40 @@ function pushProviderVerificationNote(notes, provider, providerName) {
       return;
     }
 
+    if (providerKey === "virustotal") {
+      notes.push("VirusTotal reported no malicious detections for this link.");
+      return;
+    }
+
     notes.push("URLhaus did not report known malware activity for this link.");
   }
+}
+
+function isVirusTotalDisplayRelevant(provider = {}) {
+  if (!provider || typeof provider !== "object") {
+    return false;
+  }
+
+  const status = String(provider.details?.status || "").toLowerCase();
+  return Boolean(
+    provider.configured ||
+    provider.checked ||
+    provider.flagged ||
+    ["pending", "rate-limited", "error", "timeout", "parse-error", "checked"].includes(status)
+  );
 }
 
 function buildEndUserVerificationNotes(analysis = {}) {
   const notes = [];
   const gsb = findProviderResult(analysis.providerResults, "gsb");
   const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
+  const vt = findProviderResult(analysis.providerResults, "virustotal");
 
   pushProviderVerificationNote(notes, gsb, "Google Safe Browsing");
   pushProviderVerificationNote(notes, urlhaus, "URLhaus");
+  if (isVirusTotalDisplayRelevant(vt)) {
+    pushProviderVerificationNote(notes, vt, "VirusTotal");
+  }
 
   for (const limitation of analysis.limitations || []) {
     const text = String(limitation || "");
@@ -4364,7 +4813,12 @@ function buildEndUserVerificationNotes(analysis = {}) {
       continue;
     }
 
-    if (/urlhaus/i.test(text)) {
+    if (/urlhaus was checked in public mode/i.test(text)) {
+      notes.push("URLhaus was checked in public mode for this scan.");
+      continue;
+    }
+
+    if (/urlhaus public lookup was unavailable|urlhaus lookup returned an error|urlhaus verification could not be completed/i.test(text)) {
       notes.push("URLhaus verification could not be completed during this scan.");
       continue;
     }
@@ -4643,16 +5097,21 @@ function buildTechnicalDetails(analysis = {}) {
 
   const providerLabels = {
     gsb: "Google Safe Browsing",
-    urlhaus: "URLhaus"
+    urlhaus: "URLhaus",
+    virustotal: "VirusTotal"
   };
 
   for (const provider of analysis.providerResults || []) {
+    const providerName = String(provider?.provider || "").toLowerCase();
+    if (providerName === "virustotal" && !isVirusTotalDisplayRelevant(provider)) {
+      continue;
+    }
+
     if (!provider?.checkedUrl) {
       continue;
     }
 
-    const providerName = String(provider.provider || "").toLowerCase();
-    if (providerName !== "gsb" && providerName !== "urlhaus") {
+    if (providerName !== "gsb" && providerName !== "urlhaus" && providerName !== "virustotal") {
       continue;
     }
 
@@ -4671,6 +5130,23 @@ function buildTechnicalDetails(analysis = {}) {
 
     if (Number.isFinite(durationMs)) {
       pushUniqueTechnicalDetail(details, `${label} response time: ${durationMs} ms`);
+    }
+
+    if (provider.details?.fromCache === true || provider.details?.cacheStatus === "hit") {
+      pushUniqueTechnicalDetail(details, `${label} cache: reused recent result.`);
+    }
+
+    if (providerName === "virustotal" && auditStatus === "completed") {
+      const maliciousCount = Number(provider.details?.maliciousCount);
+      const suspiciousCount = Number(provider.details?.suspiciousCount);
+
+      if (Number.isFinite(maliciousCount)) {
+        pushUniqueTechnicalDetail(details, `${label} malicious detections: ${maliciousCount}.`);
+      }
+
+      if (Number.isFinite(suspiciousCount)) {
+        pushUniqueTechnicalDetail(details, `${label} suspicious detections: ${suspiciousCount}.`);
+      }
     }
   }
 
@@ -4700,8 +5176,21 @@ function buildTechnicalDetails(analysis = {}) {
     pushUniqueTechnicalDetail(details, `Current post text hash: ${analysis.currentPostTextHash}.`);
   }
 
+  if (analysis.features?.demoScoreBiasApplied) {
+    const amount = Number(analysis.features.demoScoreBiasAmount);
+    pushUniqueTechnicalDetail(
+      details,
+      `Demo score bias applied: -${Number.isFinite(amount) ? amount : "unknown"} points. This is not a real provider verdict.`
+    );
+  }
+
   for (const note of analysis.redirectAnalysis?.notes || []) {
-    if (!isNormalWrapperText(note)) {
+    const text = String(note || "").trim();
+    if (
+      text &&
+      !isNormalWrapperText(text) &&
+      shouldShowRedirectNoteAfterMitigation(text, analysis.features || {})
+    ) {
       pushUniqueTechnicalDetail(details, note);
     }
   }
@@ -4726,6 +5215,38 @@ function buildTechnicalDetails(analysis = {}) {
 
   function isNormalWrapperText(text) {
     return /facebook wrapper concealed|wrapper concealed an external destination|facebook wrapper unwrapped|facebook or tracking wrapper concealed/i.test(String(text || ""));
+  }
+
+  function shouldShowRedirectNoteAfterMitigation(note, features = {}) {
+    const text = String(note || "");
+    const isHarshRedirectWarning =
+      /multiple redirects|hands the user across different domains|commonly seen in deceptive links|different website/i.test(text);
+
+    if (!isHarshRedirectWarning) {
+      return true;
+    }
+
+    const explicitlyMitigated = Boolean(
+      features.knownBrandedCampaignRedirect ||
+      features.knownGoogleFormsRedirect ||
+      features.googleFormsViaGenericShortener ||
+      features.mainstreamResolvedShortlink ||
+      features.knownShortenerOwnerRedirect ||
+      features.softExternalFormCaution ||
+      features.trustedEndpointMitigationEligible
+    );
+
+    if (explicitlyMitigated) {
+      return false;
+    }
+
+    return Boolean(
+      features.suspiciousRedirectPattern ||
+      features.shortenerToUnrelatedDomain ||
+      features.trackingHopToUnrelatedDomain ||
+      features.redirectChainToDifferentRegistrantLikeTarget ||
+      features.crossDomainRedirectChain
+    );
   }
 
   function formatIntegrityEventLabel(value) {
@@ -5510,12 +6031,47 @@ function isForbiddenPanelMountSurface(element, owningPost) {
     return true;
   }
 
+  if (isUnsafePanelMountTarget(element, owningPost)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isUnsafePanelMountTarget(element, owningPost) {
+  if (!(element instanceof Element) || !(owningPost instanceof Element)) {
+    return true;
+  }
+
   if (isElementInsideUnsafeClickableSurface(element, owningPost)) {
     return true;
   }
 
+  if (
+    isLikelyActionBarOrControlContainer(element) ||
+    isLikelyCommentOrReplyContainer(element) ||
+    isInsideNestedSharedStory(element, owningPost)
+  ) {
+    return true;
+  }
+
   const forbiddenAncestor = element.closest(
-    'a[href], [data-url], [data-lynx-uri], [role="link"], [role="button"], [data-ad-preview]:not([data-ad-preview="message"]), [data-ad-comet-preview]:not([data-ad-comet-preview="message"])'
+    [
+      "a[href]",
+      "button",
+      "[data-url]",
+      "[data-lynx-uri]",
+      '[role="link"]',
+      '[role="button"]',
+      "img",
+      "video",
+      "picture",
+      "canvas",
+      "svg",
+      '[data-visualcompletion="media-vc-image"]',
+      '[data-ad-preview]:not([data-ad-preview="message"])',
+      '[data-ad-comet-preview]:not([data-ad-comet-preview="message"])'
+    ].join(",")
   );
 
   return Boolean(
@@ -6006,15 +6562,23 @@ if (
     }
   }
 
-  // Final assertion: if Facebook DOM still placed this inside a clickable/card
+// Final assertion: if Facebook DOM still placed this inside a clickable/card
   // surface, force the slot to the top-level post container.
 if (isForbiddenPanelMountSurface(slot, post)) {
   scanStatus.panelUnsafeRelocated += 1;
 
-  const fallbackPoint = {
-    parent: post,
-    beforeNode: post.firstElementChild || null
-  };
+  console.debug("[DILI] Relocated unsafe panel mount target to top-level post slot.");
+
+  const preferredFallbackPoint = getSafePanelFallbackPoint(post);
+  const fallbackPoint =
+    preferredFallbackPoint?.parent instanceof Element &&
+    post.contains(preferredFallbackPoint.parent) &&
+    !isForbiddenPanelMountSurface(preferredFallbackPoint.parent, post)
+      ? preferredFallbackPoint
+      : {
+          parent: post,
+          beforeNode: post.firstElementChild || null
+        };
 
   if (fallbackPoint.beforeNode instanceof Node) {
     fallbackPoint.parent.insertBefore(slot, fallbackPoint.beforeNode);
