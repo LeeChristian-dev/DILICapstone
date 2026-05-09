@@ -10,10 +10,13 @@
   "permissions": [
     "storage",
     "activeTab",
-    "scripting"
+    "scripting",
+    "webNavigation"
   ],
   "host_permissions": [
     "https://*.facebook.com/*",
+    "http://*/*",
+    "https://*/*",
     "https://safebrowsing.googleapis.com/*",
     "https://urlhaus-api.abuse.ch/*"
   ],
