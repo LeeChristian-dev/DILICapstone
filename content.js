@@ -13,6 +13,7 @@
   const MESSAGE_TYPES = {
     ANALYZE_LINK: "DILI_ANALYZE_LINK",
     REANALYZE_LINK: "DILI_REANALYZE_LINK",
+    REFRESH_VIRUSTOTAL_RESULT: "DILI_REFRESH_VIRUSTOTAL_RESULT",
     GET_POST_STATE: "DILI_GET_POST_STATE",
     SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
     GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
@@ -162,6 +163,12 @@ const UNSAFE_PANEL_ANCESTOR_SELECTOR =
   const latestRequestByPostId = new Map();
   const cachedPanelByPostId = new Map();
   const noLinkRescanCountsByPostId = new Map();
+  const recentlyRenderedPanelByPostId = new Map();
+  const pendingVirusTotalRefreshByPostId = new Map();
+  const pendingVirusTotalRefreshAttemptsByPostId = new Map();
+  const VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS = [30000, 60000];
+  const COMPLETED_PANEL_RENDER_COOLDOWN_MS = 30 * 1000;
+  let manualRescanBypassUntil = 0;
 const NO_LINK_PANEL_REMOVAL_CONFIRMATION_COUNT = 3;
   const clickAnalysisCache = new Map();
 const CLICK_ANALYSIS_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -251,6 +258,10 @@ const scanStatus = {
   visibleDomainCandidatesFound: 0,
   sponsoredFallbackCandidatesFound: 0,
   hiddenFullUrlCandidatesFound: 0,
+  unchangedPostAnalysisSkippedCooldown: 0,
+  fallbackSuppressedBecauseFullUrlExists: 0,
+  fallbackUsedNoFullUrlExposed: 0,
+  vtRefreshSkippedAlreadyCompleted: 0,
 
   // P1 diagnostics: panel mount behavior
   panelMountFallbackUsed: 0,
@@ -1519,6 +1530,7 @@ proceedButton?.addEventListener("click", () => {
       return;
     }
 
+    manualRescanBypassUntil = Date.now() + COMPLETED_PANEL_RENDER_COOLDOWN_MS;
     scanAndQueueVisiblePosts(document);
     console.debug("[DILI] Manual re-scan requested from popup.");
   }
@@ -1978,13 +1990,35 @@ async function processPost(post) {
     baseline?.hadLinkAtBaseline === false ||
     baseline?.postTextHash
   );
+  const linkFingerprint = linkInfo.linkFingerprint;
+
+  if (
+    !isManualRescanCooldownBypassActive() &&
+    !isVirusTotalRefreshDueForBaseline(baseline, postId) &&
+    shouldSkipUnchangedPostAnalysisForCooldown({
+      postId,
+      signature,
+      linkFingerprint,
+      postTextHash: postTextSnapshot.postTextHash,
+      post: owningPost
+    })
+  ) {
+    scanStatus.unchangedPostAnalysisSkippedCooldown += 1;
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "unchanged-post-analysis-skipped-cooldown",
+      postId,
+      signature,
+      linkFingerprint,
+      timestamp: Date.now()
+    };
+    return;
+  }
 
   const messageType = hasPriorBaseline
     ? MESSAGE_TYPES.REANALYZE_LINK
     : MESSAGE_TYPES.ANALYZE_LINK;
 
   const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const linkFingerprint = linkInfo.linkFingerprint;
 
   latestRequestByPostId.set(postId, {
     requestId,
@@ -2148,6 +2182,51 @@ async function processPost(post) {
   scanStatus.perfLastPostMs = postMs;
   recordMaxScanStatusValue("perfMaxPostMs", postMs);
 }
+
+function isManualRescanCooldownBypassActive() {
+  return Date.now() < Number(manualRescanBypassUntil || 0);
+}
+
+function shouldSkipUnchangedPostAnalysisForCooldown({
+  postId,
+  signature,
+  linkFingerprint,
+  postTextHash,
+  post
+} = {}) {
+  const recent = recentlyRenderedPanelByPostId.get(postId);
+  if (!recent || Date.now() - Number(recent.renderedAt || 0) > COMPLETED_PANEL_RENDER_COOLDOWN_MS) {
+    return false;
+  }
+
+  if (
+    recent.signature !== signature ||
+    recent.linkFingerprint !== linkFingerprint ||
+    recent.postTextHash !== postTextHash
+  ) {
+    return false;
+  }
+
+  return Boolean(post?.querySelector?.(".dili-panel[data-dili-owned='true']"));
+}
+
+function isVirusTotalRefreshDueForBaseline(baseline = {}, postId = "") {
+  const vt = findProviderResult(baseline?.providerResults, "virustotal");
+  if (String(vt?.details?.status || "").toLowerCase() !== "pending") {
+    return false;
+  }
+
+  if (pendingVirusTotalRefreshByPostId.has(postId)) {
+    return false;
+  }
+
+  const checkedAtMs = Date.parse(vt.checkedAt || "");
+  if (!Number.isFinite(checkedAtMs)) {
+    return true;
+  }
+
+  return Date.now() - checkedAtMs >= VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS[0];
+}
 function isPostCaptionProbablyCollapsed(post) {
   if (!(post instanceof Element)) {
     return false;
@@ -2259,6 +2338,10 @@ const candidates = filterFallbackCandidatesWhenFullUrlsExist(dedupeLinkCandidate
   ...embeddedCardCandidates,
   ...fallbackCandidates
 ]));
+
+if (!suppressDiagnostics && candidates.some((candidate) => isVisibleDomainFallbackSource(getCandidateSource(candidate)))) {
+  scanStatus.fallbackUsedNoFullUrlExposed += 1;
+}
 
 if (!suppressDiagnostics) {
   scanStatus.directCandidatesFound += directCandidates.length;
@@ -3398,14 +3481,25 @@ function readCandidateRawUrlFromElement(element) {
         getCandidateUrlCompleteness(candidate) === "full-url"
       );
     });
+    const hasUsableAttributeRootCandidate = values.some((candidate) => {
+      const source = getCandidateSource(candidate);
+      return (
+        !isVisibleDomainFallbackSource(source) &&
+        getCandidateUrlCompleteness(candidate) === "domain-root-url" &&
+        Boolean(candidate.rawHref || candidate.facebookWrapperUrl || candidate.unwrappedCandidateUrl)
+      );
+    });
 
-    if (!hasUsableFullCandidate) {
+    if (!hasUsableFullCandidate && !hasUsableAttributeRootCandidate) {
       return values;
     }
 
-    return values.filter((candidate) => {
+    const filtered = values.filter((candidate) => {
       return !isVisibleDomainFallbackSource(getCandidateSource(candidate));
     });
+
+    scanStatus.fallbackSuppressedBecauseFullUrlExists += values.length - filtered.length;
+    return filtered;
   }
 
   function isVisibleDomainFallbackSource(source) {
@@ -3900,11 +3994,22 @@ function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
     }
   }
 
+  function clearAllPendingVirusTotalPanelRefreshes() {
+    for (const timer of pendingVirusTotalRefreshByPostId.values()) {
+      window.clearTimeout(timer);
+    }
+
+    pendingVirusTotalRefreshByPostId.clear();
+    pendingVirusTotalRefreshAttemptsByPostId.clear();
+  }
+
     function resetOwnedUiArtifacts() {
     removeAllOwnedPanels();
     closeWarningModal({ restoreFocus: false });
     removeOwnedWarningOverlays();
     cachedPanelByPostId.clear();
+    recentlyRenderedPanelByPostId.clear();
+    clearAllPendingVirusTotalPanelRefreshes();
     postSignatureCache = new WeakMap(); 
 }
 
@@ -3914,6 +4019,8 @@ function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
     clickAnalysisCache.clear();
     observedPostIds.clear();
     latestRequestByPostId.clear();
+recentlyRenderedPanelByPostId.clear();
+clearAllPendingVirusTotalPanelRefreshes();
 noLinkRescanCountsByPostId.clear();
 
     if (flushTimer !== null) {
@@ -4083,11 +4190,183 @@ function renderBadge(post, viewModel) {
 </details>
     `;
 
-    cachedPanelByPostId.set(getStablePostId(owningPost), viewModel);
+    const renderedPostId = getStablePostId(owningPost);
+    cachedPanelByPostId.set(renderedPostId, viewModel);
+    rememberRecentlyRenderedPanel(renderedPostId, owningPost, viewModel);
+    schedulePendingVirusTotalPanelRefresh(owningPost, viewModel);
     scanStatus.renderedPanels += 1;
     scanStatus.visiblePanels = document.querySelectorAll(".dili-panel[data-dili-owned='true']").length;
     scanStatus.lastRenderedDomain = viewModel.finalDomain || viewModel.domain || "";
   }
+function rememberRecentlyRenderedPanel(postId, post, viewModel = {}) {
+  const analysis = viewModel.analysis || {};
+  const latestRequest = latestRequestByPostId.get(postId) || {};
+  const vt = findProviderResult(analysis.providerResults, "virustotal");
+  const hasCompletedAnalysis = Boolean(
+    analysis.classification ||
+    Number.isFinite(Number(analysis.safetyScore))
+  );
+
+  if (!hasCompletedAnalysis) {
+    return;
+  }
+
+  recentlyRenderedPanelByPostId.set(postId, {
+    signature: latestRequest.signature || "",
+    linkFingerprint: latestRequest.linkFingerprint || "",
+    postTextHash: latestRequest.postTextHash || analysis.postTextHash || analysis.currentPostTextHash || "",
+    renderedAt: Date.now(),
+    classification: analysis.classification || viewModel.label || "",
+    safetyScore: analysis.safetyScore,
+    vtStatus: String(vt?.details?.status || "").toLowerCase()
+  });
+}
+function schedulePendingVirusTotalPanelRefresh(post, viewModel = {}) {
+  const owningPost = getTopLevelPanelOwner(post);
+  const analysis = viewModel.analysis;
+  const vt = findProviderResult(analysis?.providerResults, "virustotal");
+  const status = String(vt?.details?.status || "").toLowerCase();
+  const postId = owningPost ? getStablePostId(owningPost) : "";
+
+  if (!postId) {
+    return;
+  }
+
+  if (!vt || status !== "pending" || vt.flagged === true || !vt.checkedUrl) {
+    if (vt && (status === "checked" || status === "completed" || vt.flagged === true)) {
+      scanStatus.vtRefreshSkippedAlreadyCompleted += 1;
+    }
+    clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+    return;
+  }
+
+  if (pendingVirusTotalRefreshByPostId.has(postId)) {
+    return;
+  }
+
+  const nextAttempt = Number(pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0) + 1;
+  if (nextAttempt > VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length) {
+    return;
+  }
+
+  const latestRequest = latestRequestByPostId.get(postId) || {};
+  const entry = {
+    post: owningPost,
+    postId,
+    attempt: nextAttempt,
+    requestId: latestRequest.requestId || "",
+    postSignature: latestRequest.signature || "",
+    linkFingerprint: latestRequest.linkFingerprint || "",
+    postTextHash: latestRequest.postTextHash || analysis?.postTextHash || analysis?.currentPostTextHash || "",
+    analysisUrl: analysis?.analysisUrl || "",
+    normalizedUrl: analysis?.normalizedUrl || "",
+    providerCheckedUrl: vt?.checkedUrl || analysis?.analysisUrl || analysis?.normalizedUrl || ""
+  };
+
+  pendingVirusTotalRefreshAttemptsByPostId.set(postId, nextAttempt);
+  pendingVirusTotalRefreshByPostId.set(
+    postId,
+    window.setTimeout(() => {
+      refreshPendingVirusTotalPanel(entry).catch((error) => {
+        console.debug("[DILI] VirusTotal panel refresh failed", error);
+        clearPendingVirusTotalPanelRefresh(postId);
+      });
+    }, VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS[nextAttempt - 1])
+  );
+}
+
+function clearPendingVirusTotalPanelRefresh(postId, { clearAttempts = false } = {}) {
+  const timer = pendingVirusTotalRefreshByPostId.get(postId);
+  if (timer) {
+    window.clearTimeout(timer);
+  }
+
+  pendingVirusTotalRefreshByPostId.delete(postId);
+  if (clearAttempts) {
+    pendingVirusTotalRefreshAttemptsByPostId.delete(postId);
+  }
+}
+
+async function refreshPendingVirusTotalPanel(entry = {}) {
+  const { post, postId } = entry;
+  if (!(await isVirusTotalRefreshEntryCurrent(entry))) {
+    clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+    return;
+  }
+
+  const response = await sendRuntimeMessage({
+    type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
+    postId,
+    analysisUrl: entry.analysisUrl,
+    normalizedUrl: entry.normalizedUrl,
+    providerCheckedUrl: entry.providerCheckedUrl,
+    requestId: entry.requestId,
+    postSignature: entry.postSignature,
+    linkFingerprint: entry.linkFingerprint,
+    postTextHash: entry.postTextHash
+  });
+
+  if (!(await isVirusTotalRefreshEntryCurrent(entry))) {
+    scanStatus.staleResponsesDiscarded += 1;
+    clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+    return;
+  }
+
+  clearPendingVirusTotalPanelRefresh(postId);
+
+  if (!response?.analysis || response.refreshed === false) {
+    return;
+  }
+
+  const refreshedVt = findProviderResult(response.analysis.providerResults, "virustotal");
+  const refreshedPending = String(refreshedVt?.details?.status || "").toLowerCase() === "pending";
+  const viewModel = mapAnalysisToViewModel(response.analysis);
+  const currentLinkInfo = extractRelevantLinks(post, postId, { suppressDiagnostics: true });
+  renderBadge(post, viewModel);
+  if (currentLinkInfo) {
+    rememberAnalysisForLinkInfo(postId, currentLinkInfo, response.analysis);
+  }
+
+  if (!refreshedPending) {
+    clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+  }
+}
+
+async function isVirusTotalRefreshEntryCurrent(entry = {}) {
+  const post = entry.post;
+  if (!(post instanceof Element) || !post.isConnected) {
+    return false;
+  }
+
+  const currentPostId = getStablePostId(post);
+  if (entry.postId && currentPostId !== entry.postId) {
+    return false;
+  }
+
+  const latestRequest = latestRequestByPostId.get(entry.postId) || {};
+  if (entry.requestId && latestRequest.requestId && latestRequest.requestId !== entry.requestId) {
+    return false;
+  }
+
+  const currentLinkInfo = extractRelevantLinks(post, entry.postId, { suppressDiagnostics: true });
+  const currentSignature = buildPostSignature(currentLinkInfo);
+  if (entry.postSignature && currentSignature !== entry.postSignature) {
+    return false;
+  }
+
+  if (entry.linkFingerprint && currentLinkInfo?.linkFingerprint && currentLinkInfo.linkFingerprint !== entry.linkFingerprint) {
+    return false;
+  }
+
+  if (entry.postTextHash) {
+    const postTextSnapshot = await buildVisiblePostTextSnapshot(post);
+    if (postTextSnapshot.postTextHash !== entry.postTextHash) {
+      return false;
+    }
+  }
+
+  return true;
+}
 function renderPanelReportSections(report = {}) {
   const reasonItems = (report.reasons || [])
     .map((reason) => `<li>${escapeHtml(reason)}</li>`)
@@ -4224,13 +4503,13 @@ function classifyTechnicalDetailGroup(text) {
   }
 
   if (
-    /^(Visible post URL\/text|Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Facebook wrapper unwrapped)/i.test(value)
+    /^(Visible post URL\/text|Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Checked fallback URL|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Facebook wrapper unwrapped)/i.test(value)
   ) {
     return "endpoint";
   }
 
   if (
-    /DILI verified|Google Forms|visible-domain|Endpoint source note|Provider scan scope|Full endpoint extraction status|Click-time note|not configured|timed out|public mode|could not|limited|limitation|fallback|No full path/i.test(value)
+    /DILI verified|Google Forms|visible-domain|Endpoint source note|Provider scan scope|Provider checked scope|Full endpoint extraction status|Click-time note|not configured|timed out|public mode|could not|limited|limitation|fallback|No full path/i.test(value)
   ) {
     return "limitations";
   }
@@ -4248,6 +4527,7 @@ function classifyTechnicalDetailGroup(text) {
     const details = buildPanelDetails(analysis);
 
     return {
+      analysis,
       label: analysis.classification || "Unknown",
       reportSections,
       details,
@@ -4394,10 +4674,17 @@ function buildPanelReportSections(analysis = {}) {
     analysis.lowestScoringLinkDomain ||
     finalDomain ||
     "";
+  const domainOnlyFallback = Boolean(
+    analysis.candidateIsDomainOnlyFallback === true ||
+    analysis.candidateContext?.candidateIsDomainOnlyFallback === true ||
+    analysis.candidateUrlCompleteness === "domain-only-fallback"
+  );
 
   return {
     resultLine: buildPlainResultLine(classification, analysis.safetyScore, finalDomain),
-    checkedLine: `DILI checked where the link starts and where it finally leads. The clicked/visible link appears to be ${originalDomain}, and the final site appears to be ${finalDomain}.`,
+    checkedLine: domainOnlyFallback
+      ? "DILI checked the visible domain because Facebook did not expose a full clickable endpoint during passive scanning."
+      : `DILI checked where the link starts and where it finally leads. The clicked/visible link appears to be ${originalDomain}, and the final site appears to be ${finalDomain}.`,
     multiLinkNote: multiLinkPost
       ? `DILI found and analyzed ${analyzedLinkCount || linkScoreSummary.length} links in this post. The post result follows the lowest-scoring link so one risky link cannot be hidden by safer links.`
       : "",
@@ -4911,12 +5198,14 @@ function shouldSkipAutoGeneratedTechnicalDetail(detail) {
     /^Facebook click wrapper URL:/i.test(text) ||
     /^Unwrapped URL:/i.test(text) ||
     /^Full endpoint URL:/i.test(text) ||
+    /^Checked fallback URL:/i.test(text) ||
     /^Redirect chain:/i.test(text) ||
     /^Observed redirect chain:/i.test(text) ||
     /^Risk-relevant redirect chain:/i.test(text) ||
     /^Redirect chain domains:/i.test(text) ||
     /^Endpoint confidence:/i.test(text) ||
     /^Provider scan scope:/i.test(text) ||
+    /^Provider checked scope:/i.test(text) ||
     /^Full endpoint extraction status:/i.test(text) ||
     /^Click-time note:/i.test(text) ||
     /^Resolution method:/i.test(text) ||
@@ -5012,6 +5301,10 @@ function buildTechnicalDetails(analysis = {}) {
   }
 
   const candidateContext = analysis.candidateContext || {};
+  const isDomainOnlyFallbackDetail = Boolean(
+    candidateContext?.candidateIsDomainOnlyFallback === true ||
+    candidateContext?.candidateUrlCompleteness === "domain-only-fallback"
+  );
   const visiblePostValue =
     candidateContext.unwrappedCandidateUrl ||
     candidateContext.selectedNormalizedTarget ||
@@ -5037,8 +5330,10 @@ function buildTechnicalDetails(analysis = {}) {
     pushUniqueTechnicalDetail(details, `Unwrapped URL: ${endpoint.unwrappedUrl}`);
   }
 
-  if (endpoint.effectiveEndpoint) {
+  if (endpoint.effectiveEndpoint && !isDomainOnlyFallbackDetail) {
     pushUniqueTechnicalDetail(details, `Full endpoint URL: ${endpoint.effectiveEndpoint}`);
+  } else if (endpoint.effectiveEndpoint && isDomainOnlyFallbackDetail) {
+    pushUniqueTechnicalDetail(details, `Checked fallback URL: ${endpoint.effectiveEndpoint}`);
   }
 
   const observedRedirectChain = prependKnownFacebookWrapperForDisplay(chain, facebookWrapperUrl);
@@ -5085,12 +5380,11 @@ function buildTechnicalDetails(analysis = {}) {
   }
 
   if (
-    candidateContext?.candidateIsDomainOnlyFallback === true ||
-    candidateContext?.candidateUrlCompleteness === "domain-only-fallback"
+    isDomainOnlyFallbackDetail
   ) {
     pushUniqueTechnicalDetail(details, "Candidate source: visible-domain-fallback.");
     pushUniqueTechnicalDetail(details, "Endpoint source note: Facebook did not expose a full clickable URL for this card, so DILI checked the visible domain only.");
-    pushUniqueTechnicalDetail(details, "Provider scan scope: limited to visible-domain fallback because no full endpoint was exposed during passive scan.");
+    pushUniqueTechnicalDetail(details, "Provider checked scope: visible domain only.");
     pushUniqueTechnicalDetail(details, "Full endpoint extraction status: No full path/query URL was exposed during passive scan.");
     pushUniqueTechnicalDetail(details, "Click-time note: If the user clicks this card, DILI will re-check the actual clicked destination before navigation.");
   }

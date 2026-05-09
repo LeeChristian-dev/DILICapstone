@@ -29,7 +29,7 @@ DILI displays endpoint stages as:
 
 This clarifies that shortened links are resolved to their final endpoint before provider checks whenever resolution succeeds.
 
-DILI prefers full clickable or embedded URLs over visible-domain fallbacks. A visible-domain fallback is used only when Facebook does not expose a usable full destination in the same post/card.
+DILI prefers full clickable, embedded, hidden-attribute, and wrapper-unwrapped URLs over visible-domain fallbacks. A visible-domain fallback is used only when Facebook does not expose a usable full or clickable root destination in the same post/card.
 
 Facebook wrappers are shown in Technical Details for auditability, but normal user-facing summaries prefer the visible post URL/text or unwrapped target.
 
@@ -43,7 +43,7 @@ DILI attempts three levels of endpoint discovery:
 2. Redirect resolution in the background service worker.
 3. Click-time reanalysis when Facebook only exposed a root-domain fallback during passive scanning.
 
-Passive visible-domain fallback is a limited check. It can still receive a normal Safety Score classification based on the exposed domain and configured checks, but Technical Details must clearly state that only the visible domain was checked. DILI re-checks the actual clicked destination when click-time data exposes a fuller URL.
+Passive visible-domain fallback is not a full endpoint verification. It is a limited root-domain check used only when Facebook does not expose a usable full URL during passive scanning. It can still receive a normal Safety Score classification based on the exposed domain and configured checks, but Technical Details must clearly state that only the visible domain was checked. DILI re-checks the actual clicked destination when click-time data exposes a fuller URL.
 
 ## File Structure
 
@@ -221,6 +221,8 @@ Provider telemetry is informational only. It does not directly affect Safety Sco
 
 DILI caches Google Safe Browsing, URLhaus, and optional VirusTotal results per checked endpoint for a short time during a session. This reduces duplicate provider calls, improves panel speed, and lowers quota pressure when multiple posts resolve to the same URL.
 
+Facebook can lazy-load or mutate posts after they first appear, so DILI performs short delayed rescans to catch newly exposed destinations. Once an unchanged post already has a completed panel, DILI protects that panel from unnecessary visible re-rendering to avoid repeated "Analyzing" flicker.
+
 Cached provider results preserve their original `checkedAt` timestamp and do not change Safety Score rules. The provider cache is cleared when session logs are cleared, the session is restarted, or provider keys change.
 
 DILI may apply conservative false-positive mitigation for explicitly mapped branded campaign redirectors when providers are clean and the final destination matches the expected campaign platform. This does not apply to unknown shorteners or provider-flagged links.
@@ -271,6 +273,8 @@ DILI may apply conservative false-positive mitigation for explicitly mapped bran
 ## Optional VirusTotal Enrichment
 
 VirusTotal is off unless an API key is configured. It supplements Google Safe Browsing and URLhaus; it does not replace them. It is quota-sensitive and rate-limited, so it may initially show as pending. DILI first checks for an existing VirusTotal URL report when possible. If no report exists, DILI may submit the URL for analysis. DILI stores the returned VirusTotal analysis ID in memory and may follow up on later rescans instead of repeatedly submitting the same URL.
+
+When VirusTotal initially returns pending, DILI may perform a small number of delayed follow-up checks and update the visible panel if the result completes. This follow-up is quota-safe and does not reduce Safety Score while pending, rate-limited, timed out, or failed.
 
 Clearing session logs does not necessarily clear pending VirusTotal analysis IDs unless provider configuration changes or the session is fully reset. Pending, timeout, error, and rate-limited VirusTotal states do not reduce Safety Score. Positive malicious/suspicious VirusTotal detections can escalate a URL to High Risk. Do not use demo score bias during real provider accuracy testing.
 

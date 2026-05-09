@@ -29,6 +29,7 @@ const DEMO_SCORE_BIAS_AMOUNT_STORAGE_KEY = "dili:debug:scoreBiasAmount";
 const MESSAGE_TYPES = {
   ANALYZE_LINK: "DILI_ANALYZE_LINK",
   REANALYZE_LINK: "DILI_REANALYZE_LINK",
+  REFRESH_VIRUSTOTAL_RESULT: "DILI_REFRESH_VIRUSTOTAL_RESULT",
   GET_POST_STATE: "DILI_GET_POST_STATE",
   SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
   GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
@@ -191,6 +192,9 @@ async function handleMessage(message) {
           isReanalysis: true
         })
       };
+
+    case MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT:
+      return refreshVirusTotalResultForPost(message);
 
     case MESSAGE_TYPES.GET_POPUP_SUMMARY:
       return {
@@ -1913,6 +1917,11 @@ function buildTechnicalDetails({ endpointResult = {}, redirectAnalysis = {}, url
   const effectiveDomain = endpointResult.effectiveDomain || urlFeatureAnalysis.finalDomain || "";
   const candidateContext = analysis.candidateContext || {};
   const finalFeatures = analysis.features || {};
+  const isDomainOnlyFallbackAnalysis = Boolean(
+    candidateContext?.candidateIsDomainOnlyFallback === true ||
+    candidateContext?.candidateUrlCompleteness === "domain-only-fallback" ||
+    /visible-domain/i.test(String(candidateContext?.candidateSource || ""))
+  );
 const redirectChain =
   redirectAnalysis.redirectChain ||
   endpointResult.resolutionChain ||
@@ -1942,8 +1951,10 @@ if (redirectChain.length > 0) {
     details.push(`Unwrapped URL: ${endpointResult.unwrappedUrl}.`);
   }
 
-  if (endpointResult.effectiveEndpoint) {
+  if (endpointResult.effectiveEndpoint && !isDomainOnlyFallbackAnalysis) {
     details.push(`Full endpoint URL: ${endpointResult.effectiveEndpoint}.`);
+  } else if (endpointResult.effectiveEndpoint && isDomainOnlyFallbackAnalysis) {
+    details.push(`Checked fallback URL: ${endpointResult.effectiveEndpoint}.`);
   }
 
 const observedRedirectChain = prependKnownFacebookWrapperForDisplay(redirectChain, facebookWrapperUrl);
@@ -2011,13 +2022,11 @@ if (
   }
 
   if (
-    candidateContext?.candidateIsDomainOnlyFallback === true ||
-    candidateContext?.candidateUrlCompleteness === "domain-only-fallback" ||
-    /visible-domain/i.test(String(candidateContext?.candidateSource || ""))
+    isDomainOnlyFallbackAnalysis
   ) {
     details.push("Candidate source: visible-domain-fallback.");
     details.push("Endpoint source note: Facebook did not expose a full clickable URL for this card, so DILI checked the visible domain only.");
-    details.push("Provider scan scope: limited to visible-domain fallback because no full endpoint was exposed during passive scan.");
+    details.push("Provider checked scope: visible domain only.");
     details.push("Full endpoint extraction status: No full path/query URL was exposed during passive scan.");
     details.push("Click-time note: If the user clicks this card, DILI will re-check the actual clicked destination before navigation.");
   }
@@ -3370,6 +3379,172 @@ async function requestUrlhausLookup(normalizedUrl, { authKey = "", timeoutMs = 4
       mode: authKey ? "authenticated" : "public",
       httpStatus: null,
       errorMessage: safeErrorMessage(error, "Unknown URLhaus lookup error.")
+    };
+  }
+}
+
+async function refreshVirusTotalResultForPost(message = {}) {
+  const postId = String(message.postId || "").trim();
+  if (!postId) {
+    return {
+      type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
+      refreshed: false,
+      reason: "missing-post-id"
+    };
+  }
+
+  const storedAnalysis = await getBaseline(postId);
+  if (!storedAnalysis) {
+    return {
+      type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
+      refreshed: false,
+      reason: "missing-stored-analysis"
+    };
+  }
+
+  const providerResults = normalizeProviderResults(storedAnalysis.providerResults || []);
+  const existingVt = providerResults.find((item) => item.provider === "virustotal");
+  const vtStatus = String(existingVt?.details?.status || "").toLowerCase();
+
+  if (!["pending", "timeout", "rate-limited"].includes(vtStatus)) {
+    return {
+      type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
+      refreshed: false,
+      reason: `virustotal-status-${vtStatus || "unavailable"}`
+    };
+  }
+
+  const providerCheckedUrl =
+    existingVt?.checkedUrl ||
+    message.providerCheckedUrl ||
+    storedAnalysis.analysisUrl ||
+    storedAnalysis.normalizedUrl ||
+    message.analysisUrl ||
+    message.normalizedUrl ||
+    "";
+
+  if (!providerCheckedUrl) {
+    return {
+      type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
+      refreshed: false,
+      reason: "missing-provider-checked-url"
+    };
+  }
+
+  const refreshedVt = await getCachedOrInFlightProviderResult(
+    "virustotal",
+    providerCheckedUrl,
+    () => lookupVirusTotalUrl(providerCheckedUrl)
+  );
+  const updatedProviderResults = providerResults.map((provider) => (
+    provider.provider === "virustotal" ? refreshedVt : provider
+  ));
+  const updatedAnalysis = buildVirusTotalRefreshedAnalysis(storedAnalysis, updatedProviderResults);
+  replaceVirusTotalInUrlAnalysisCache({
+    analysis: updatedAnalysis,
+    providerResult: refreshedVt,
+    checkedUrl: providerCheckedUrl
+  });
+
+  const persistedAnalysis = await persistPostLevelAnalysis(postId, updatedAnalysis);
+
+  if (refreshedVt.flagged) {
+    const flaggedDomain =
+      persistedAnalysis.endpointResult?.effectiveDomain ||
+      persistedAnalysis.urlFeatureAnalysis?.finalDomain ||
+      safeHostname(persistedAnalysis.analysisUrl || providerCheckedUrl);
+    await markDomainFlagged(flaggedDomain);
+  }
+
+  sessionInfo.lastActivityAt = Date.now();
+
+  return {
+    type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
+    analysis: persistedAnalysis,
+    refreshed: true,
+    reason: refreshedVt.flagged ? "virustotal-flagged" : String(refreshedVt.details?.status || "virustotal-refreshed")
+  };
+}
+
+function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
+  const safeProviderResults = normalizeProviderResults(providerResults);
+  const gsbResult = getNormalizedProviderResult(safeProviderResults, "gsb");
+  const urlhausResult = getNormalizedProviderResult(safeProviderResults, "urlhaus");
+  const virusTotalResult = getNormalizedProviderResult(safeProviderResults, "virustotal");
+  const providerOverride = Boolean(gsbResult.flagged || urlhausResult.flagged || virusTotalResult.flagged);
+  const previousScore = Number(analysis.safetyScore);
+  const safetyScore = virusTotalResult.flagged
+    ? Math.min(Number.isFinite(previousScore) ? previousScore : 20, 20)
+    : analysis.safetyScore;
+  const classification = virusTotalResult.flagged
+    ? "High Risk"
+    : analysis.classification;
+  const features = {
+    ...(analysis.features || {}),
+    virusTotalFlagged: virusTotalResult.flagged === true
+  };
+  const refreshedAnalysis = {
+    ...analysis,
+    providerResults: safeProviderResults,
+    features,
+    providerOverride,
+    classification,
+    safetyScore,
+    concreteRiskSignals: Boolean(analysis.concreteRiskSignals || providerOverride),
+    interceptionRecommended: shouldRecommendInterceptionForStoredAnalysis({
+      ...analysis,
+      providerResults: safeProviderResults,
+      features,
+      providerOverride,
+      classification,
+      safetyScore
+    }),
+    lastChecked: Date.now()
+  };
+
+  refreshedAnalysis.technicalDetails = buildTechnicalDetails({
+    endpointResult: refreshedAnalysis.endpointResult,
+    redirectAnalysis: refreshedAnalysis.redirectAnalysis,
+    urlFeatureAnalysis: refreshedAnalysis.urlFeatureAnalysis,
+    analysis: {
+      ...refreshedAnalysis,
+      features,
+      candidateContext: refreshedAnalysis.candidateContext || {}
+    },
+    providerResults: safeProviderResults
+  });
+
+  return refreshedAnalysis;
+}
+
+function replaceVirusTotalInUrlAnalysisCache({ analysis = {}, providerResult = {}, checkedUrl = "" } = {}) {
+  const targetKeys = new Set([
+    normalizeCacheKey(checkedUrl),
+    normalizeCacheKey(providerResult.checkedUrl),
+    normalizeCacheKey(analysis.analysisUrl),
+    normalizeCacheKey(analysis.normalizedUrl)
+  ].filter(Boolean));
+
+  for (const [cacheKey, entry] of urlAnalysisCache.entries()) {
+    const payload = entry?.payload || {};
+    const providers = normalizeProviderResults(payload.providerResults || []);
+    const cachedVt = providers.find((item) => item.provider === "virustotal");
+    const isMatch = Boolean(
+      targetKeys.has(cacheKey) ||
+      targetKeys.has(normalizeCacheKey(payload.analysisUrl)) ||
+      targetKeys.has(normalizeCacheKey(payload.providerCheckedUrl)) ||
+      targetKeys.has(normalizeCacheKey(cachedVt?.checkedUrl))
+    );
+
+    if (!isMatch) {
+      continue;
+    }
+
+    entry.payload = {
+      ...payload,
+      providerResults: providers.map((provider) => (
+        provider.provider === "virustotal" ? cloneValue(providerResult) : provider
+      ))
     };
   }
 }
