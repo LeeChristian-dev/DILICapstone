@@ -18,6 +18,35 @@
   color: var(--dili-ink);
   font: 600 13px/1.45 "Segoe UI", Tahoma, sans-serif;
   box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+}
+
+.dili-panel *,
+.dili-detail-card,
+.dili-technical-details,
+.dili-evidence-card,
+.dili-panel-row,
+.dili-panel-section,
+.dili-panel-card {
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+  box-sizing: border-box;
+}
+
+.dili-panel code,
+.dili-panel pre {
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: pre-wrap;
 }
 
 .dili-panel-slot {
@@ -256,10 +285,38 @@
 
 .dili-detail-list li {
   margin-bottom: 6px;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
 }
 
 .dili-detail-list li:last-child {
   margin-bottom: 0;
+}
+
+.dili-technical-label {
+  display: block;
+  margin-bottom: 4px;
+  font-weight: 800;
+}
+
+.dili-url-evidence {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(248, 250, 252, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overflow-x: hidden;
 }
 
 @media (max-width: 480px) {
