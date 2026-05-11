@@ -1364,7 +1364,7 @@ const TRUSTED_REDIRECT_DESTINATION_HOSTS = new Set([
 const KNOWN_CAMPAIGN_REDIRECT_SOURCE_DOMAINS = new Set([
   // Brand-owned short links
   "cnn.it",
-  "hoyo.link",
+  "hoyo.link",  
   "nyti.ms",
 
   // Telecom / commerce campaign domains
@@ -1703,7 +1703,7 @@ const KNOWN_BRANDED_CAMPAIGN_REDIRECTS = [
     sourceDomain: "cnn.it",
     allowedFinalDomains: ["cnn.com"]
   },
-  {
+    {
     sourceDomain: "nyti.ms",
     allowedFinalDomains: ["nytimes.com"]
   },
