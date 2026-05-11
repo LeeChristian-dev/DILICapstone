@@ -382,7 +382,7 @@ const scanStatus = {
   }
 
 async function handleDocumentClickCapture(event) {
-  if (!scanRuntimeState.enabled || scanRuntimeState.extensionContextInvalidated || event.defaultPrevented) {
+  if (scanRuntimeState.extensionContextInvalidated || event.defaultPrevented) {
     return;
   }
 
@@ -392,6 +392,18 @@ async function handleDocumentClickCapture(event) {
   }
 
   const cachedAnalysis = getCachedClickAnalysisSync(clickContext);
+  if (!scanRuntimeState.enabled) {
+    if (cachedAnalysis && analysisMatchesTarget(cachedAnalysis, clickContext.normalizedTargetUrl) && shouldShowWarningModal(cachedAnalysis)) {
+      scanStatus.lastAnalysisPipelineState = {
+        stage: "click-allowed-protection-off-cached-risk",
+        postId: clickContext.postId,
+        timestamp: Date.now()
+      };
+    }
+
+    return;
+  }
+
   const forceFullUrlReanalysis = shouldForceFullUrlClickReanalysis(cachedAnalysis, clickContext);
 
   // Important:
@@ -416,14 +428,19 @@ async function handleDocumentClickCapture(event) {
   const verificationToken = ++clickWarningState.activeToken;
   closeWarningModal({ restoreFocus: false });
 
-  try {
-    const analysis = forceFullUrlReanalysis
-      ? await resolveClickAnalysis(clickContext, { forceReanalysis: true })
-      : cachedAnalysis || await resolveClickAnalysis(clickContext);
+    try {
+      const analysis = forceFullUrlReanalysis
+        ? await resolveClickAnalysis(clickContext, { forceReanalysis: true })
+        : cachedAnalysis || await resolveClickAnalysis(clickContext);
 
-    if (verificationToken !== clickWarningState.activeToken) {
-      closePendingWindow(clickContext.intent.pendingWindow);
-      return;
+      if (scanRuntimeState.extensionContextInvalidated) {
+        closePendingWindow(clickContext.intent.pendingWindow);
+        return;
+      }
+
+      if (verificationToken !== clickWarningState.activeToken) {
+        closePendingWindow(clickContext.intent.pendingWindow);
+        return;
     }
 
     if (analysis) {
@@ -463,6 +480,12 @@ async function handleDocumentClickCapture(event) {
       reasons: buildWarningReasons(analysis)
     });
   } catch (error) {
+    if (isRuntimeInvalidationError(error)) {
+      invalidateRuntimeContext(error);
+      closePendingWindow(clickContext.intent.pendingWindow);
+      return;
+    }
+
     console.warn("[DILI] Click link verification failed", error);
 
     showVerificationUnavailableModal({
@@ -549,6 +572,10 @@ function findClickableUrlElement(startElement) {
       type: MESSAGE_TYPES.GET_POST_STATE,
       postId: clickContext.postId
     });
+    if (shouldAbortForRuntimeInvalidation(currentState)) {
+      return null;
+    }
+
     const baseline = currentState?.baseline || null;
 
 if (!forceReanalysis && analysisMatchesTarget(baseline, clickContext.normalizedTargetUrl)) {
@@ -561,6 +588,10 @@ if (!forceReanalysis && analysisMatchesTarget(baseline, clickContext.normalizedT
       type: MESSAGE_TYPES.GET_POST_STATE,
       postId: clickPostId
     });
+    if (shouldAbortForRuntimeInvalidation(cachedClickState)) {
+      return null;
+    }
+
     const cachedClickAnalysis = cachedClickState?.baseline || null;
 
 if (!forceReanalysis && analysisMatchesTarget(cachedClickAnalysis, clickContext.normalizedTargetUrl)) {
@@ -576,6 +607,9 @@ if (!forceReanalysis && analysisMatchesTarget(cachedClickAnalysis, clickContext.
       displayedText: clickContext.displayText,
       candidateContext: buildClickCandidateContext(clickContext)
     });
+if (shouldAbortForRuntimeInvalidation(response)) {
+  return null;
+}
 
 const analysis = response?.analysis || null;
 
@@ -816,7 +850,8 @@ function continueNavigation(destinationUrl, intent) {
 
   if (!safeDestination) {
     console.warn("[DILI] Navigation blocked because no valid HTTP/HTTPS destination was available.", {
-      destinationUrl
+      destinationUrl: typeof destinationUrl === "string" ? destinationUrl : "",
+      destinationType: typeof destinationUrl
     });
     return false;
   }
@@ -865,15 +900,18 @@ function shouldShowWarningModal(analysis) {
   const gsb = findProviderResult(analysis.providerResults, "gsb");
   const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
   const vt = findProviderResult(analysis.providerResults, "virustotal");
+  const providerFlagged = Array.isArray(analysis.providerResults) && analysis.providerResults.some((item) => item?.flagged === true);
 
-  if (gsb?.flagged || urlhaus?.flagged || vt?.flagged) {
+  if (analysis.interceptionRecommended === true) {
+    return true;
+  }
+
+  if (analysis.providerOverride === true || providerFlagged || gsb?.flagged || urlhaus?.flagged || vt?.flagged) {
     return true;
   }
 
   const score = Number(analysis.safetyScore);
   const classification = String(analysis.classification || "").toLowerCase();
-  const features = analysis.features || {};
-  const verificationState = String(analysis.verificationState || "").toLowerCase();
 
   if (
     classification.includes("high risk") ||
@@ -889,23 +927,6 @@ function shouldShowWarningModal(analysis) {
   }
 
   if (Number.isFinite(score) && score < 60) {
-    return true;
-  }
-
-  if (features.integrityHashMismatch && Number.isFinite(score) && score < 75) {
-    return true;
-  }
-
-  if (
-    verificationState === "unverified" &&
-    (
-      features.shortenedUrl ||
-      features.textMismatch ||
-      features.obfuscatedUrl ||
-      features.suspiciousRedirectPattern ||
-      features.usernamePasswordTrick
-    )
-  ) {
     return true;
   }
 
@@ -1851,6 +1872,10 @@ async function processPostBatch(batch) {
 
     for (const result of results) {
       if (result.status === "rejected") {
+        if (scanRuntimeState.extensionContextInvalidated || isRuntimeInvalidationError(result.reason)) {
+          return;
+        }
+
         console.warn("[DILI] Post processing failed", result.reason);
       }
     }
@@ -1921,6 +1946,9 @@ async function processPost(post) {
         type: MESSAGE_TYPES.GET_POST_STATE,
         postId
       });
+      if (shouldAbortForRuntimeInvalidation(currentState)) {
+        return;
+      }
 
       const storedBaseline = currentState?.baseline || null;
       const hasOwnedArtifacts = Boolean(
@@ -1981,6 +2009,9 @@ async function processPost(post) {
     type: MESSAGE_TYPES.GET_POST_STATE,
     postId
   });
+  if (shouldAbortForRuntimeInvalidation(currentState)) {
+    return;
+  }
 
   const baseline = currentState?.baseline || null;
 
@@ -2067,6 +2098,9 @@ async function processPost(post) {
     postSignature: signature,
     linkFingerprint
   });
+  if (shouldAbortForRuntimeInvalidation(response)) {
+    return;
+  }
 
   const backgroundRoundTripMs = elapsedMs(backgroundStartedAt);
   scanStatus.perfLastBackgroundRoundTripMs = backgroundRoundTripMs;
@@ -2260,13 +2294,16 @@ function isPostCaptionProbablyCollapsed(post) {
   });
 }
 async function deferCollapsedNoLinkPost(post, postId, postTextSnapshot = null) {
-  await sendRuntimeMessage({
+  const response = await sendRuntimeMessage({
     type: MESSAGE_TYPES.SET_NO_LINK_STATE,
     postId,
     baselineState: "truncated_unexpanded",
     postTextHash: postTextSnapshot?.postTextHash || "",
     normalizedVisiblePostText: postTextSnapshot?.normalizedVisiblePostText || ""
   });
+  if (shouldAbortForRuntimeInvalidation(response)) {
+    return;
+  }
 
   selectedPostLinkCache.delete(postId);
   cachedPanelByPostId.delete(postId);
@@ -2286,13 +2323,16 @@ async function deferCollapsedNoLinkPost(post, postId, postTextSnapshot = null) {
 async function setNoLinkState(post, postId, postTextSnapshot = null, postIdentity = null) {
   const stable = postIdentity?.stable === true;
 
-  await sendRuntimeMessage({
+  const response = await sendRuntimeMessage({
     type: MESSAGE_TYPES.SET_NO_LINK_STATE,
     postId,
     baselineState: stable ? "no_link" : "observed_no_link_unstable",
     postTextHash: postTextSnapshot?.postTextHash || "",
     normalizedVisiblePostText: postTextSnapshot?.normalizedVisiblePostText || ""
   });
+  if (shouldAbortForRuntimeInvalidation(response)) {
+    return;
+  }
 
   selectedPostLinkCache.delete(postId);
   cachedPanelByPostId.delete(postId);
@@ -2322,21 +2362,26 @@ const directCandidates = candidateElements
   .map((element) => buildRelevantLinkCandidate(element, post))
   .filter(Boolean);
 
+const visibleTextFullUrlCandidates = findVisibleTextFullUrlCandidates(post);
 const embeddedCardCandidates = findEmbeddedCardCandidates(post);
 const sponsoredFallbackCandidates = findSponsoredFallbackCandidates(post);
 const hiddenFullUrlCandidates = findHiddenFullUrlCandidates(post);
 const visibleDomainFallbackCandidates = findVisibleDomainFallbackCandidates(post);
 
 const fallbackCandidates = [
-  ...sponsoredFallbackCandidates,
   ...hiddenFullUrlCandidates,
+  ...visibleTextFullUrlCandidates,
+  ...sponsoredFallbackCandidates,
   ...visibleDomainFallbackCandidates
 ];
 
 const candidates = filterFallbackCandidatesWhenFullUrlsExist(dedupeLinkCandidates([
   ...directCandidates,
+  ...hiddenFullUrlCandidates,
+  ...visibleTextFullUrlCandidates,
   ...embeddedCardCandidates,
-  ...fallbackCandidates
+  ...sponsoredFallbackCandidates,
+  ...visibleDomainFallbackCandidates
 ]));
 
 if (!suppressDiagnostics && candidates.some((candidate) => isVisibleDomainFallbackSource(getCandidateSource(candidate)))) {
@@ -2356,6 +2401,7 @@ if (!suppressDiagnostics) {
     embedded: embeddedCardCandidates.length,
     sponsoredFallback: sponsoredFallbackCandidates.length,
     hiddenFullUrl: hiddenFullUrlCandidates.length,
+    visibleTextFullUrl: visibleTextFullUrlCandidates.length,
     visibleDomainFallback: visibleDomainFallbackCandidates.length,
     fallback: fallbackCandidates.length,
     total: candidates.length
@@ -2447,6 +2493,136 @@ if (!suppressDiagnostics) {
     }
   };
 }
+
+function findVisibleTextFullUrlCandidates(post) {
+  if (!(post instanceof Element)) {
+    return [];
+  }
+
+  const renderedText = extractRenderedVisibleText(post);
+  const text = removeHeaderTextFromRenderedText(post, renderedText);
+  if (!text) {
+    return [];
+  }
+
+  const candidates = [];
+  const seen = new Set();
+
+  for (const rawUrl of extractFullUrlCandidatesFromVisibleText(text)) {
+    if (!isUsefulFullEndpointCandidate(rawUrl, post)) {
+      continue;
+    }
+
+    const candidate = buildVisibleTextFullUrlCandidate(rawUrl, post);
+    if (!candidate) {
+      continue;
+    }
+
+    const key = candidate.normalizedTargetUrl || candidate.url;
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    candidates.push(candidate);
+  }
+
+  return dedupeLinkCandidates(candidates);
+}
+
+function extractFullUrlCandidatesFromVisibleText(text) {
+  const source = String(text || "");
+  const candidates = [];
+  const seen = new Set();
+  const pushCandidate = (value, index = -1) => {
+    let candidate = cleanExtractedUrl(value);
+    if (!candidate) {
+      return;
+    }
+
+    if (!/^https?:\/\//i.test(candidate)) {
+      candidate = `https://${candidate.replace(/^\/+/, "")}`;
+    }
+
+    if (!isVisibleTextFullUrlCandidate(candidate, source, index) || seen.has(candidate)) {
+      return;
+    }
+
+    seen.add(candidate);
+    candidates.push(candidate);
+  };
+
+  const protocolOrWwwPattern = /\b(?:https?:\/\/|www\.)[^\s"'<>\\)\\]}]+/gi;
+  for (const match of source.matchAll(protocolOrWwwPattern)) {
+    pushCandidate(match[0], Number(match.index ?? -1));
+  }
+
+  const pathOrQueryDomainPattern = /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:academy|agency|ai|app|biz|click|cloud|co|com|dev|edu|finance|gov|info|io|me|net|online|org|ph|shop|site|store|xyz)(?:\/[^\s"'<>\\)\\]}]*|\?[^\s"'<>\\)\\]}]+)/gi;
+  for (const match of source.matchAll(pathOrQueryDomainPattern)) {
+    pushCandidate(match[0], Number(match.index ?? -1));
+  }
+
+  return candidates;
+}
+
+function isVisibleTextFullUrlCandidate(rawUrl, sourceText = "", matchIndex = -1) {
+  try {
+    const url = new URL(rawUrl, location.href);
+    const host = url.hostname.toLowerCase();
+    const hasPathOrQuery = Boolean((url.pathname && url.pathname !== "/") || url.search);
+    const original = String(sourceText || "");
+
+    if (!["http:", "https:"].includes(url.protocol) || !host || !hasPathOrQuery) {
+      return false;
+    }
+
+    if (matchIndex > 0 && original[matchIndex - 1] === "@") {
+      return false;
+    }
+
+    if (isDomainPartOfEmail(original, host.replace(/^www\./, ""), matchIndex)) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function buildVisibleTextFullUrlCandidate(rawUrl, post) {
+  const normalizedTargetUrl = safelyNormalizeComparableUrl(rawUrl);
+  const hostname = safeHostname(normalizedTargetUrl || rawUrl);
+  const registrableDomain = getRegistrableDomain(hostname);
+
+  if (!hostname || !registrableDomain) {
+    return null;
+  }
+
+  return {
+    element: post,
+    url: rawUrl,
+    normalizedTargetUrl,
+    displayText: rawUrl,
+    visibleText: rawUrl,
+    rawHref: rawUrl,
+    facebookWrapperUrl: isFacebookWrapperHref(rawUrl) ? rawUrl : "",
+    unwrappedCandidateUrl: unwrapFacebookRedirectUrl(rawUrl),
+    hostname,
+    registrableDomain,
+    wrapperOutbound: isFacebookWrapperHref(rawUrl),
+    meaningfulText: true,
+    inMainContent: true,
+    inActionArea: false,
+    hasMedia: Boolean(post.querySelector("img, picture, video, svg")),
+    visualArea: 1000,
+    textLength: rawUrl.length,
+    urlLength: normalizedTargetUrl.length,
+    domPath: `visible-text-full-url:${hostname}`,
+    candidateSource: "visible-text-full-url"
+  };
+}
+
 function findVisibleDomainFallbackCandidates(post) {
   if (!(post instanceof Element)) {
     return [];
@@ -2826,6 +3002,10 @@ function extractUrlCandidatesFromRawString(rawValue) {
 
     for (const nested of extractRedirectParamUrls(value)) {
       pushUrl(nested);
+    }
+
+    for (const textUrl of extractFullUrlCandidatesFromVisibleText(value)) {
+      pushUrl(textUrl);
     }
   }
 
@@ -3349,32 +3529,45 @@ function readCandidateRawUrlFromElement(element) {
     return "";
   }
 
-  const candidates = [
-    element.getAttribute("data-lynx-uri"),
-    element.getAttribute("data-url")
-  ];
-
+  const candidates = [];
   if (element instanceof HTMLAnchorElement) {
-    candidates.push(element.href || element.getAttribute("href") || "");
+    candidates.push({
+      value: element.href || element.getAttribute("href") || "",
+      priority: 100
+    });
   } else {
-    candidates.push(element.getAttribute("href") || "");
+    candidates.push({
+      value: element.getAttribute("href") || "",
+      priority: 100
+    });
   }
 
-  for (const candidate of candidates) {
-    const value = String(candidate || "").trim();
-    if (value && isEligibleLink(value)) {
-      return value;
-    }
+  candidates.push(
+    { value: element.getAttribute("data-lynx-uri"), priority: 95 },
+    { value: element.getAttribute("data-url"), priority: 90 },
+    { value: element.getAttribute("ajaxify"), priority: 88 }
+  );
+
+  const rankedCandidates = candidates
+    .map((candidate) => {
+      const value = String(candidate.value || "").trim();
+      const unwrapped = unwrapFacebookRedirectUrl(value);
+      const hasFullEndpoint = hasPathOrQueryUrl(value) || hasPathOrQueryUrl(unwrapped);
+      const internalFacebook = isFacebookHost(safeHostname(value)) && !isFacebookWrapperHref(value);
+      return {
+        value,
+        score: Number(candidate.priority || 0) + (hasFullEndpoint ? 1000 : 0) - (internalFacebook ? 2000 : 0)
+      };
+    })
+    .filter((candidate) => candidate.value)
+    .sort((left, right) => right.score - left.score);
+
+  const eligible = rankedCandidates.find((candidate) => isEligibleLink(candidate.value));
+  if (eligible) {
+    return eligible.value;
   }
 
-  for (const candidate of candidates) {
-    const value = String(candidate || "").trim();
-    if (value) {
-      return value;
-    }
-  }
-
-  return "";
+  return rankedCandidates[0]?.value || "";
 }
   function summarizePostLinkCandidates(candidates, rememberedSelection) {
     if (!Array.isArray(candidates) || candidates.length === 0) {
@@ -3527,18 +3720,50 @@ function readCandidateRawUrlFromElement(element) {
       return "domain-only-fallback";
     }
 
-    try {
-      const url = new URL(candidate.normalizedTargetUrl || candidate.url || "", location.href);
-      const hasPath = url.pathname && url.pathname !== "/";
-      const hasQuery = Boolean(url.search);
-      return hasPath || hasQuery ? "full-url" : "domain-root-url";
-    } catch {
-      return "unknown";
+    const candidates = [
+      candidate.url,
+      candidate.rawHref,
+      candidate.unwrappedCandidateUrl,
+      candidate.normalizedTargetUrl
+    ];
+
+    let sawRootUrl = false;
+    for (const value of candidates) {
+      if (!value) {
+        continue;
+      }
+
+      try {
+        const url = new URL(value, location.href);
+        if (url.protocol !== "http:" && url.protocol !== "https:") {
+          continue;
+        }
+
+        const hasPath = url.pathname && url.pathname !== "/";
+        const hasQuery = Boolean(url.search);
+        if (hasPath || hasQuery) {
+          return "full-url";
+        }
+
+        sawRootUrl = true;
+      } catch {
+        continue;
+      }
     }
+
+    return sawRootUrl ? "domain-root-url" : "unknown";
   }
 
   function getCandidateSourcePriority(candidate = {}) {
     const source = getCandidateSource(candidate);
+
+    if (source === "direct") {
+      return 110;
+    }
+
+    if (source === "sponsored-fallback-direct") {
+      return 100;
+    }
 
     if (source === "hidden-facebook-wrapper-full-url") {
       return 95;
@@ -3548,16 +3773,12 @@ function readCandidateRawUrlFromElement(element) {
       return 92;
     }
 
+    if (source === "visible-text-full-url") {
+      return 88;
+    }
+
     if (source === "embedded-card-direct") {
-      return 90;
-    }
-
-    if (source === "sponsored-fallback-direct") {
       return 85;
-    }
-
-    if (source === "direct") {
-      return 80;
     }
 
     if (source === "embedded-card-visible-domain") {
@@ -4124,7 +4345,11 @@ noLinkRescanCountsByPostId.clear();
   }
 
 function renderBadge(post, viewModel) {
-  const owningPost = getTopLevelPanelOwner(post);
+  const owningPost = getSafePanelMountOwner(post);
+  if (!(owningPost instanceof Element)) {
+    return;
+  }
+
   const mountPoint = getBadgeMountPoint(owningPost);
   const panels = [...owningPost.querySelectorAll(".dili-panel[data-dili-owned='true']")];
 
@@ -4303,6 +4528,10 @@ async function refreshPendingVirusTotalPanel(entry = {}) {
     linkFingerprint: entry.linkFingerprint,
     postTextHash: entry.postTextHash
   });
+  if (shouldAbortForRuntimeInvalidation(response)) {
+    clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+    return;
+  }
 
   if (!(await isVirusTotalRefreshEntryCurrent(entry))) {
     scanStatus.staleResponsesDiscarded += 1;
@@ -4523,13 +4752,13 @@ function classifyTechnicalDetailGroup(text) {
   }
 
   if (
-    /^(Visible post URL\/text|Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Checked fallback URL|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Facebook wrapper unwrapped)/i.test(value)
+    /^(Candidate source|Candidate completeness|Provider checked full endpoint URL|Provider checked URL|Normalized comparison URL|Display URL|Visible post URL\/text|Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Endpoint URL|Checked fallback URL|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Facebook wrapper unwrapped)/i.test(value)
   ) {
     return "endpoint";
   }
 
   if (
-    /DILI verified|Google Forms|visible-domain|Endpoint source note|Provider scan scope|Provider checked scope|Full endpoint extraction status|Click-time note|not configured|timed out|public mode|could not|limited|limitation|fallback|No full path/i.test(value)
+    /DILI verified|Google Forms|visible-domain|Endpoint source note|Provider scan scope|Provider checked scope|Passive scan did not expose|Click-time note|not configured|timed out|public mode|could not|limited|limitation|fallback|No full path/i.test(value)
   ) {
     return "limitations";
   }
@@ -4573,7 +4802,8 @@ function classifyTechnicalDetailGroup(text) {
         {
           label: analysis.classification || "Unknown",
           state: analysis.state,
-          safetyScore: analysis.safetyScore
+          safetyScore: analysis.safetyScore,
+          interceptionRecommended: analysis.interceptionRecommended
         },
         severityLevel
       ),
@@ -4593,12 +4823,24 @@ detailsSummary: buildInlineDetailsSummary(
       analysis.urlFeatureAnalysis?.finalDomain ||
       safeHostname(analysis.analysisUrl) ||
       "";
+    const score = Number(analysis.safetyScore);
+    const classification = String(analysis.classification || "").toLowerCase();
+    const providerFlagged = Array.isArray(analysis.providerResults) && analysis.providerResults.some((provider) => provider?.flagged === true);
 
-    if (isMessagingOrCommunityInviteDomain(finalDomain)) {
-      return "You can open this link, but verify the group, sender, and any instructions before sharing personal information, payment details, or account credentials.";
+    if (
+      severityLevel === "high-risk" ||
+      classification.includes("high risk") ||
+      (Number.isFinite(score) && score < 40) ||
+      providerFlagged
+    ) {
+      return "Do not continue unless you are certain this destination is legitimate. Avoid sharing personal information, payment details, account credentials, or following instructions from unknown groups or senders.";
     }
 
     if (severityLevel === "safe") {
+      if (isMessagingOrCommunityInviteDomain(finalDomain)) {
+        return "DILI verified the URL reputation, but it cannot assess messages, members, claims, or future content inside this platform.";
+      }
+
       return "You can open this link normally, but still avoid entering passwords or payment information unless you trust the site.";
     }
 
@@ -4607,11 +4849,7 @@ detailsSummary: buildInlineDetailsSummary(
     }
 
     if (severityLevel === "suspicious") {
-      return "Avoid entering passwords, payment details, or personal information unless you can independently verify the site.";
-    }
-
-    if (severityLevel === "high-risk") {
-      return "Do not continue unless you are certain this destination is legitimate.";
+      return "Open only if you can independently verify the destination, sender, and purpose of the link.";
     }
 
     return "Treat this as not fully verified. Continue only if the source and destination make sense.";
@@ -4859,23 +5097,28 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
     reasons.push("The link appears to have changed after DILI first observed the post.");
   }
 
-  if (features.shortenedUrl && !features.knownBrandedCampaignRedirect) {
+  if (features.shortenedUrl && !features.knownBrandedCampaignRedirect && !features.trustedRedirectDestination) {
     reasons.push("The link uses a shortened URL, so the final website is hidden at first.");
   }
 
   if (
     !features.knownBrandedCampaignRedirect &&
     !features.knownGoogleFormsRedirect &&
+    !features.trustedRedirectDestination &&
     (features.shortenerToUnrelatedDomain || features.crossDomainRedirectChain)
   ) {
     reasons.push("The link redirects to a different website before reaching the final destination.");
   }
 
-  if (!features.knownBrandedCampaignRedirect && !features.knownGoogleFormsRedirect && features.textMismatch) {
+  if (features.trustedRedirectDestination || features.knownCampaignRedirectToTrustedDestination) {
+    reasons.push("The link redirects through a known campaign or tracking redirect before reaching the final destination.");
+  }
+
+  if (!features.knownBrandedCampaignRedirect && !features.knownGoogleFormsRedirect && !features.trustedRedirectDestination && features.textMismatch) {
     reasons.push("The visible link text does not match the final website.");
   }
 
-  if (!features.knownBrandedCampaignRedirect && !features.knownGoogleFormsRedirect && features.obfuscatedUrl) {
+  if (!features.knownBrandedCampaignRedirect && !features.knownGoogleFormsRedirect && !features.trustedRedirectDestination && features.obfuscatedUrl) {
     reasons.push("The URL contains encoded or unusual text that can make the destination harder to read.");
   }
 
@@ -4894,9 +5137,10 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
   if (
     features.knownBrandedCampaignRedirect &&
     !gsb?.flagged &&
-    !urlhaus?.flagged
+    !urlhaus?.flagged &&
+    !vt?.flagged
   ) {
-    reasons.push("The link uses a known branded campaign redirect, and configured threat checks did not report the final destination as unsafe.");
+    reasons.push("The link uses a known branded redirect and resolves to the expected brand destination.");
   }
 
   if (
@@ -5332,6 +5576,11 @@ function buildTechnicalDetails(analysis = {}) {
     candidateContext?.candidateIsDomainOnlyFallback === true ||
     candidateContext?.candidateUrlCompleteness === "domain-only-fallback"
   );
+  const candidateSource = String(candidateContext.candidateSource || analysis.candidateSource || "").trim();
+  const candidateCompleteness = String(candidateContext.candidateUrlCompleteness || analysis.candidateUrlCompleteness || "").trim();
+  const providerCheckedUrl = getPrimaryProviderCheckedUrl(analysis.providerResults) || analysis.providerCheckedUrl || analysis.urlFeatureAnalysis?.providerCheckedUrl || "";
+  const normalizedComparisonUrl = analysis.urlFeatureAnalysis?.normalizedComparisonUrl || analysis.urlFeatureAnalysis?.sourceNormalizedUrl || "";
+  const displayUrl = analysis.urlFeatureAnalysis?.displayUrl || candidateContext.unwrappedCandidateUrl || candidateContext.selectedNormalizedTarget || candidateContext.rawHref || "";
   const visiblePostValue =
     candidateContext.unwrappedCandidateUrl ||
     candidateContext.selectedNormalizedTarget ||
@@ -5339,6 +5588,32 @@ function buildTechnicalDetails(analysis = {}) {
     (looksLikeUsefulVisibleDestinationText(candidateContext.visibleText) ? candidateContext.visibleText : "") ||
     (looksLikeUsefulVisibleDestinationText(candidateContext.displayText) ? candidateContext.displayText : "") ||
     "";
+
+  if (candidateSource) {
+    pushUniqueTechnicalDetail(details, `Candidate source: ${candidateSource}.`);
+  }
+
+  if (candidateCompleteness) {
+    pushUniqueTechnicalDetail(details, `Candidate completeness: ${candidateCompleteness}.`);
+  }
+
+  if (providerCheckedUrl) {
+    if (!isDomainOnlyFallbackDetail && hasPathOrQueryUrl(providerCheckedUrl)) {
+      pushUniqueTechnicalDetail(details, `Provider checked full endpoint URL: ${providerCheckedUrl}.`);
+    } else if (isDomainOnlyFallbackDetail) {
+      pushUniqueTechnicalDetail(details, "Provider checked scope: visible domain only.");
+    } else {
+      pushUniqueTechnicalDetail(details, `Provider checked URL: ${providerCheckedUrl}.`);
+    }
+  }
+
+  if (normalizedComparisonUrl) {
+    pushUniqueTechnicalDetail(details, `Normalized comparison URL: ${normalizedComparisonUrl}.`);
+  }
+
+  if (displayUrl) {
+    pushUniqueTechnicalDetail(details, `Display URL: ${displayUrl}.`);
+  }
 
   if (visiblePostValue && !isFacebookClickWrapperLikeText(visiblePostValue)) {
     pushUniqueTechnicalDetail(details, `Visible post URL/text: ${visiblePostValue}.`);
@@ -5357,8 +5632,10 @@ function buildTechnicalDetails(analysis = {}) {
     pushUniqueTechnicalDetail(details, `Unwrapped URL: ${endpoint.unwrappedUrl}`);
   }
 
-  if (endpoint.effectiveEndpoint && !isDomainOnlyFallbackDetail) {
+  if (endpoint.effectiveEndpoint && !isDomainOnlyFallbackDetail && hasPathOrQueryUrl(endpoint.effectiveEndpoint)) {
     pushUniqueTechnicalDetail(details, `Full endpoint URL: ${endpoint.effectiveEndpoint}`);
+  } else if (endpoint.effectiveEndpoint && !isDomainOnlyFallbackDetail) {
+    pushUniqueTechnicalDetail(details, `Endpoint URL: ${endpoint.effectiveEndpoint}`);
   } else if (endpoint.effectiveEndpoint && isDomainOnlyFallbackDetail) {
     pushUniqueTechnicalDetail(details, `Checked fallback URL: ${endpoint.effectiveEndpoint}`);
   }
@@ -5409,10 +5686,8 @@ function buildTechnicalDetails(analysis = {}) {
   if (
     isDomainOnlyFallbackDetail
   ) {
-    pushUniqueTechnicalDetail(details, "Candidate source: visible-domain-fallback.");
     pushUniqueTechnicalDetail(details, "Endpoint source note: Facebook did not expose a full clickable URL for this card, so DILI checked the visible domain only.");
-    pushUniqueTechnicalDetail(details, "Provider checked scope: visible domain only.");
-    pushUniqueTechnicalDetail(details, "Full endpoint extraction status: No full path/query URL was exposed during passive scan.");
+    pushUniqueTechnicalDetail(details, "Passive scan did not expose a full path/query endpoint.");
     pushUniqueTechnicalDetail(details, "Click-time note: If the user clicks this card, DILI will re-check the actual clicked destination before navigation.");
   }
 
@@ -5551,6 +5826,9 @@ function buildTechnicalDetails(analysis = {}) {
       features.knownBrandedCampaignRedirect ||
       features.knownGoogleFormsRedirect ||
       features.googleFormsViaGenericShortener ||
+      features.trustedRedirectDestination ||
+      features.knownCampaignRedirectToTrustedDestination ||
+      features.trustedDestinationUnknownShortenerRedirect ||
       features.mainstreamResolvedShortlink ||
       features.knownShortenerOwnerRedirect ||
       features.softExternalFormCaution ||
@@ -5785,18 +6063,23 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
 
   function buildInlineActionHint(viewModel = {}, severityLevel = normalizeInlineSeverityLevel(viewModel)) {
     const score = Number(viewModel.safetyScore);
-    const label = String(viewModel.label || "").toLowerCase();
+    const label = String(viewModel.label || viewModel.classification || "").toLowerCase();
 
-    if (severityLevel === "high-risk" || severityLevel === "suspicious") {
+    if (
+      viewModel.interceptionRecommended === true ||
+      label.includes("high risk") ||
+      label.includes("suspicious") ||
+      (Number.isFinite(score) && score < 60)
+    ) {
       return "DILI will pause navigation before opening this link.";
     }
 
-    if (severityLevel === "caution") {
-      if (Number.isFinite(score) && score >= 60) {
-        return "DILI will show this warning in the post, but will not block navigation by default.";
-      }
-
-      return "Clicking this link may trigger a warning before navigation.";
+    if (
+      label.includes("caution") ||
+      severityLevel === "caution" ||
+      (Number.isFinite(score) && score >= 60 && score < 90)
+    ) {
+      return "DILI will show this warning in the post, but will not block navigation by default.";
     }
 
     if (severityLevel === "unverified" || label.includes("unverified")) {
@@ -5824,6 +6107,21 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
     }
 
     return results.find((item) => item.provider === providerName) || null;
+  }
+
+  function getPrimaryProviderCheckedUrl(results = []) {
+    if (!Array.isArray(results)) {
+      return "";
+    }
+
+    for (const provider of results) {
+      const checkedUrl = String(provider?.checkedUrl || "").trim();
+      if (checkedUrl) {
+        return checkedUrl;
+      }
+    }
+
+    return "";
   }
 
   function getStablePostId(post) {
@@ -5957,7 +6255,12 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
   }
 
   function getBadgeMountPoint(post) {
-    return ensurePanelSlot(post);
+    return ensurePanelSlot(getSafePanelMountOwner(post));
+  }
+
+  function getSafePanelMountOwner(post) {
+    const owner = getTopLevelPanelOwner(post);
+    return owner instanceof Element ? owner : post;
   }
 
   function getArticleAncestors(element) {
@@ -6364,6 +6667,10 @@ function isUnsafePanelMountTarget(element, owningPost) {
     return true;
   }
 
+  if (hasUnsafePanelMountAncestor(element, owningPost)) {
+    return true;
+  }
+
   if (isElementInsideUnsafeClickableSurface(element, owningPost)) {
     return true;
   }
@@ -6400,6 +6707,42 @@ function isUnsafePanelMountTarget(element, owningPost) {
     forbiddenAncestor !== owningPost &&
     owningPost.contains(forbiddenAncestor)
   );
+}
+
+function hasUnsafePanelMountAncestor(element, owningPost) {
+  let current = element instanceof Element ? element : null;
+
+  while (current instanceof Element && current !== owningPost) {
+    if (
+      isLikelyActionBarOrControlContainer(current) ||
+      isLikelyCommentOrReplyContainer(current) ||
+      isInsideNestedSharedStory(current, owningPost)
+    ) {
+      return true;
+    }
+
+    if (
+      current.matches(
+        [
+          "form",
+          "textarea",
+          "[contenteditable='true']",
+          "[data-ad-preview]:not([data-ad-preview='message'])",
+          "[data-ad-comet-preview]:not([data-ad-comet-preview='message'])",
+          "[data-visualcompletion='media-vc-image']",
+          "[aria-label*='comment']",
+          "[aria-label*='reply']",
+          "[aria-label*='reaction']"
+        ].join(",")
+      )
+    ) {
+      return true;
+    }
+
+    current = current.parentElement;
+  }
+
+  return false;
 }
 function isValidCaptionCandidate(element, post) {
   if (!(element instanceof Element) || !post.contains(element) || !isProbablyVisible(element)) {
@@ -6495,16 +6838,19 @@ function findPostAttachmentOrPreview(post) {
 function findPanelInsertionPoint(post) {
   const fallbackPoint = getSafePanelFallbackPoint(post);
 
-  // Desired layout:
-  // Header
-  // DILI panel
-  // Caption
-  // Media / embedded card
+  const headerBlock = findPostHeaderBlock(post);
+  if (headerBlock instanceof Element) {
+    const headerPoint = buildSafeInsertionAfterElement(post, headerBlock);
+    if (headerPoint) {
+      return normalizePanelInsertionPoint(post, headerPoint, fallbackPoint);
+    }
+  }
+
   const caption = findPostCaption(post);
   if (caption instanceof Element) {
     const captionPoint = buildSafeInsertionBeforeElement(post, caption);
     if (captionPoint) {
-      return captionPoint;
+      return normalizePanelInsertionPoint(post, captionPoint, fallbackPoint);
     }
   }
 
@@ -6512,15 +6858,15 @@ function findPanelInsertionPoint(post) {
   if (attachment instanceof Element) {
     const attachmentPoint = buildSafeInsertionBeforeElement(post, attachment);
     if (attachmentPoint) {
-      return attachmentPoint;
+      return normalizePanelInsertionPoint(post, attachmentPoint, fallbackPoint);
     }
   }
 
-  const headerBlock = findPostHeaderBlock(post);
-  if (headerBlock instanceof Element) {
-    const headerPoint = buildSafeInsertionAfterElement(post, headerBlock);
-    if (headerPoint) {
-      return headerPoint;
+  const actionBar = findActionBar(post);
+  if (actionBar instanceof Element) {
+    const actionBarPoint = buildSafeInsertionBeforeElement(post, actionBar);
+    if (actionBarPoint) {
+      return normalizePanelInsertionPoint(post, actionBarPoint, fallbackPoint);
     }
   }
 
@@ -6652,16 +6998,40 @@ function getSafePanelFallbackPoint(post) {
   }
 
   const headerBlock = findPostHeaderBlock(post);
-  if (headerBlock instanceof Element && headerBlock.parentElement instanceof Element) {
-    return {
-      parent: headerBlock.parentElement,
-      beforeNode: headerBlock.nextSibling || null
-    };
+  if (headerBlock instanceof Element) {
+    const headerPoint = buildSafeInsertionAfterElement(post, headerBlock);
+    if (headerPoint) {
+      return headerPoint;
+    }
+  }
+
+  const caption = findPostCaption(post);
+  if (caption instanceof Element) {
+    const captionPoint = buildSafeInsertionBeforeElement(post, caption);
+    if (captionPoint) {
+      return captionPoint;
+    }
+  }
+
+  const attachment = findPostAttachmentOrPreview(post);
+  if (attachment instanceof Element) {
+    const attachmentPoint = buildSafeInsertionBeforeElement(post, attachment);
+    if (attachmentPoint) {
+      return attachmentPoint;
+    }
+  }
+
+  const actionBar = findActionBar(post);
+  if (actionBar instanceof Element) {
+    const actionBarPoint = buildSafeInsertionBeforeElement(post, actionBar);
+    if (actionBarPoint) {
+      return actionBarPoint;
+    }
   }
 
   return {
     parent: post,
-    beforeNode: post.firstElementChild || null
+    beforeNode: null
   };
 }
 function buildSafeInsertionBeforeElement(post, target) {
@@ -6848,12 +7218,6 @@ let slot = ownedSlots[0] || null;
     scanStatus.duplicatePanelsRemoved += 1;
   }
 
-if (slot && isExistingPanelSlotStillSafe(slot, post)) {
-  scanStatus.panelSlotReused += 1;
-  cleanupDuplicatePanelArtifacts(post, slot);
-  return slot;
-}
-
   if (!slot) {
     slot = document.createElement("div");
     slot.className = "dili-panel-slot";
@@ -6875,7 +7239,14 @@ if (
   scanStatus.panelMountFallbackUsed += 1;
   insertionPoint = getSafePanelFallbackPoint(post);
 }
-  if (slot.parentElement !== insertionPoint.parent || slot.nextSibling !== insertionPoint.beforeNode) {
+
+if (slot.parentElement && isExistingPanelSlotStillSafe(slot, post) && isSlotAtInsertionPoint(slot, insertionPoint)) {
+  scanStatus.panelSlotReused += 1;
+  cleanupDuplicatePanelArtifacts(post, slot);
+  return slot;
+}
+
+  if (!isSlotAtInsertionPoint(slot, insertionPoint)) {
     if (insertionPoint.beforeNode instanceof Node) {
       insertionPoint.parent.insertBefore(slot, insertionPoint.beforeNode);
     } else {
@@ -6910,6 +7281,15 @@ if (isForbiddenPanelMountSurface(slot, post)) {
 
   cleanupDuplicatePanelArtifacts(post, slot);
   return slot;
+}
+
+function isSlotAtInsertionPoint(slot, insertionPoint) {
+  return Boolean(
+    slot instanceof Element &&
+    insertionPoint?.parent instanceof Element &&
+    slot.parentElement === insertionPoint.parent &&
+    slot.nextSibling === (insertionPoint.beforeNode || null)
+  );
 }
 
 function isExistingPanelSlotStillSafe(slot, post) {
@@ -7346,28 +7726,26 @@ function findActionBar(post) {
 
   async function sendRuntimeMessage(message) {
     if (scanRuntimeState.extensionContextInvalidated || isRuntimeInvalidated()) {
-      invalidateRuntimeContext();
-      return {
-        ok: false,
-        runtimeInvalidated: true,
-        error: "Extension context invalidated."
-      };
+      return buildRuntimeInvalidatedResponse("Extension context invalidated.");
     }
 
     try {
       const response = await chrome.runtime.sendMessage(message);
+      if (response?.runtimeInvalidated) {
+        return buildRuntimeInvalidatedResponse(response.error);
+      }
+
       if (!response?.ok) {
+        if (isRuntimeInvalidationError(response?.error)) {
+          return buildRuntimeInvalidatedResponse(response.error);
+        }
+
         console.warn("[DILI] Background returned an error", response?.error);
       }
       return response;
     } catch (error) {
       if (isRuntimeInvalidationError(error)) {
-        invalidateRuntimeContext();
-        return {
-          ok: false,
-          runtimeInvalidated: true,
-          error: "Extension context invalidated."
-        };
+        return buildRuntimeInvalidatedResponse(error);
       }
 
       console.warn("[DILI] Message dispatch failed", error);
@@ -7378,24 +7756,49 @@ function findActionBar(post) {
     }
   }
 
+  function buildRuntimeInvalidatedResponse(error) {
+    const message = getRuntimeErrorMessage(error, "Extension context invalidated.");
+    invalidateRuntimeContext(message);
+    return {
+      ok: false,
+      runtimeInvalidated: true,
+      error: message
+    };
+  }
+
+  function shouldAbortForRuntimeInvalidation(response) {
+    if (response?.runtimeInvalidated) {
+      invalidateRuntimeContext(response.error);
+      return true;
+    }
+
+    return scanRuntimeState.extensionContextInvalidated;
+  }
+
   function isRuntimeInvalidated() {
     return typeof chrome === "undefined" || !chrome.runtime?.id;
   }
 
   function isRuntimeInvalidationError(error) {
     const message = String(error?.message || error || "");
-    return /Extension context invalidated|context invalidated|Invalid extension context/i.test(message);
+    return /Extension context invalidated|context invalidated|Invalid extension context|message channel closed|receiving end does not exist|The message port closed|listener indicated an asynchronous response/i.test(message);
   }
 
-  function invalidateRuntimeContext() {
+  function getRuntimeErrorMessage(error, fallbackMessage) {
+    const message = String(error?.message || error || "").trim();
+    return message || fallbackMessage;
+  }
+
+  function invalidateRuntimeContext(error) {
     if (scanRuntimeState.extensionContextInvalidated) {
       return;
     }
 
+    const message = getRuntimeErrorMessage(error, "Extension context invalidated.");
     scanRuntimeState.extensionContextInvalidated = true;
     scanRuntimeState.enabled = false;
     scanStatus.enabled = false;
-    scanStatus.lastError = "Extension context invalidated.";
+    scanStatus.lastError = message;
     console.debug("[DILI] Extension context invalidated; stopping old content script instance.");
     stopScanning();
   }
@@ -7425,6 +7828,9 @@ function recordMaxScanStatusValue(key, value) {
     const response = await sendRuntimeMessage({
       type: MESSAGE_TYPES.GET_SCAN_STATE
     });
+    if (shouldAbortForRuntimeInvalidation(response)) {
+      return false;
+    }
 
     return response?.scanEnabled !== false;
   }

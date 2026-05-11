@@ -492,6 +492,7 @@ const canUseNoLinkInjectionBaseline = Boolean(
   const postContextFeatures = {
     domainPreviouslyFlagged,
     textMismatch: textComparison.mismatch,
+    linkInsertedAfterBaseline,
     integrityHashMismatch: Boolean(linkInsertedAfterBaseline || (isReanalysis && compatibleBaseline?.postIdentityStable === true && normalizedCandidateContext.candidateMode === "single" && hasCompatibleIntegrityMismatch(compatibleBaseline, {
       currentHash,
       analysisUrl,
@@ -519,12 +520,14 @@ const canUseNoLinkInjectionBaseline = Boolean(
   };
   const urlLevelFeaturesBase = {
     ...reusableUrlAnalysis.urlLevelFeatures,
-    wrapperToExternalDestination: enrichedUrlFeatures.wrapperToExternalDestination
+    wrapperToExternalDestination: enrichedUrlFeatures.wrapperToExternalDestination,
+    facebookWrapperUnwrapped: enrichedUrlFeatures.facebookWrapperUnwrapped
   };
-  let urlLevelFeatures = applyMainstreamResolvedShortlinkMitigation({
+  let urlLevelFeatures = applyTrustedRedirectDestinationMitigation({
     ...urlLevelFeaturesBase,
     trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(urlLevelFeaturesBase)
   }, reusableUrlAnalysis, endpointResult);
+  urlLevelFeatures = applyMainstreamResolvedShortlinkMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
   urlLevelFeatures = applyFacebookWrapperOnlyRedirectMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
   urlLevelFeatures = applySameDomainMarketingEncodingMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
   urlLevelFeatures = applyKnownBrandedCampaignRedirectMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
@@ -533,10 +536,11 @@ const canUseNoLinkInjectionBaseline = Boolean(
     ...urlLevelFeatures,
     ...postContextFeatures
   };
-  let features = applyMainstreamResolvedShortlinkMitigation({
+  let features = applyTrustedRedirectDestinationMitigation({
     ...combinedFeaturesBase,
     trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(combinedFeaturesBase)
   }, reusableUrlAnalysis, endpointResult);
+  features = applyMainstreamResolvedShortlinkMitigation(features, reusableUrlAnalysis, endpointResult);
   features = applyFacebookWrapperOnlyRedirectMitigation(features, reusableUrlAnalysis, endpointResult);
   features = applySameDomainMarketingEncodingMitigation(features, reusableUrlAnalysis, endpointResult);
   features = applyKnownBrandedCampaignRedirectMitigation(features, reusableUrlAnalysis, endpointResult);
@@ -613,17 +617,31 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
       demoScoreBiasAmount: demoScoreBias.amount
     };
   }
-  const classification = providerOverride
+  const finalClassification = providerOverride
     ? "High Risk"
     : verificationOnlyUnknown
       ? "Unverified"
       : classifySafetyScore(finalScore);
-  const interceptionRecommended = shouldRecommendInterceptionForStoredAnalysis({
-    classification,
-    safetyScore: finalScore,
-    features: finalFeatures,
-    providerResults
-  });
+  const finalInterceptionRecommended =
+    providerOverride === true ||
+    finalClassification === "High Risk" ||
+    finalClassification === "Suspicious" ||
+    Number(finalScore) < 60;
+  const finalUrlFeatureAnalysis = {
+    ...enrichedUrlFeatures,
+    providerCheckedUrl: reusableUrlAnalysis.providerCheckedUrl || "",
+    normalizedComparisonUrl:
+      reusableUrlAnalysis.urlFeatureAnalysis?.normalizedComparisonUrl ||
+      reusableUrlAnalysis.urlFeatureAnalysis?.sourceNormalizedUrl ||
+      enrichedUrlFeatures.normalizedUrl ||
+      "",
+    displayUrl:
+      normalizedCandidateContext.unwrappedCandidateUrl ||
+      normalizedCandidateContext.selectedNormalizedTarget ||
+      normalizedCandidateContext.rawHref ||
+      rawUrl ||
+      ""
+  };
   const nextState = finalFeatures.integrityHashMismatch ? "changed" : "monitored";
   const record = {
     postId,
@@ -647,20 +665,21 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     candidateDomainCount: normalizedCandidateContext.candidateDomainCount,
     selectedNormalizedTarget: normalizedCandidateContext.selectedNormalizedTarget,
     candidateContext: normalizedCandidateContext,
-    classification,
+    classification: finalClassification,
     safetyScore: finalScore,
     verificationState,
     verificationOnlyUnknown,
     concreteRiskSignals,
-    interceptionRecommended,
+    interceptionRecommended: finalInterceptionRecommended,
     features: finalFeatures,
     deductions: scoring.deductions,
     providerOverride,
     providerResults,
+    providerCheckedUrl: reusableUrlAnalysis.providerCheckedUrl || "",
     technicalDetails: buildTechnicalDetails({
       endpointResult,
       redirectAnalysis,
-      urlFeatureAnalysis: enrichedUrlFeatures,
+      urlFeatureAnalysis: finalUrlFeatureAnalysis,
       analysis: {
         postIntegrityEvent: linkInsertedAfterBaseline ? "link_inserted_after_no_link_baseline" : "",
         linkInsertedAfterBaseline,
@@ -668,7 +687,12 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         previousPostTextHash,
         currentPostTextHash,
         candidateContext: normalizedCandidateContext,
-        features: finalFeatures
+        features: finalFeatures,
+        classification: finalClassification,
+        safetyScore: finalScore,
+        providerOverride,
+        interceptionRecommended: finalInterceptionRecommended,
+        deductions: scoring.deductions
       },
       providerResults
     }),
@@ -677,7 +701,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     postIdentityStable: normalizedCandidateContext.postIdentityStable === true,
     integrityComparisonStatus: normalizedCandidateContext.postIdentityStable === true ? "checked" : "skipped-unstable-post-identity",
     redirectAnalysis,
-    urlFeatureAnalysis: enrichedUrlFeatures,
+    urlFeatureAnalysis: finalUrlFeatureAnalysis,
     candidateSource: normalizedCandidateContext.candidateSource || "",
     candidateUrlCompleteness: normalizedCandidateContext.candidateUrlCompleteness || "",
     candidateIsDomainOnlyFallback: normalizedCandidateContext.candidateIsDomainOnlyFallback === true,
@@ -723,15 +747,16 @@ if (providerFlaggedDomain) {
       domain,
       urlHash: currentHash,
       safetyScore: finalScore,
-      classification,
+      classification: finalClassification,
       verificationState,
       verificationOnlyUnknown,
       concreteRiskSignals,
-      interceptionRecommended,
+      interceptionRecommended: finalInterceptionRecommended,
       features: finalFeatures,
       providerResults,
       endpointResult,
       endpointConfidence: endpointResult.endpointConfidence,
+      providerCheckedUrl: reusableUrlAnalysis.providerCheckedUrl || "",
       limitations: record.limitations,
       providerOverride,
       state: nextState
@@ -748,7 +773,7 @@ if (providerFlaggedDomain) {
   logDebug(
     `Provider checks: gsb=${gsbResult.flagged} urlhaus=${urlhausResult.flagged}`
   );
-  logDebug(`Scoring result for ${postId}: safety=${finalScore} classification=${classification}`);
+  logDebug(`Scoring result for ${postId}: safety=${finalScore} classification=${finalClassification}`);
 const totalMs = elapsedMs(totalStartedAt);
 performanceStats.lastTotalAnalysisMs = totalMs;
 performanceStats.lastAnalyzedDomain = domain || "";
@@ -1049,6 +1074,9 @@ recordMaxPerformanceStat("maxProviderMs", providerMs);
     sourceUnwrappedUrl: urlFeatures.unwrappedUrl,
     sourceRawComparableUrl: urlFeatures.rawComparableUrl,
     finalAnalysisUrl: analysisUrl,
+    providerCheckedUrl,
+    normalizedComparisonUrl: urlFeatures.normalizedUrl,
+    displayUrl: urlFeatures.rawComparableUrl || urlFeatures.unwrappedUrl || urlFeatures.normalizedUrl || "",
     finalDomain: domain,
     endpointConfidence: endpointResult?.endpointConfidence || "",
     shortenedUrl: Boolean(urlFeatures.shortenedUrl || analysisUrlFeatures.shortenedUrl),
@@ -1162,15 +1190,21 @@ function buildUrlLevelFeatures({ redirectAnalysis, providerResults, urlFeatureAn
     crossDomainRedirectChain: safeRedirectAnalysis.crossDomainRedirectChain,
     redirectChainToDifferentRegistrantLikeTarget: safeRedirectAnalysis.redirectChainToDifferentRegistrantLikeTarget,
     wrapperToExternalDestination: Boolean(safeUrlFeatureAnalysis.wrapperToExternalDestination),
+    facebookWrapperUnwrapped: Boolean(safeUrlFeatureAnalysis.facebookWrapperUnwrapped),
     suspiciousRedirectPattern: safeRedirectAnalysis.suspiciousPattern,
     trackingHopToUnrelatedDomain: safeRedirectAnalysis.trackingHopToUnrelatedDomain,
     shortenerToUnrelatedDomain: safeRedirectAnalysis.shortenerToUnrelatedDomain,
     shortenedUrl: safeUrlFeatureAnalysis.shortenedUrl,
     obfuscatedUrl: safeUrlFeatureAnalysis.obfuscatedUrl,
+    obfuscationSignals: Array.isArray(safeUrlFeatureAnalysis.obfuscationSignals)
+      ? safeUrlFeatureAnalysis.obfuscationSignals
+      : [],
+    suspiciousEncoding: Boolean(safeUrlFeatureAnalysis.suspiciousEncoding),
     suspiciousTld: safeUrlFeatureAnalysis.suspiciousTld,
     textMismatch: false,
     excessiveQueryComplexity: safeUrlFeatureAnalysis.excessiveQueryComplexity,
     suspiciousPath: safeUrlFeatureAnalysis.suspiciousPath,
+    sensitiveArticleTopicTermsIgnored: safeUrlFeatureAnalysis.sensitiveArticleTopicTermsIgnored,
     excessiveSubdomainDepth: safeUrlFeatureAnalysis.excessiveSubdomainDepth,
     usernamePasswordTrick: safeUrlFeatureAnalysis.usernamePasswordTrick,
     trustedEndpoint: Boolean(safeUrlFeatureAnalysis.trustedEndpoint),
@@ -1311,10 +1345,205 @@ function shouldApplyWrapperRisk({ endpointResult = {}, redirectAnalysis = {}, ur
     safeFeatures.suspiciousFileExtension
   );
 }
+
+const TRUSTED_REDIRECT_DESTINATION_HOSTS = new Set([
+  "docs.google.com",
+  "forms.google.com",
+  "drive.google.com",
+  "youtube.com",
+  "youtu.be",
+  "twitch.tv",
+  "discord.com",
+  "github.com",
+  "notion.so",
+  "canva.com"
+]);
+
+// Trusted redirect sources are wrappers/shorteners that often hide the final URL
+// for measurement or campaign routing; they are not trusted destinations by themselves.
+const KNOWN_CAMPAIGN_REDIRECT_SOURCE_DOMAINS = new Set([
+  // Brand-owned short links
+  "cnn.it",
+  "hoyo.link",
+  "nyti.ms",
+
+  // Telecom / commerce campaign domains
+  "dito.ph",
+  "coca-cola.com",
+
+  // Google-owned redirect/share shortener
+  "forms.gle",
+
+  // Common campaign / tracking redirectors
+  "bit.ly",
+  "tinyurl.com",
+  "t.co",
+  "lnkd.in",
+  "buff.ly",
+  "ow.ly",
+  "rebrand.ly",
+  "linktr.ee",
+  "cutt.ly",
+  "shorturl.at",
+  "rb.gy"
+]);
+
+// Trusted destinations are final landing domains. Mitigation requires both an
+// expected redirect source and a trusted destination, with clean providers.
+const TRUSTED_REDIRECT_DESTINATION_DOMAINS = new Set([
+  // Google productivity/content
+  "docs.google.com",
+  "forms.google.com",
+  "drive.google.com",
+  "sites.google.com",
+
+  // Major media/content platforms
+  "youtube.com",
+  "youtu.be",
+  "twitch.tv",
+
+  // Developer/productivity platforms
+  "github.com",
+  "notion.so",
+  "canva.com",
+
+  // Common official/social destinations
+  "facebook.com",
+  "instagram.com",
+  "linkedin.com",
+  "x.com",
+  "twitter.com",
+
+  // Major commerce/payment platforms, still only trusted if providers are clean
+  "shopee.ph",
+  "lazada.com.ph",
+  "amazon.com"
+]);
+
+function applyTrustedRedirectDestinationMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
+  const finalUrl = endpointResult?.effectiveEndpoint || reusableUrlAnalysis.analysisUrl || "";
+  const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || safeHostname(finalUrl) || reusableUrlAnalysis.domain || "");
+  const rawChain =
+    Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
+      ? endpointResult.resolutionChain
+      : Array.isArray(reusableUrlAnalysis.redirectAnalysis?.redirectChain)
+        ? reusableUrlAnalysis.redirectAnalysis.redirectChain
+        : [];
+  const sourceDomain = getRedirectSourceDomain(rawChain);
+  const trustedDestination = isTrustedRedirectDestination(finalUrl, finalDomain);
+  const providerFlagged = Boolean(features.googleSafeBrowsingFlagged || features.urlhausFlagged || features.virusTotalFlagged);
+  // Provider detections always win; this mitigation only reduces redirect-only
+  // false positives after reputation providers and severe heuristics are clean.
+  const strongLocalSignal = Boolean(
+    features.suspiciousTld ||
+    features.suspiciousPath ||
+    features.usernamePasswordTrick ||
+    hasSevereObfuscationSignal(features) ||
+    features.integrityHashMismatch ||
+    features.rawIpHost ||
+    features.suspiciousFileExtension
+  );
+
+  if (!trustedDestination || providerFlagged || !features.httpsEndpoint || strongLocalSignal) {
+    return features;
+  }
+
+  const knownCampaignSource = Boolean(
+    isKnownCampaignRedirectSource(sourceDomain) ||
+    isKnownBrandedCampaignRedirect({
+      endpointResult,
+      redirectAnalysis: reusableUrlAnalysis.redirectAnalysis,
+      finalDomain,
+      finalUrl
+    }) ||
+    endpointResult?.isFacebookWrapper ||
+    features.facebookWrapperUnwrapped
+  );
+  const unknownShortenerSource = Boolean(features.shortenedUrl && !knownCampaignSource);
+
+  if (!knownCampaignSource && !unknownShortenerSource) {
+    return features;
+  }
+
+  const tier = knownCampaignSource ? "A" : "B";
+
+  return {
+    ...features,
+    suspiciousRedirectPattern: false,
+    shortenerToUnrelatedDomain: false,
+    trackingHopToUnrelatedDomain: false,
+    crossDomainRedirectChain: false,
+    redirectChainToDifferentRegistrantLikeTarget: false,
+    wrapperToExternalDestination: false,
+    textMismatch: false,
+    obfuscatedUrl: false,
+    excessiveQueryComplexity: false,
+    trustedRedirectDestination: true,
+    trustedRedirectDestinationDomain: finalDomain,
+    trustedRedirectSourceDomain: sourceDomain,
+    trustedRedirectTier: tier,
+    knownCampaignRedirectToTrustedDestination: knownCampaignSource,
+    trustedDestinationUnknownShortenerRedirect: unknownShortenerSource,
+    expectedRedirectBehavior: true,
+    trustedEndpoint: true,
+    trustedEndpointMitigationEligible: knownCampaignSource
+  };
+}
+
+function isKnownCampaignRedirectSource(sourceDomain = "") {
+  const normalized = String(sourceDomain || "").toLowerCase().replace(/^www\./, "");
+  return KNOWN_CAMPAIGN_REDIRECT_SOURCE_DOMAINS.has(normalized);
+}
+
+function hasSevereObfuscationSignal(features = {}) {
+  const signals = Array.isArray(features.obfuscationSignals)
+    ? features.obfuscationSignals.map((signal) => String(signal || "").toLowerCase())
+    : [];
+
+  return Boolean(
+    features.usernamePasswordTrick ||
+    signals.includes("double-encoding") ||
+    signals.includes("nested-url")
+  );
+}
+
+function isTrustedRedirectDestination(finalUrl = "", finalDomain = "") {
+  const host = safeHostname(finalUrl) || String(finalDomain || "").toLowerCase();
+  const normalizedHost = String(host || "").toLowerCase().replace(/^www\./, "");
+  const normalizedDomain = String(
+    finalDomain || getRegistrableDomain(normalizedHost) || ""
+  )
+    .toLowerCase()
+    .replace(/^www\./, "");
+
+  for (const trustedHost of TRUSTED_REDIRECT_DESTINATION_HOSTS) {
+    if (
+      normalizedHost === trustedHost ||
+      normalizedHost.endsWith(`.${trustedHost}`)
+    ) {
+      return true;
+    }
+  }
+
+  if (TRUSTED_REDIRECT_DESTINATION_DOMAINS.has(normalizedHost)) {
+    return true;
+  }
+
+  if (TRUSTED_REDIRECT_DESTINATION_DOMAINS.has(normalizedDomain)) {
+    return true;
+  }
+
+  return false;
+}
+
 // This is a conservative local allowlist for high-confidence HTTPS shortlinks
 // resolving to well-known destinations. It does not override provider flags,
 // suspicious paths, suspicious TLDs, text mismatch, or post-integrity changes.
 function applyMainstreamResolvedShortlinkMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
+  if (features.trustedDestinationUnknownShortenerRedirect) {
+    return features;
+  }
+
   const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
   const resolutionChain = Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
     ? endpointResult.resolutionChain
@@ -1471,9 +1700,25 @@ function applySameDomainMarketingEncodingMitigation(features = {}, reusableUrlAn
 
 const KNOWN_BRANDED_CAMPAIGN_REDIRECTS = [
   {
+    sourceDomain: "cnn.it",
+    allowedFinalDomains: ["cnn.com"]
+  },
+  {
+    sourceDomain: "nyti.ms",
+    allowedFinalDomains: ["nytimes.com"]
+  },
+  {
     sourceDomain: "hoyo.link",
     allowedFinalDomains: ["twitch.tv", "youtube.com", "hoyoverse.com", "hoyolab.com"],
     requiredPathHints: ["genshinimpactofficial", "hoyoverse", "hoyolab", "genshin"]
+  },
+  {
+    sourceDomain: "dito.ph",
+    allowedFinalDomains: ["dito.ph"]
+  },
+  {
+    sourceDomain: "coca-cola.com",
+    allowedFinalDomains: ["coca-cola.com"]
   }
 ];
 
@@ -1627,6 +1872,14 @@ function applySoftUncertaintyCap(finalScore, {
 
   if (score === 100 && features.knownBrandedCampaignRedirect) {
     score = 95;
+  }
+
+  if (score === 100 && features.knownCampaignRedirectToTrustedDestination) {
+    score = 95;
+  }
+
+  if (features.trustedDestinationUnknownShortenerRedirect) {
+    score = Math.min(score, 89);
   }
 
   if (score === 100 && features.knownGoogleFormsRedirect) {
@@ -1824,6 +2077,9 @@ function shouldShowRedirectNoteAfterMitigation(note, features = {}) {
     features.knownBrandedCampaignRedirect ||
     features.knownGoogleFormsRedirect ||
     features.googleFormsViaGenericShortener ||
+    features.trustedRedirectDestination ||
+    features.knownCampaignRedirectToTrustedDestination ||
+    features.trustedDestinationUnknownShortenerRedirect ||
     features.mainstreamResolvedShortlink ||
     features.knownShortenerOwnerRedirect ||
     features.softExternalFormCaution ||
@@ -1912,6 +2168,26 @@ function getHostnameFromUrlOrDomainText(value) {
   return "";
 }
 
+function getPrimaryProviderCheckedUrl(providerResults = []) {
+  for (const provider of normalizeProviderResults(providerResults)) {
+    const checkedUrl = String(provider?.checkedUrl || "").trim();
+    if (checkedUrl) {
+      return checkedUrl;
+    }
+  }
+
+  return "";
+}
+
+function hasPathOrQueryUrl(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ""));
+    return ["http:", "https:"].includes(url.protocol) && Boolean((url.pathname && url.pathname !== "/") || url.search);
+  } catch {
+    return false;
+  }
+}
+
 function buildTechnicalDetails({ endpointResult = {}, redirectAnalysis = {}, urlFeatureAnalysis = {}, analysis = {}, providerResults = [] } = {}) {
   const details = [];
   const effectiveDomain = endpointResult.effectiveDomain || urlFeatureAnalysis.finalDomain || "";
@@ -1926,6 +2202,38 @@ const redirectChain =
   redirectAnalysis.redirectChain ||
   endpointResult.resolutionChain ||
   [];
+  const candidateSource = String(candidateContext.candidateSource || "").trim();
+  const candidateCompleteness = String(candidateContext.candidateUrlCompleteness || "").trim();
+  const providerCheckedUrl = getPrimaryProviderCheckedUrl(providerResults) || urlFeatureAnalysis.providerCheckedUrl || "";
+  const normalizedComparisonUrl = urlFeatureAnalysis.normalizedComparisonUrl || urlFeatureAnalysis.sourceNormalizedUrl || "";
+  const displayUrl = urlFeatureAnalysis.displayUrl || candidateContext.unwrappedCandidateUrl || candidateContext.selectedNormalizedTarget || candidateContext.rawHref || "";
+
+  if (candidateSource) {
+    details.push(`Candidate source: ${candidateSource}.`);
+  }
+
+  if (candidateCompleteness) {
+    details.push(`Candidate completeness: ${candidateCompleteness}.`);
+  }
+
+  if (providerCheckedUrl) {
+    if (!isDomainOnlyFallbackAnalysis && hasPathOrQueryUrl(providerCheckedUrl)) {
+      details.push(`Provider checked full endpoint URL: ${providerCheckedUrl}.`);
+    } else if (isDomainOnlyFallbackAnalysis) {
+      details.push("Provider checked scope: visible domain only.");
+    } else {
+      details.push(`Provider checked URL: ${providerCheckedUrl}.`);
+    }
+  }
+
+  if (normalizedComparisonUrl) {
+    details.push(`Normalized comparison URL: ${normalizedComparisonUrl}.`);
+  }
+
+  if (displayUrl) {
+    details.push(`Display URL: ${displayUrl}.`);
+  }
+
   if (endpointResult.isFacebookWrapper && effectiveDomain) {
     details.push(`Facebook wrapper unwrapped to ${effectiveDomain}.`);
   }
@@ -1951,8 +2259,10 @@ if (redirectChain.length > 0) {
     details.push(`Unwrapped URL: ${endpointResult.unwrappedUrl}.`);
   }
 
-  if (endpointResult.effectiveEndpoint && !isDomainOnlyFallbackAnalysis) {
+  if (endpointResult.effectiveEndpoint && !isDomainOnlyFallbackAnalysis && hasPathOrQueryUrl(endpointResult.effectiveEndpoint)) {
     details.push(`Full endpoint URL: ${endpointResult.effectiveEndpoint}.`);
+  } else if (endpointResult.effectiveEndpoint && !isDomainOnlyFallbackAnalysis) {
+    details.push(`Endpoint URL: ${endpointResult.effectiveEndpoint}.`);
   } else if (endpointResult.effectiveEndpoint && isDomainOnlyFallbackAnalysis) {
     details.push(`Checked fallback URL: ${endpointResult.effectiveEndpoint}.`);
   }
@@ -1986,7 +2296,13 @@ if (
   }
 
   if (finalFeatures.knownBrandedCampaignRedirect) {
+    details.push("Known branded redirect recognized.");
+    details.push("Redirect mitigation applied: initial and final domains belong to expected brand family.");
     details.push("Known branded campaign redirect recognized; DILI treated the redirect as lower risk because providers were clean and the final destination matched an expected campaign platform.");
+  }
+
+  if (finalFeatures.sensitiveArticleTopicTermsIgnored) {
+    details.push("Sensitive article-topic terms were not treated as phishing terms by themselves.");
   }
 
   if (finalFeatures.knownGoogleFormsRedirect) {
@@ -1997,8 +2313,34 @@ if (
     details.push("Google Forms final endpoint recognized through a generic shortener; DILI treated redirect mechanics as lower risk because providers were clean, but form ownership should still be verified.");
   }
 
+  if (finalFeatures.knownCampaignRedirectToTrustedDestination) {
+    details.push("Known campaign redirect resolved to trusted destination.");
+  }
+
+  if (finalFeatures.trustedDestinationUnknownShortenerRedirect) {
+    details.push("Redirect trust tier B: unknown shortener resolved to a trusted destination with clean providers.");
+  }
+
   if (finalFeatures.softUncertaintyCapApplied) {
     details.push("Safety score was softly capped because DILI can verify URL reputation, but some destination content remains outside URL-reputation scope.");
+  }
+
+  const providerFlagged = normalizeProviderResults(providerResults).some((provider) => provider?.flagged === true);
+  if (analysis.interceptionRecommended === true) {
+    const score = Number(analysis.safetyScore);
+    if (providerFlagged || analysis.providerOverride === true) {
+      details.push("Navigation pause reason: provider flagged this URL.");
+    } else if (analysis.classification === "High Risk") {
+      details.push("Navigation pause reason: High Risk classification.");
+    } else if (analysis.classification === "Suspicious") {
+      details.push("Navigation pause reason: Suspicious classification.");
+    } else if (Number.isFinite(score) && score < 60) {
+      details.push("Navigation pause reason: final score below 60.");
+    }
+  }
+
+  for (const detail of buildCombinedRiskTechnicalDetails(finalFeatures)) {
+    details.push(detail);
   }
 
   if (analysis.postIntegrityEvent) {
@@ -2024,10 +2366,8 @@ if (
   if (
     isDomainOnlyFallbackAnalysis
   ) {
-    details.push("Candidate source: visible-domain-fallback.");
     details.push("Endpoint source note: Facebook did not expose a full clickable URL for this card, so DILI checked the visible domain only.");
-    details.push("Provider checked scope: visible domain only.");
-    details.push("Full endpoint extraction status: No full path/query URL was exposed during passive scan.");
+    details.push("Passive scan did not expose a full path/query endpoint.");
     details.push("Click-time note: If the user clicks this card, DILI will re-check the actual clicked destination before navigation.");
   }
 
@@ -2087,6 +2427,48 @@ for (const provider of normalizeProviderResults(providerResults)) {
 
 }
 
+function buildCombinedRiskTechnicalDetails(features = {}) {
+  const details = [];
+  const redirectCount = Number(features.redirectCount || 0);
+  const hasRedirect = Boolean(
+    redirectCount > 0 ||
+    features.wrapperToExternalDestination ||
+    features.crossDomainRedirectChain ||
+    features.suspiciousRedirectPattern ||
+    features.shortenerToUnrelatedDomain
+  );
+
+  if (features.shortenedUrl && (features.crossDomainRedirectChain || features.shortenerToUnrelatedDomain || features.redirectChainToDifferentRegistrantLikeTarget)) {
+    details.push("Combined risk: shortener and cross-domain redirect.");
+  }
+
+  if (features.shortenedUrl && features.textMismatch) {
+    details.push("Combined risk: hidden destination and visible/final mismatch.");
+  }
+
+  if (features.shortenedUrl && features.wrapperToExternalDestination && (features.facebookWrapperUnwrapped || features.crossDomainRedirectChain || features.shortenerToUnrelatedDomain)) {
+    details.push("Combined risk: Facebook wrapper, shortener, and external final destination.");
+  }
+
+  if (features.obfuscatedUrl && hasRedirect) {
+    details.push("Combined risk: obfuscated or encoded URL plus redirect behavior.");
+  }
+
+  if (features.suspiciousPath && (features.shortenedUrl || hasRedirect)) {
+    details.push("Combined risk: credential/payment/prize path indicators plus hidden destination behavior.");
+  }
+
+  if (features.integrityHashMismatch && features.linkInsertedAfterBaseline) {
+    details.push("Combined risk: post-integrity change introduced a new link.");
+  }
+
+  if (features.domainPreviouslyFlagged && (features.shortenedUrl || features.wrapperToExternalDestination || features.crossDomainRedirectChain || features.textMismatch || features.obfuscatedUrl)) {
+    details.push("Combined risk: weak reputation signal plus structural destination hiding.");
+  }
+
+  return details;
+}
+
 function isVirusTotalResultDisplayRelevant(provider = {}) {
   const status = String(provider.details?.status || "").toLowerCase();
   return Boolean(
@@ -2098,7 +2480,6 @@ function isVirusTotalResultDisplayRelevant(provider = {}) {
 }
 
 function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
-  const features = analysis.features || {};
   const score = Number(analysis.safetyScore);
   const classification = String(analysis.classification || "").toLowerCase();
   const providerResults = normalizeProviderResults(analysis.providerResults || []);
@@ -2106,7 +2487,7 @@ function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
   const urlhaus = providerResults.find((item) => item.provider === "urlhaus");
   const virusTotal = providerResults.find((item) => item.provider === "virustotal");
 
-  if (gsb?.flagged || urlhaus?.flagged || virusTotal?.flagged) {
+  if (analysis.providerOverride === true || gsb?.flagged || urlhaus?.flagged || virusTotal?.flagged) {
     return true;
   }
   if (classification.includes("high risk") || classification.includes("suspicious")) {
@@ -2114,10 +2495,6 @@ function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
   }
 
   if (Number.isFinite(score) && score < 60) {
-    return true;
-  }
-
-  if (features.integrityHashMismatch && Number.isFinite(score) && score < 75) {
     return true;
   }
 

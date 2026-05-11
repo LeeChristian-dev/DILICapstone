@@ -122,6 +122,23 @@ const SUSPICIOUS_PATH_TOKEN_PATTERNS = [
   "claim"
 ];
 
+const PHISHING_OR_SCAM_INTENT_PATH_TOKENS = [
+  ...SUSPICIOUS_PATH_TOKEN_PATTERNS,
+  "prize",
+  "reward",
+  "free",
+  "urgent"
+];
+
+const SENSITIVE_ARTICLE_TOPIC_TERMS = [
+  "porn",
+  "abuse",
+  "assault",
+  "crime",
+  "investigation",
+  "violence"
+];
+
 const SUSPICIOUS_QUERY_KEYS = new Set([
   "token",
   "session",
@@ -487,6 +504,8 @@ export function analyzeUrlFeatures(input) {
     suspiciousQueryKeys: queryAnalysis.suspiciousKeys,
     suspiciousPath: pathAnalysis.flagged,
     suspiciousPathTokens: pathAnalysis.tokens,
+    sensitiveArticleTopicTerms: pathAnalysis.sensitiveArticleTopicTerms,
+    sensitiveArticleTopicTermsIgnored: pathAnalysis.sensitiveArticleTopicTermsIgnored,
     nestedUrlInPath: pathAnalysis.nestedUrlInPath,
     excessiveSubdomainDepth: subdomainDepth >= 3,
     subdomainDepth,
@@ -648,17 +667,27 @@ function analyzePathRisk(parsedUrl) {
     return {
       flagged: false,
       tokens: [],
+      sensitiveArticleTopicTerms: [],
+      sensitiveArticleTopicTermsIgnored: false,
       nestedUrlInPath: false
     };
   }
 
   const pathSource = `${parsedUrl.pathname} ${parsedUrl.search}`.toLowerCase();
-  const tokens = SUSPICIOUS_PATH_TOKEN_PATTERNS.filter((token) => pathSource.includes(token));
+  const baseTokens = SUSPICIOUS_PATH_TOKEN_PATTERNS.filter((token) => pathSource.includes(token));
+  const articleTopicTerms = SENSITIVE_ARTICLE_TOPIC_TERMS.filter((token) => pathSource.includes(token));
+  const phishingIntentTokens = PHISHING_OR_SCAM_INTENT_PATH_TOKENS.filter((token) => pathSource.includes(token));
+  const articleTopicWithPhishingIntent = Boolean(articleTopicTerms.length > 0 && phishingIntentTokens.length > 0);
+  const tokens = articleTopicWithPhishingIntent
+    ? unique([...baseTokens, ...phishingIntentTokens, ...articleTopicTerms])
+    : unique(baseTokens);
   const nestedUrlInPath = /https?:\/\//i.test(parsedUrl.pathname) || /https?%3a%2f%2f/i.test(parsedUrl.pathname);
 
   return {
-    flagged: tokens.length > 0 || nestedUrlInPath,
+    flagged: baseTokens.length > 0 || articleTopicWithPhishingIntent || nestedUrlInPath,
     tokens,
+    sensitiveArticleTopicTerms: unique(articleTopicTerms),
+    sensitiveArticleTopicTermsIgnored: articleTopicTerms.length > 0 && !articleTopicWithPhishingIntent,
     nestedUrlInPath
   };
 }

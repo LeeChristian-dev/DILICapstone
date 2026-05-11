@@ -33,6 +33,8 @@ DILI prefers full clickable, embedded, hidden-attribute, and wrapper-unwrapped U
 
 Facebook wrappers are shown in Technical Details for auditability, but normal user-facing summaries prefer the visible post URL/text or unwrapped target.
 
+When a post exposes a full endpoint through an anchor href, Facebook `l.php` wrapper target, `data-lynx-uri`, `data-url`, `ajaxify`, visible caption text, or embedded card URL, DILI uses that full endpoint for provider checks. The provider checked URL preserves available path and query parameters, including product IDs, `utm_*`, `fbclid`, campaign IDs, and ad IDs. Tracking parameters may still be stripped separately for comparison normalization, duplicate detection, and cleaner display.
+
 When Facebook only exposes a visible domain for a sponsored card and does not expose the full href/data-url/data-lynx-uri to the extension, DILI labels the scan as a visible-domain fallback. When a full clickable URL is available, DILI prefers that full URL over the visible-domain fallback.
 
 ### Full endpoint extraction limitation
@@ -114,6 +116,8 @@ DILI computes a **Safety Score** using a subtractive model:
 
 **Provider-flagged results:** URLs flagged by Google Safe Browsing, URLhaus, or optional VirusTotal are classified as High Risk. Provider errors and rate limits do not directly deduct score points.
 
+DILI uses score bands for display and navigation decisions. Suspicious results, High Risk results, provider-flagged results, and final scores below 60 trigger a navigation pause before opening the destination. Caution and Low Caution are shown inline but do not block by default unless combined with stronger evidence.
+
 ### Local domain memory
 
 DILI only stores a local flagged-domain memory when an external provider, such as Google Safe Browsing, URLhaus, or optional VirusTotal, flags the destination. Heuristic-only High Risk results do not permanently flag a domain.
@@ -124,15 +128,17 @@ Clearing session logs also clears local flagged-domain records so test runs are 
 
 Shortened links are treated as caution signals, not automatic malicious signals. A shortened link is escalated more strongly only when combined with stronger warning signs such as provider flags, suspicious paths, suspicious TLDs, visible-domain mismatch, post-integrity changes, or very long redirect chains.
 
+Single weak indicators, such as an ordinary shortener, are treated mildly to reduce false positives. Combined indicators, such as a shortener plus cross-domain redirect, mismatch, obfuscation, or link-injection evidence, receive stronger deductions.
+
+Visible-domain fallback is not treated as proof of danger by itself. It is a limited verification mode used when Facebook does not expose the full endpoint during passive scanning.
+
 ### Interception Policy
 
 DILI only pauses navigation by default when:
 
 - a provider flags the URL,
 - classification is Suspicious or High Risk,
-- score is below `60`,
-- a post-integrity change is combined with a score below `75`,
-- or an unverified destination also has other risk indicators.
+- or the final score is below `60`.
 
 ## Popup Dashboard
 
@@ -215,7 +221,7 @@ DILI records compact verification evidence for Google Safe Browsing, URLhaus, an
 
 This evidence is shown in Technical Details and included in CSV/report exports to improve auditability, demonstrate that provider scans ran, and support cybersecurity awareness and transparency during evaluation.
 
-Provider telemetry is informational only. It does not directly affect Safety Score deductions, classification thresholds, or warning/interception decisions.
+Provider operational telemetry, such as timeout, error, pending, and rate-limit states, is informational only. It does not directly affect Safety Score deductions, classification thresholds, or warning/interception decisions.
 
 ## Provider Result Cache
 
@@ -225,7 +231,11 @@ Facebook can lazy-load or mutate posts after they first appear, so DILI performs
 
 Cached provider results preserve their original `checkedAt` timestamp and do not change Safety Score rules. The provider cache is cleared when session logs are cleared, the session is restarted, or provider keys change.
 
-DILI may apply conservative false-positive mitigation for explicitly mapped branded campaign redirectors when providers are clean and the final destination matches the expected campaign platform. This does not apply to unknown shorteners or provider-flagged links.
+DILI may apply conservative false-positive mitigation for explicitly mapped branded campaign redirectors when providers are clean and the final destination matches the expected brand family. Current examples include `cnn.it` to `cnn.com`/`edition.cnn.com`, known `hoyo.link` campaign redirects to approved HoYoverse/Twitch/YouTube destinations, DITO internal redirects, and same-domain Coca-Cola campaign redirects. This does not apply to unknown shorteners or provider-flagged links.
+
+Sensitive article-topic words in legitimate news URLs, such as crime, abuse, assault, investigation, violence, or porn, are not treated as phishing terms by themselves. DILI only treats those topic words as suspicious when they appear together with phishing or scam intent such as login, verify, claim, reward, wallet, password, payment, account, free, or urgent.
+
+DILI also applies a narrow trusted redirect destination mitigation for clean redirects to selected productivity and content platforms such as `docs.google.com`, `forms.google.com`, `drive.google.com`, `youtube.com`, `twitch.tv`, `discord.com`, `github.com`, `notion.so`, and `canva.com`. Known campaign or tracking redirects to those destinations are treated as expected redirect behavior when providers are clean. Unknown shorteners to those destinations remain at Low Caution rather than Safe. Unknown redirects to unknown destinations, provider-flagged URLs, and phishing-pattern destinations remain strict.
 
 ## Provider Caveats
 
@@ -255,7 +265,7 @@ DILI may apply conservative false-positive mitigation for explicitly mapped bran
 - Known owner shortlinks such as `youtu.be` -> `youtube.com` are treated as lower-risk when providers are clean and the resolved endpoint matches the expected owner domain, but they are not exempt from provider flags or stronger warning signs.
 - Technical Details are grouped into readable sections. Long provider, wrapper, and redirect URLs wrap inside the panel instead of forcing horizontal overflow. Provider checked URLs and final endpoint evidence remain visible, while optimization/debug telemetry is kept out of the normal user-facing panel and advanced audit data is kept in an expanded subsection to reduce clutter.
 - DILI checks URL structure, redirect behavior, and provider reputation. It does not verify the legitimacy of claims inside external messaging groups, community channels, or pages that require joining or logging in, such as Telegram or Discord invites.
-- Messaging/community invite links may receive a normal Safe classification when provider checks are clean, but DILI may softly cap perfect scores because it cannot verify group/channel content, future messages, members, or claims inside the platform. This soft cap is not a provider flag and does not mean the URL is malicious.
+- Messaging/community invite links may receive a normal Safe classification when provider checks are clean, but DILI may softly cap perfect scores because it cannot verify group/channel content, future messages, members, or claims inside the platform. This soft cap is not a provider flag and does not mean the URL is malicious. If a provider flags the URL or the result is High Risk, DILI uses High Risk wording and does not show safe/open-normal guidance.
 - DILI pauses navigation for Suspicious or High Risk links. Clicking Proceed anyway opens a second confirmation dialog before the destination is opened. DILI does not automatically report posts to Facebook; it provides instructions for using Facebook's built-in report menu and choosing the closest available report reason.
 - Facebook's report flow varies between normal posts and ads. Users may see options such as Report post, Find support or report post, Report ad, Scam/Fraud/Impersonation, Spam, False information, or related subcategories; choose the closest available reason shown by Facebook.
 - Plain email addresses are not treated as destination links unless Facebook exposes them as actual clickable links.

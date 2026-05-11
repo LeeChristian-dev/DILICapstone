@@ -45,7 +45,7 @@ export async function resolveEndpoint(rawUrl) {
   let wrapperAnalysis = null;
 
   try {
-    normalizedRawUrl = canonicalizeUrl(source, { stripTracking: true });
+    normalizedRawUrl = canonicalizeUrl(source, { stripTracking: false });
     wrapperAnalysis = unwrapKnownRedirectWrappers(source);
   } catch (error) {
     errors.push(error?.message || "URL normalization failed.");
@@ -103,7 +103,7 @@ export async function resolveEndpoint(rawUrl) {
   try {
     redirectAnalysis = await analyzeRedirects(source);
     if (redirectAnalysis?.resolvedUrl) {
-      resolvedUrl = normalizeUrl(redirectAnalysis.resolvedUrl);
+      resolvedUrl = normalizeUrl(redirectAnalysis.resolvedUrl, { stripTracking: false });
       resolutionMethod = redirectAnalysis.resolutionMethod || resolutionMethod;
       endpointConfidence = redirectAnalysis.fetchAttempted
         ? redirectAnalysis.fetchSucceeded && redirectAnalysis.resolvedUrl
@@ -203,7 +203,7 @@ function isFacebookHost(hostname) {
 
 function safelyNormalize(rawUrl) {
   try {
-    return normalizeUrl(rawUrl);
+    return normalizeUrl(rawUrl, { stripTracking: false });
   } catch {
     return String(rawUrl || "").trim();
   }

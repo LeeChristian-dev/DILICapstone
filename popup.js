@@ -507,7 +507,7 @@ function convertRecordsToCsv(records) {
       features.integrityHashMismatch ?? "",
       record.state || "",
       record.verificationState || "",
-      record.interceptionRecommended ?? inferInterceptionRecommended(record),
+      inferInterceptionRecommended(record),
       "",
       "",
       "",
@@ -521,29 +521,24 @@ function convertRecordsToCsv(records) {
 }
 
 function inferInterceptionRecommended(record = {}) {
-  const features = record.features || {};
   const score = Number(record.safetyScore);
   const classification = String(record.classification || "").toLowerCase();
   const gsb = findProviderResult(record.providerResults, "gsb");
   const urlhaus = findProviderResult(record.providerResults, "urlhaus");
+  const vt = findProviderResult(record.providerResults, "virustotal");
+  const providerFlagged = Array.isArray(record.providerResults) && record.providerResults.some((item) => item?.flagged === true);
 
-  if (gsb?.flagged || urlhaus?.flagged) {
-    return true;
-  }
-
-  if (classification.includes("high risk") || classification.includes("suspicious")) {
-    return true;
-  }
-
-  if (Number.isFinite(score) && score < 60) {
-    return true;
-  }
-
-  if (features.integrityHashMismatch && Number.isFinite(score) && score < 75) {
-    return true;
-  }
-
-  return false;
+  return Boolean(
+    record.interceptionRecommended === true ||
+    record.providerOverride === true ||
+    classification === "high risk" ||
+    classification === "suspicious" ||
+    (Number.isFinite(score) && score < 60) ||
+    providerFlagged ||
+    gsb?.flagged === true ||
+    urlhaus?.flagged === true ||
+    vt?.flagged === true
+  );
 }
 
 function downloadCsv(csvText) {

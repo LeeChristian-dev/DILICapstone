@@ -19,6 +19,9 @@
   font: 600 13px/1.45 "Segoe UI", Tahoma, sans-serif;
   box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
   min-width: 0;
+  clear: both;
+  position: relative;
+  z-index: 2147483000;
   overflow-wrap: anywhere;
   word-break: break-word;
   white-space: normal;
@@ -56,6 +59,10 @@
   box-sizing: border-box;
   margin: 0;
   padding: 0;
+  clear: both;
+  position: relative;
+  z-index: 2147483000;
+  overflow-wrap: anywhere;
 }
 
 .dili-panel-safe {

@@ -122,27 +122,112 @@ const CATEGORY_CAPS = {
 
 const COMBINATION_RULES = [
   {
-  id: "shortenerRedirectCombo",
-  deduction: 8,
-  label: "A shortened URL is combined with stronger warning signs.",
-  when(features) {
-    const redirectCount = Number(features.redirectCount || 0);
+    id: "shortenerCrossDomainRedirectCombo",
+    category: "redirect_behavior",
+    deduction: 10,
+    label: "A shortened URL also redirects across domains.",
+    when(features) {
+      return Boolean(
+        features.shortenedUrl &&
+        (
+          features.crossDomainRedirectChain ||
+          features.shortenerToUnrelatedDomain ||
+          features.redirectChainToDifferentRegistrantLikeTarget
+        )
+      );
+    }
+  },
+  {
+    id: "shortenerVisibleMismatchCombo",
+    category: "display_mismatch",
+    deduction: 12,
+    label: "A shortened URL hides a destination that does not match the visible text.",
+    when(features) {
+      return Boolean(features.shortenedUrl && features.textMismatch);
+    }
+  },
+  {
+    id: "facebookWrapperShortenerExternalCombo",
+    category: "endpoint_resolution",
+    deduction: 8,
+    label: "A Facebook wrapper and shortened URL add multiple layers before the external destination.",
+    when(features) {
+      return Boolean(
+        features.shortenedUrl &&
+        features.wrapperToExternalDestination &&
+        (features.facebookWrapperUnwrapped || features.crossDomainRedirectChain || features.shortenerToUnrelatedDomain)
+      );
+    }
+  },
+  {
+    id: "suspiciousPathHiddenDestinationCombo",
+    category: "obfuscation",
+    deduction: 20,
+    label: "Credential, payment, or prize-themed path indicators are combined with hidden destination behavior.",
+    when(features) {
+      const redirectCount = Number(features.redirectCount || 0);
+      return Boolean(
+        features.suspiciousPath &&
+        (
+          features.shortenedUrl ||
+          features.wrapperToExternalDestination ||
+          features.crossDomainRedirectChain ||
+          features.suspiciousRedirectPattern ||
+          redirectCount > 0
+        )
+      );
+    }
+  },
+  {
+    id: "integrityLinkInjectionCombo",
+    category: "post_integrity",
+    deduction: 10,
+    label: "A newly introduced link matches the post-integrity link-injection threat model.",
+    when(features) {
+      return Boolean(features.integrityHashMismatch && features.linkInsertedAfterBaseline);
+    }
+  },
+  {
+    id: "weakProviderStructuralHidingCombo",
+    category: "provider_reputation",
+    deduction: 8,
+    label: "A weak reputation signal is combined with structural destination hiding.",
+    when(features) {
+      return Boolean(
+        features.domainPreviouslyFlagged &&
+        (
+          features.shortenedUrl ||
+          features.wrapperToExternalDestination ||
+          features.crossDomainRedirectChain ||
+          features.textMismatch ||
+          features.obfuscatedUrl
+        )
+      );
+    }
+  },
+  {
+    id: "shortenerRedirectCombo",
+    deduction: 8,
+    label: "A shortened URL is combined with stronger warning signs.",
+    when(features) {
+      const redirectCount = Number(features.redirectCount || 0);
 
-    return Boolean(
-      features.shortenedUrl &&
-      (
-        features.googleSafeBrowsingFlagged ||
-        features.urlhausFlagged ||
-        features.textMismatch ||
-        features.suspiciousTld ||
-        features.suspiciousPath ||
-        features.usernamePasswordTrick ||
-        features.integrityHashMismatch ||
-        redirectCount >= 4
-      )
-    );
-  }
-},
+      return Boolean(
+        features.shortenedUrl &&
+        (
+          features.googleSafeBrowsingFlagged ||
+          features.urlhausFlagged ||
+          features.virusTotalFlagged ||
+          features.textMismatch ||
+          features.suspiciousTld ||
+          features.suspiciousPath ||
+          features.usernamePasswordTrick ||
+          features.integrityHashMismatch ||
+          redirectCount >= 4
+        )
+      );
+    }
+  },
   {
     id: "wrapperMismatchCombo",
     deduction: 10,
@@ -153,13 +238,15 @@ const COMBINATION_RULES = [
   },
   {
     id: "providerRedirectCombo",
+    category: "provider_reputation",
     deduction: 10,
     label: "Threat-intelligence flags are reinforced by suspicious redirect behavior.",
     when(features) {
       return Boolean(
         (
           features.googleSafeBrowsingFlagged ||
-          features.urlhausFlagged
+          features.urlhausFlagged ||
+          features.virusTotalFlagged
         ) &&
         (
           features.crossDomainRedirectChain ||
@@ -178,10 +265,20 @@ const COMBINATION_RULES = [
   },
   {
     id: "obfuscationRedirectCombo",
-    deduction: 10,
+    category: "obfuscation",
+    deduction: 14,
     label: "Obfuscation indicators are combined with redirect-based concealment.",
     when(features) {
-      return Boolean(features.obfuscatedUrl && (features.wrapperToExternalDestination || features.suspiciousRedirectPattern));
+      const redirectCount = Number(features.redirectCount || 0);
+      return Boolean(
+        features.obfuscatedUrl &&
+        (
+          features.wrapperToExternalDestination ||
+          features.suspiciousRedirectPattern ||
+          features.crossDomainRedirectChain ||
+          redirectCount > 0
+        )
+      );
     }
   }
 ];
@@ -258,7 +355,7 @@ export function calculateSafetyScore(features = {}) {
     const appliedDeduction = triggered ? rule.deduction : 0;
 
     if (triggered) {
-      addCategoryDeduction(categoryTotals, inferRuleCategory(rule.id), rule.deduction);
+      addCategoryDeduction(categoryTotals, rule.category || inferRuleCategory(rule.id), rule.deduction);
     }
 
     deductions.push({

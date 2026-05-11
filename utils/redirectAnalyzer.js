@@ -29,7 +29,13 @@ const ACTIVE_PROBE_REDIRECT_HOSTS = new Set([
   "lnkd.in",
   "rb.gy",
   "s.id",
-  "bl.ink"
+  "bl.ink",
+  "cnn.it",
+  "hoyo.link",
+  "dito.ph",
+  "eshop.dito.ph",
+  "my.dito.ph",
+  "coca-cola.com"
 ]);
 
 /**
@@ -154,7 +160,7 @@ export async function analyzeRedirects(rawUrl) {
     chain: redirectChain,
     redirectDomains: redirectSummary.redirectDomains,
     uniqueRegistrableDomains: redirectSummary.uniqueRegistrableDomains,
-    resolvedUrl: normalizeUrl(currentUrl),
+    resolvedUrl: normalizeUrl(currentUrl, { stripTracking: false }),
     resolutionMethod: fetchResolution.fetchAllowed ? fetchResolution.method : "heuristic-only",
     fetchMethod: fetchResolution.method,
     fetchStatus: fetchResolution.status || "",
