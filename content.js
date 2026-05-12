@@ -2686,6 +2686,11 @@ function findVisibleDomainFallbackCandidates(post) {
   }
 
   const filteredDomains = uniqueDomains.filter((domain) => {
+    if (shouldSuppressHeaderDomainFallback(domain, post)) {
+      scanStatus.skippedHeaderDomain += 1;
+      return false;
+    }
+
     if (!domainAppearsOnlyInHeader(domain, post, renderedText)) {
       return true;
     }
@@ -2826,6 +2831,11 @@ if (isInsidePostHeaderArea(element, post)) {
       });
 
     const filteredCardDomains = [...new Set(domainMatches)].filter((domain) => {
+      if (shouldSuppressHeaderDomainFallback(domain, post)) {
+        scanStatus.skippedHeaderDomain += 1;
+        return false;
+      }
+
       if (!domainAppearsOnlyInHeader(domain, post, cardText)) {
         return true;
       }
@@ -4351,6 +4361,11 @@ function renderBadge(post, viewModel) {
   }
 
   const mountPoint = getBadgeMountPoint(owningPost);
+  if (!(mountPoint instanceof Element)) {
+    scanStatus.panelMountFallbackUsed += 1;
+    return;
+  }
+
   const panels = [...owningPost.querySelectorAll(".dili-panel[data-dili-owned='true']")];
 
   if (panels.length > 1) {
@@ -4702,6 +4717,17 @@ function renderDetailListItems(items = []) {
 
 function renderDetailListItem(detail) {
   const text = String(detail || "").trim();
+  const scoreMatch = text.match(/^(Score starts at|DILI's rule scoring lowered it to|DILI's rule scoring kept it at|Endpoint-hiding warning signs totaled|A threat-intelligence provider flagged this URL, so DILI capped the final score at|No provider override was applied|Because the endpoint was .+?, DILI capped the score at|DILI applied an uncertainty cap, lowering the score to|Demo\/testing mode lowered the score to|Final score|Score calculation|Note|Warning sign applied|Mitigation noted|Mitigation note|Provider override|Navigation decision|Verification state):\s*(.+)$/i);
+
+  if (scoreMatch) {
+    return `
+      <li>
+        <span class="dili-technical-label">${escapeHtml(scoreMatch[1])}:</span>
+        ${escapeHtml(scoreMatch[2])}
+      </li>
+    `;
+  }
+
   const match = text.match(/^(Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Checked fallback URL|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Google Safe Browsing checked URL|URLhaus checked URL|VirusTotal checked URL):\s*(.+)$/i);
 
   if (!match) {
@@ -4747,6 +4773,12 @@ function buildTechnicalDetailGroups(details = []) {
 function classifyTechnicalDetailGroup(text) {
   const value = String(text || "");
 
+  if (
+    /^(Score starts at|DILI's rule scoring|Endpoint-hiding warning signs totaled|A threat-intelligence provider flagged this URL|No provider override was applied|Because the endpoint was|DILI applied an uncertainty cap|Demo\/testing mode lowered the score|Final score|Score calculation|Note: The final score uses|Warning sign applied|Additional warning signs|Mitigation noted|Mitigation note|Provider override|Navigation decision|Verification state):/i.test(value)
+  ) {
+    return "advanced";
+  }
+
   if (/^(Google Safe Browsing|URLhaus|VirusTotal) (checked URL|result|status|malicious detections|suspicious detections):/i.test(value)) {
     return "verification";
   }
@@ -4764,6 +4796,185 @@ function classifyTechnicalDetailGroup(text) {
   }
 
   return "advanced";
+}
+
+function findScoreAuditCategory(categoryAudit = {}, categoryName = "") {
+  if (!categoryAudit || typeof categoryAudit !== "object") {
+    return null;
+  }
+
+  return categoryAudit[categoryName] && typeof categoryAudit[categoryName] === "object"
+    ? categoryAudit[categoryName]
+    : null;
+}
+
+function buildSafetyScoreBreakdownDetails(analysis = {}) {
+  const details = [];
+  const score = Number(analysis.safetyScore);
+  const classification = analysis.classification || "Unknown";
+  const scoreAudit = analysis.scoreAudit && typeof analysis.scoreAudit === "object"
+    ? analysis.scoreAudit
+    : null;
+
+  const triggered = (Array.isArray(analysis.deductions) ? analysis.deductions : [])
+    .filter((item) => item && item.triggered && Number(item.deduction) !== 0);
+  const triggeredPenalties = triggered.filter((item) => Number(item.deduction) > 0);
+  const triggeredMitigations = triggered.filter((item) => Number(item.deduction) < 0);
+
+  if (scoreAudit) {
+    const baselineScore = Number(scoreAudit.baselineScore);
+    const ruleDeductionTotal = Number(scoreAudit.ruleDeductionTotal);
+    const ruleScore = Number(scoreAudit.ruleScore);
+    const finalAuditScore = Number(scoreAudit.finalScore);
+    const auditClassification = scoreAudit.classification || classification;
+
+    details.push(`Score starts at ${Number.isFinite(baselineScore) ? baselineScore : 100}.`);
+
+    if (Number.isFinite(ruleScore)) {
+      if (Number.isFinite(ruleDeductionTotal) && ruleDeductionTotal > 0) {
+        details.push(`DILI's rule scoring lowered it to ${ruleScore}.`);
+      } else {
+        details.push(`DILI's rule scoring kept it at ${ruleScore}.`);
+      }
+    }
+
+    const endpointAudit = findScoreAuditCategory(scoreAudit.categoryAudit, "endpoint_resolution");
+    if (
+      endpointAudit &&
+      Number(endpointAudit.positiveDeductions || 0) > Number(endpointAudit.appliedDeduction || 0) &&
+      Number(endpointAudit.appliedDeduction || 0) > 0
+    ) {
+      details.push(
+        `Endpoint-hiding warning signs totaled ${Number(endpointAudit.positiveDeductions || 0)} points, but DILI capped that category at ${Number(endpointAudit.appliedDeduction || 0)}.`
+      );
+    }
+
+    const providerCap = scoreAudit.providerOverrideCap || {};
+    if (providerCap.applied === true) {
+      details.push(
+        `A threat-intelligence provider flagged this URL, so DILI capped the final score at ${providerCap.afterScore}.`
+      );
+    } else {
+      details.push("No provider override was applied.");
+    }
+
+    const verificationCap = scoreAudit.verificationCap || {};
+    if (verificationCap.applied === true) {
+      details.push(`Because the endpoint was ${verificationCap.state || "not fully verified"}, DILI capped the score at ${verificationCap.afterScore}.`);
+    }
+
+    const softCap = scoreAudit.softUncertaintyCap || {};
+    if (softCap.applied === true) {
+      details.push(`DILI applied an uncertainty cap, lowering the score to ${softCap.afterScore}.`);
+    }
+
+    const demoBias = scoreAudit.demoScoreBias || {};
+    if (demoBias.applied === true) {
+      details.push(`Demo/testing mode lowered the score to ${demoBias.afterScore}.`);
+    }
+
+    details.push(
+      Number.isFinite(finalAuditScore)
+        ? `Final score: ${finalAuditScore} (${auditClassification}).`
+        : `Final score: unavailable (${auditClassification}).`
+    );
+
+    if (
+      Number.isFinite(ruleDeductionTotal) &&
+      Number.isFinite(ruleScore)
+    ) {
+      details.push(`Score calculation: 100 - ${ruleDeductionTotal} applied category deduction = ${ruleScore}.`);
+    }
+
+    const listedTriggeredDeductionTotal = Number(scoreAudit.listedTriggeredDeductionTotal);
+    const triggeredMitigationCreditTotal = Number(scoreAudit.triggeredMitigationCreditTotal);
+    const hasCategoryAudit = Object.keys(scoreAudit.categoryAudit || {}).length > 0;
+    const rawRulePointsDiffer =
+      Number.isFinite(listedTriggeredDeductionTotal) &&
+      Number.isFinite(ruleDeductionTotal) &&
+      listedTriggeredDeductionTotal !== ruleDeductionTotal;
+
+    if (
+      hasCategoryAudit ||
+      rawRulePointsDiffer ||
+      (Number.isFinite(triggeredMitigationCreditTotal) && triggeredMitigationCreditTotal > 0)
+    ) {
+      details.push("Note: The final score uses the applied category deduction, not a simple sum of every visible rule and mitigation line.");
+    }
+  } else {
+    details.push("Score starts at 100.");
+    details.push(
+      Number.isFinite(score)
+        ? `Final score: ${score} (${classification}).`
+        : `Final score: unavailable (${classification}).`
+    );
+  }
+
+  if (triggeredPenalties.length === 0) {
+    details.push("Warning signs applied: no scoring deductions were triggered.");
+  } else {
+    for (const item of triggeredPenalties.slice(0, 6)) {
+      const label = item.label || item.id || "Unnamed warning sign";
+      const deduction = Math.abs(Number(item.deduction));
+      details.push(`Warning sign applied: ${label} (-${deduction}).`);
+    }
+
+    if (triggeredPenalties.length > 6) {
+      details.push("Additional warning signs were triggered but hidden to keep this audit readable.");
+    }
+  }
+
+  if (triggeredMitigations.length > 0) {
+    for (const item of triggeredMitigations.slice(0, 3)) {
+      const label = item.label || item.id || "Unnamed mitigation";
+      const credit = Math.abs(Number(item.deduction));
+      details.push(`Mitigation noted: ${label} (+${credit}).`);
+    }
+
+    details.push("Mitigation note: mitigation credits are shown for transparency, but category caps/floors decide how much they affect the final score.");
+  }
+
+  const inactiveImportantRules = (Array.isArray(analysis.deductions) ? analysis.deductions : [])
+    .filter((item) => item && !item.triggered && Number(item.deduction || 0) > 0)
+    .slice(0, 6);
+
+  if (inactiveImportantRules.length > 0) {
+    details.push(
+      `Not triggered: ${inactiveImportantRules.map((item) => item.label || item.id || "Unnamed scoring rule").join("; ")}.`
+    );
+  }
+
+  if (analysis.providerOverride === true) {
+    details.push("Provider override: applied. A provider flag forces a stricter final score.");
+  } else {
+    details.push("Provider override: not applied.");
+  }
+
+  details.push(
+    analysis.interceptionRecommended
+      ? "Navigation decision: DILI will pause before opening this link."
+      : "Navigation decision: DILI will not block this link by default."
+  );
+
+  if (analysis.verificationState) {
+    details.push(`Verification state: ${analysis.verificationState}.`);
+  }
+
+  if (Array.isArray(analysis.linkScoreSummary) && analysis.linkScoreSummary.length > 1) {
+    details.push(
+      "Multi-link scoring: post-level result follows the lowest-scoring analyzed link so one risky link is not hidden by safer links."
+    );
+
+    for (const item of analysis.linkScoreSummary.slice(0, 8)) {
+      const index = item.index || "?";
+      const domain = item.domain || safeHostname(item.url) || "unknown domain";
+      const linkScore = Number.isFinite(Number(item.safetyScore)) ? Number(item.safetyScore) : "unscored";
+      const linkClassification = item.classification || "Unknown";
+      details.push(`Analyzed link score: ${index}. ${domain} - ${linkClassification}, ${linkScore}.`);
+    }
+  }
+
+  return details;
 }
 
   function mapAnalysisToViewModel(analysis) {
@@ -4914,7 +5125,6 @@ function buildPanelReportSections(analysis = {}) {
 
   const reasons = buildEndUserRiskReasons(analysis, severityLevel);
   const verificationNotes = buildEndUserVerificationNotes(analysis);
-  const technicalDetails = buildTechnicalDetails(analysis);
   const analyzedLinkCount = Number(analysis.analyzedLinkCount || 0);
   const linkScoreSummary = Array.isArray(analysis.linkScoreSummary)
     ? analysis.linkScoreSummary
@@ -4927,6 +5137,14 @@ function buildPanelReportSections(analysis = {}) {
           classification: item.classification
         }))
       : [];
+  const scoreBreakdownDetails = buildSafetyScoreBreakdownDetails({
+    ...analysis,
+    linkScoreSummary
+  });
+  const technicalDetails = [
+    ...scoreBreakdownDetails,
+    ...buildTechnicalDetails(analysis)
+  ];
   const multiLinkPost = analysis.multiLinkPost === true || analyzedLinkCount > 1 || linkScoreSummary.length > 1;
   const lowestScoringLinkDomain =
     analysis.lowestScoringLinkDomain ||
@@ -5512,18 +5730,39 @@ function formatCompactRedirectChainDetail(chain = []) {
     }
   }
 
-  const hopCount = Math.max(urls.length - 1, 0);
-  const hopText = hopCount === 1 ? "1 redirect hop" : `${hopCount} redirect hops`;
+  const rawHopCount = Math.max(urls.length - 1, 0);
+  const domainTransitionCount = Math.max(compactDomains.length - 1, 0);
 
   if (compactDomains.length === 1) {
-    return hopCount > 0
-      ? `Redirect chain: ${compactDomains[0]} only (${hopText}; same-domain redirect or tracking cleanup).`
-      : `Redirect chain: ${compactDomains[0]} only (no redirect hop observed).`;
+    if (rawHopCount > 0) {
+      const transitionText =
+        rawHopCount === 1
+          ? "1 same-domain URL-stage transition"
+          : `${rawHopCount} same-domain URL-stage transitions`;
+
+      return `Redirect chain: ${compactDomains[0]} only (${transitionText}; likely tracking cleanup or URL normalization).`;
+    }
+
+    return `Redirect chain: ${compactDomains[0]} only (no redirect hop observed).`;
   }
 
+  if (rawHopCount !== domainTransitionCount) {
+    const domainChangeText =
+      domainTransitionCount === 1
+        ? "1 domain change"
+        : `${domainTransitionCount} domain changes`;
+
+    const transitionText =
+      rawHopCount === 1
+        ? "1 URL-stage transition"
+        : `${rawHopCount} URL-stage transitions`;
+
+    return `Redirect chain: ${compactDomains.join(" -> ")} (${domainChangeText}; ${transitionText} including wrapper/cleanup).`;
+  }
+
+  const hopText = rawHopCount === 1 ? "1 redirect hop" : `${rawHopCount} redirect hops`;
   return `Redirect chain: ${compactDomains.join(" -> ")} (${hopText}).`;
 }
-
 function isFacebookPlatformWrapperUrl(rawUrl) {
   try {
     const url = new URL(String(rawUrl || ""));
@@ -6574,6 +6813,130 @@ if (
     return text;
   }
 
+  function collectHeaderDomainTokens(post) {
+    if (!(post instanceof Element)) {
+      return new Set();
+    }
+
+    const sources = [];
+
+    const header = findPostHeader(post);
+    if (header instanceof Element) {
+      sources.push(extractRenderedVisibleText(header));
+    }
+
+    const headerBlock = findPostHeaderBlock(post);
+    if (headerBlock instanceof Element) {
+      sources.push(extractRenderedVisibleText(headerBlock));
+    }
+
+    const authorText = extractAuthorText(post);
+    if (authorText) {
+      sources.push(authorText);
+    }
+
+    // Facebook profile/page links can contain page slugs such as /something.ph.
+    // These are Facebook internal identifiers, not necessarily external destinations.
+    const headerRoots = [header, headerBlock].filter((element) => element instanceof Element);
+    for (const root of headerRoots) {
+      for (const anchor of root.querySelectorAll?.("a[href]") || []) {
+        const href = String(anchor.getAttribute("href") || anchor.href || "").trim();
+        const text = String(anchor.textContent || anchor.getAttribute("aria-label") || "").trim();
+        sources.push(href, text);
+      }
+    }
+
+    const tokens = new Set();
+
+    for (const source of sources) {
+      const text = String(source || "").toLowerCase();
+      for (const match of text.matchAll(new RegExp(DOMAIN_TEXT_PATTERN.source, "gi"))) {
+        const domain = String(match[0] || "")
+          .toLowerCase()
+          .replace(/^https?:\/\//, "")
+          .replace(/^www\./, "")
+          .replace(/[/?#].*$/, "")
+          .replace(/\.$/, "");
+
+        if (domain) {
+          tokens.add(domain);
+        }
+      }
+
+      // Also catch Facebook profile slugs like facebook.com/something.ph
+      for (const match of text.matchAll(/facebook\.com\/(?:profile\.php\?id=\d+|pages\/)?([a-z0-9._-]+\.[a-z]{2,})(?:[/?#\s]|$)/gi)) {
+        const slugDomain = String(match[1] || "")
+          .toLowerCase()
+          .replace(/^www\./, "")
+          .replace(/\.$/, "");
+
+        if (slugDomain) {
+          tokens.add(slugDomain);
+        }
+      }
+    }
+
+    return tokens;
+  }
+
+  function domainAppearsInConfirmedBodyOrAttachment(domain, post) {
+    const normalizedDomain = String(domain || "")
+      .toLowerCase()
+      .replace(/^www\./, "")
+      .replace(/\.$/, "");
+
+    if (!normalizedDomain || !(post instanceof Element)) {
+      return false;
+    }
+
+    const caption = findPostCaption(post);
+    if (caption instanceof Element) {
+      const captionText = extractRenderedVisibleText(caption).toLowerCase();
+      if (captionText.includes(normalizedDomain)) {
+        return true;
+      }
+    }
+
+    const attachment = findPostAttachmentOrPreview(post);
+    if (attachment instanceof Element) {
+      const attachmentText = extractRenderedVisibleText(attachment).toLowerCase();
+      if (attachmentText.includes(normalizedDomain)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Prevent Facebook page names such as "something.ph" from being treated as
+  // external destinations when they appear only in the author/header area.
+  // This intentionally affects visible-domain fallback only; real href/data-url
+  // candidates are still analyzed.
+  function shouldSuppressHeaderDomainFallback(domain, post) {
+    const normalizedDomain = String(domain || "")
+      .toLowerCase()
+      .replace(/^www\./, "")
+      .replace(/\.$/, "");
+
+    if (!normalizedDomain || !(post instanceof Element)) {
+      return false;
+    }
+
+    const headerDomains = collectHeaderDomainTokens(post);
+
+    if (!headerDomains.has(normalizedDomain)) {
+      return false;
+    }
+
+    // If the same domain is clearly present in the post body/caption/attachment,
+    // it may be an intentional visible destination, so do not suppress it here.
+    if (domainAppearsInConfirmedBodyOrAttachment(normalizedDomain, post)) {
+      return false;
+    }
+
+    return true;
+  }
+
   function domainAppearsOnlyInHeader(domain, post, candidateText = "") {
     const normalizedDomain = String(domain || "")
       .toLowerCase()
@@ -6991,10 +7354,7 @@ function isLikelyImageSourceCandidate(element, rawUrl) {
 }
 function getSafePanelFallbackPoint(post) {
   if (!(post instanceof Element)) {
-    return {
-      parent: document.body,
-      beforeNode: null
-    };
+    return null;
   }
 
   const headerBlock = findPostHeaderBlock(post);
@@ -7029,11 +7389,39 @@ function getSafePanelFallbackPoint(post) {
     }
   }
 
-  return {
-    parent: post,
-    beforeNode: null
-  };
+  return null;
 }
+
+function findFirstSafePanelBeforeNode(parent, post) {
+  if (!(parent instanceof Element) || !(post instanceof Element) || !post.contains(parent)) {
+    return null;
+  }
+
+  const children = [...parent.children].slice(0, 12);
+
+  for (const child of children) {
+    if (!(child instanceof Element)) {
+      continue;
+    }
+
+    if (child.matches?.(".dili-panel-slot, .dili-panel")) {
+      continue;
+    }
+
+    if (isForbiddenPanelMountSurface(child, post)) {
+      continue;
+    }
+
+    if (isLikelyActionBarOrControlContainer(child) || isLikelyCommentOrReplyContainer(child)) {
+      return child;
+    }
+
+    return child;
+  }
+
+  return null;
+}
+
 function buildSafeInsertionBeforeElement(post, target) {
   if (!(post instanceof Element) || !(target instanceof Element) || !post.contains(target)) {
     return null;
@@ -7240,6 +7628,17 @@ if (
   insertionPoint = getSafePanelFallbackPoint(post);
 }
 
+if (
+  !insertionPoint?.parent ||
+  !(insertionPoint.parent instanceof Element) ||
+  isForbiddenPanelMountSurface(insertionPoint.parent, post)
+) {
+  cleanupDuplicatePanelArtifacts(post, slot);
+  return slot.parentElement instanceof Element && post.contains(slot.parentElement)
+    ? slot
+    : null;
+}
+
 if (slot.parentElement && isExistingPanelSlotStillSafe(slot, post) && isSlotAtInsertionPoint(slot, insertionPoint)) {
   scanStatus.panelSlotReused += 1;
   cleanupDuplicatePanelArtifacts(post, slot);
@@ -7247,10 +7646,21 @@ if (slot.parentElement && isExistingPanelSlotStillSafe(slot, post) && isSlotAtIn
 }
 
   if (!isSlotAtInsertionPoint(slot, insertionPoint)) {
-    if (insertionPoint.beforeNode instanceof Node) {
+    if (insertionPoint.beforeNode instanceof Node && insertionPoint.parent.contains(insertionPoint.beforeNode)) {
       insertionPoint.parent.insertBefore(slot, insertionPoint.beforeNode);
     } else {
-      insertionPoint.parent.appendChild(slot);
+      const safeFirstChild = findFirstSafePanelBeforeNode(insertionPoint.parent, post);
+
+      if (safeFirstChild instanceof Node) {
+        insertionPoint.parent.insertBefore(slot, safeFirstChild);
+      } else if (slot.parentElement instanceof Element && post.contains(slot.parentElement)) {
+        cleanupDuplicatePanelArtifacts(post, slot);
+        return slot;
+      } else {
+        scanStatus.panelMountFallbackUsed += 1;
+        cleanupDuplicatePanelArtifacts(post, slot);
+        return null;
+      }
     }
   }
 
@@ -7267,15 +7677,24 @@ if (isForbiddenPanelMountSurface(slot, post)) {
     post.contains(preferredFallbackPoint.parent) &&
     !isForbiddenPanelMountSurface(preferredFallbackPoint.parent, post)
       ? preferredFallbackPoint
-      : {
-          parent: post,
-          beforeNode: post.firstElementChild || null
-        };
+      : null;
 
-  if (fallbackPoint.beforeNode instanceof Node) {
+  if (fallbackPoint?.beforeNode instanceof Node && fallbackPoint.parent.contains(fallbackPoint.beforeNode)) {
     fallbackPoint.parent.insertBefore(slot, fallbackPoint.beforeNode);
+  } else if (fallbackPoint?.parent instanceof Element) {
+    const safeFirstChild = findFirstSafePanelBeforeNode(fallbackPoint.parent, post);
+
+    if (safeFirstChild instanceof Node) {
+      fallbackPoint.parent.insertBefore(slot, safeFirstChild);
+    } else if (!(slot.parentElement instanceof Element && post.contains(slot.parentElement))) {
+      cleanupDuplicatePanelArtifacts(post, slot);
+      return null;
+    }
   } else {
-    fallbackPoint.parent.appendChild(slot);
+    cleanupDuplicatePanelArtifacts(post, slot);
+    return slot.parentElement instanceof Element && post.contains(slot.parentElement)
+      ? slot
+      : null;
   }
 }
 

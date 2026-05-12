@@ -586,12 +586,31 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     trulyUnresolvedEndpoint &&
     !concreteRiskSignals
   );
-  let finalScore = providerOverride ? Math.min(scoring.score, 20) : scoring.score;
+  const providerCapBeforeScore = scoring.score;
+  const providerCapAfterScore = providerOverride
+    ? Math.min(providerCapBeforeScore, 20)
+    : providerCapBeforeScore;
+
+  let finalScore = providerCapAfterScore;
+
+  let verificationCapReason = "";
+  const verificationCapBeforeScore = finalScore;
+
   if (!providerOverride && concreteRiskSignals && verificationState === "unverified") {
     finalScore = Math.min(finalScore, 74);
+    if (finalScore < verificationCapBeforeScore) {
+      verificationCapReason = "unverified endpoint with concrete risk signals";
+    }
   } else if (!providerOverride && concreteRiskSignals && verificationState === "low-confidence") {
     finalScore = Math.min(finalScore, 79);
+    if (finalScore < verificationCapBeforeScore) {
+      verificationCapReason = "low-confidence endpoint with concrete risk signals";
+    }
   }
+
+  const verificationCapAfterScore = finalScore;
+
+  const softCapBeforeScore = finalScore;
   const cappedScore = applySoftUncertaintyCap(finalScore, {
     features,
     endpointResult,
@@ -600,16 +619,22 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
   });
   const softUncertaintyCapApplied = Number(cappedScore) !== Number(finalScore);
   finalScore = cappedScore;
+  const softCapAfterScore = finalScore;
+
   let finalFeatures = softUncertaintyCapApplied
     ? {
         ...features,
         softUncertaintyCapApplied: true
       }
     : features;
+
   const originalFinalScore = finalScore;
   const demoScoreBias = await getDemoScoreBiasConfig();
+  const demoBiasBeforeScore = finalScore;
+
   if (demoScoreBias.enabled) {
     finalScore = Math.max(0, finalScore - demoScoreBias.amount);
+
     finalFeatures = {
       ...finalFeatures,
       demoScoreBiasApplied: true,
@@ -617,11 +642,33 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
       demoScoreBiasAmount: demoScoreBias.amount
     };
   }
+
+  const demoBiasAfterScore = finalScore;
+
   const finalClassification = providerOverride
     ? "High Risk"
     : verificationOnlyUnknown
       ? "Unverified"
       : classifySafetyScore(finalScore);
+
+  const scoreAudit = buildScoreAudit({
+    scoring,
+    providerOverride,
+    providerCapBeforeScore,
+    providerCapAfterScore,
+    verificationState,
+    verificationCapReason,
+    verificationCapBeforeScore,
+    verificationCapAfterScore,
+    softUncertaintyCapApplied,
+    softCapBeforeScore,
+    softCapAfterScore,
+    demoScoreBias,
+    demoBiasBeforeScore,
+    demoBiasAfterScore,
+    finalScore,
+    finalClassification
+  });
   const finalInterceptionRecommended =
     providerOverride === true ||
     finalClassification === "High Risk" ||
@@ -667,12 +714,16 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     candidateContext: normalizedCandidateContext,
     classification: finalClassification,
     safetyScore: finalScore,
+    ruleScore: scoring.score,
+    totalDeduction: scoring.totalDeduction,
+    categoryDeductions: scoring.categoryDeductions,
     verificationState,
     verificationOnlyUnknown,
     concreteRiskSignals,
     interceptionRecommended: finalInterceptionRecommended,
     features: finalFeatures,
     deductions: scoring.deductions,
+    scoreAudit,
     providerOverride,
     providerResults,
     providerCheckedUrl: reusableUrlAnalysis.providerCheckedUrl || "",
@@ -690,6 +741,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         features: finalFeatures,
         classification: finalClassification,
         safetyScore: finalScore,
+        scoreAudit,
         providerOverride,
         interceptionRecommended: finalInterceptionRecommended,
         deductions: scoring.deductions
@@ -747,6 +799,10 @@ if (providerFlaggedDomain) {
       domain,
       urlHash: currentHash,
       safetyScore: finalScore,
+      ruleScore: scoring.score,
+      totalDeduction: scoring.totalDeduction,
+      categoryDeductions: scoring.categoryDeductions,
+      scoreAudit,
       classification: finalClassification,
       verificationState,
       verificationOnlyUnknown,
@@ -1889,6 +1945,145 @@ function applySoftUncertaintyCap(finalScore, {
   return score;
 }
 
+function sumPositiveTriggeredDeductions(deductions = []) {
+  return (Array.isArray(deductions) ? deductions : []).reduce((sum, item) => {
+    const value = Number(item?.deduction);
+    return item?.triggered && Number.isFinite(value) && value > 0 ? sum + value : sum;
+  }, 0);
+}
+
+function sumTriggeredMitigationCredits(deductions = []) {
+  return (Array.isArray(deductions) ? deductions : []).reduce((sum, item) => {
+    const value = Number(item?.deduction);
+    return item?.triggered && Number.isFinite(value) && value < 0 ? sum + Math.abs(value) : sum;
+  }, 0);
+}
+
+function formatScoreAuditClassification(classification) {
+  return String(classification || "Unknown").trim() || "Unknown";
+}
+
+function buildScoreAudit({
+  scoring = {},
+  providerOverride = false,
+  providerCapBeforeScore,
+  providerCapAfterScore,
+  verificationState = "",
+  verificationCapReason = "",
+  verificationCapBeforeScore,
+  verificationCapAfterScore,
+  softUncertaintyCapApplied = false,
+  softCapBeforeScore,
+  softCapAfterScore,
+  demoScoreBias = {},
+  demoBiasBeforeScore,
+  demoBiasAfterScore,
+  finalScore,
+  finalClassification
+} = {}) {
+  const deductions = Array.isArray(scoring.deductions) ? scoring.deductions : [];
+  const baselineScore = 100;
+  const ruleDeductionTotal = Number(scoring.totalDeduction);
+  const ruleScore = Number(scoring.score);
+  const providerBefore = Number(providerCapBeforeScore);
+  const providerAfter = Number(providerCapAfterScore);
+  const verificationBefore = Number(verificationCapBeforeScore);
+  const verificationAfter = Number(verificationCapAfterScore);
+  const softBefore = Number(softCapBeforeScore);
+  const softAfter = Number(softCapAfterScore);
+  const demoBefore = Number(demoBiasBeforeScore);
+  const demoAfter = Number(demoBiasAfterScore);
+  const displayedFinalScore = Number(finalScore);
+
+  return {
+    baselineScore,
+    listedTriggeredDeductionTotal: sumPositiveTriggeredDeductions(deductions),
+    triggeredMitigationCreditTotal: sumTriggeredMitigationCredits(deductions),
+    ruleDeductionTotal: Number.isFinite(ruleDeductionTotal) ? ruleDeductionTotal : null,
+    ruleScore: Number.isFinite(ruleScore) ? ruleScore : null,
+    categoryDeductions: scoring.categoryDeductions || {},
+    categoryAudit: scoring.categoryAudit || {},
+    providerOverrideCap: {
+      applied: Boolean(
+        providerOverride &&
+        Number.isFinite(providerBefore) &&
+        Number.isFinite(providerAfter) &&
+        providerAfter < providerBefore
+      ),
+      providerOverride: providerOverride === true,
+      cap: 20,
+      beforeScore: Number.isFinite(providerBefore) ? providerBefore : null,
+      afterScore: Number.isFinite(providerAfter) ? providerAfter : null
+    },
+    verificationCap: {
+      applied: Boolean(
+        verificationCapReason &&
+        Number.isFinite(verificationBefore) &&
+        Number.isFinite(verificationAfter) &&
+        verificationAfter < verificationBefore
+      ),
+      state: verificationState || "",
+      reason: verificationCapReason || "",
+      beforeScore: Number.isFinite(verificationBefore) ? verificationBefore : null,
+      afterScore: Number.isFinite(verificationAfter) ? verificationAfter : null
+    },
+    softUncertaintyCap: {
+      applied: Boolean(
+        softUncertaintyCapApplied &&
+        Number.isFinite(softBefore) &&
+        Number.isFinite(softAfter) &&
+        softAfter < softBefore
+      ),
+      beforeScore: Number.isFinite(softBefore) ? softBefore : null,
+      afterScore: Number.isFinite(softAfter) ? softAfter : null
+    },
+    demoScoreBias: {
+      applied: Boolean(
+        demoScoreBias?.enabled &&
+        Number.isFinite(demoBefore) &&
+        Number.isFinite(demoAfter) &&
+        demoAfter < demoBefore
+      ),
+      amount: Number.isFinite(Number(demoScoreBias?.amount)) ? Number(demoScoreBias.amount) : 0,
+      beforeScore: Number.isFinite(demoBefore) ? demoBefore : null,
+      afterScore: Number.isFinite(demoAfter) ? demoAfter : null
+    },
+    finalScore: Number.isFinite(displayedFinalScore) ? displayedFinalScore : null,
+    classification: formatScoreAuditClassification(finalClassification)
+  };
+}
+
+function refreshScoreAuditForProviderResult(analysis = {}, {
+  providerOverride = false,
+  safetyScore,
+  classification
+} = {}) {
+  const previousAudit = analysis.scoreAudit && typeof analysis.scoreAudit === "object"
+    ? analysis.scoreAudit
+    : {};
+  const previousScore = Number(analysis.safetyScore);
+  const refreshedScore = Number(safetyScore);
+
+  return {
+    ...previousAudit,
+    providerOverrideCap: {
+      ...(previousAudit.providerOverrideCap || {}),
+      applied: Boolean(
+        providerOverride &&
+        Number.isFinite(previousScore) &&
+        Number.isFinite(refreshedScore) &&
+        refreshedScore < previousScore
+      ),
+      providerOverride: providerOverride === true,
+      cap: 20,
+      beforeScore: Number.isFinite(previousScore) ? previousScore : (previousAudit.providerOverrideCap?.beforeScore ?? null),
+      afterScore: Number.isFinite(refreshedScore) ? refreshedScore : (previousAudit.providerOverrideCap?.afterScore ?? null)
+    },
+    finalScore: Number.isFinite(refreshedScore) ? refreshedScore : (previousAudit.finalScore ?? null),
+    classification: formatScoreAuditClassification(classification)
+  };
+}
+
 function isKnownBrandedCampaignRedirect({ endpointResult = {}, redirectAnalysis = {}, finalDomain = "", finalUrl = "" } = {}) {
   const rawChain =
     Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
@@ -2507,6 +2702,7 @@ function compactLiveLinkAnalysis(analysis = {}) {
     normalizedUrl: analysis.normalizedUrl,
     domain: analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
     safetyScore: analysis.safetyScore,
+    scoreAudit: analysis.scoreAudit,
     classification: analysis.classification,
     endpointConfidence: analysis.endpointConfidence,
     providerOverride: Boolean(analysis.providerOverride),
@@ -2546,6 +2742,7 @@ async function persistPostLevelAnalysis(postId, analysis) {
       baselineState: analysis.baselineState,
       normalizedVisiblePostText: analysis.normalizedVisiblePostText,
       safetyScore: analysis.safetyScore,
+      scoreAudit: analysis.scoreAudit,
       classification: analysis.classification,
       analyzedLinkCount: analysis.analyzedLinkCount,
       failedLinkCount: analysis.failedLinkCount,
@@ -3860,6 +4057,11 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
     ...(analysis.features || {}),
     virusTotalFlagged: virusTotalResult.flagged === true
   };
+  const scoreAudit = refreshScoreAuditForProviderResult(analysis, {
+    providerOverride,
+    safetyScore,
+    classification
+  });
   const refreshedAnalysis = {
     ...analysis,
     providerResults: safeProviderResults,
@@ -3867,6 +4069,7 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
     providerOverride,
     classification,
     safetyScore,
+    scoreAudit,
     concreteRiskSignals: Boolean(analysis.concreteRiskSignals || providerOverride),
     interceptionRecommended: shouldRecommendInterceptionForStoredAnalysis({
       ...analysis,
@@ -3874,7 +4077,8 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
       features,
       providerOverride,
       classification,
-      safetyScore
+      safetyScore,
+      scoreAudit
     }),
     lastChecked: Date.now()
   };

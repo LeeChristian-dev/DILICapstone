@@ -304,11 +304,14 @@ export const SAFETY_SCORE_BANDS = {
 /**
  * Calculate a transparent weighted safety score from collected link features.
  * @param {object} features
- * @returns {{ score: number, totalDeduction: number, deductions: Array<{ id: string, label: string, deduction: number, triggered: boolean }> }}
+ * @returns {{ score: number, totalDeduction: number, categoryDeductions: object, categoryAudit: object, deductions: Array<{ id: string, category: string, label: string, deduction: number, triggered: boolean }> }}
  */
 export function calculateSafetyScore(features = {}) {
   const deductions = [];
   const categoryTotals = {};
+  const rawCategoryTotals = {};
+  const rawCategoryPositiveDeductions = {};
+  const rawCategoryMitigationCredits = {};
 
   for (const rule of DEDUCTION_RULES) {
     const triggered = Boolean(features[rule.id]);
@@ -316,10 +319,13 @@ export function calculateSafetyScore(features = {}) {
 
     if (triggered) {
       addCategoryDeduction(categoryTotals, rule.category, rule.deduction);
+      addCategoryAuditValue(rawCategoryTotals, rule.category, rule.deduction);
+      addCategoryAuditValue(rawCategoryPositiveDeductions, rule.category, rule.deduction);
     }
 
     deductions.push({
       id: rule.id,
+      category: rule.category,
       label: rule.label,
       deduction: appliedDeduction,
       triggered
@@ -343,8 +349,11 @@ export function calculateSafetyScore(features = {}) {
   }
 
   addCategoryDeduction(categoryTotals, "redirect_behavior", redirectDeduction);
+  addCategoryAuditValue(rawCategoryTotals, "redirect_behavior", redirectDeduction);
+  addCategoryAuditValue(rawCategoryPositiveDeductions, "redirect_behavior", redirectDeduction);
   deductions.push({
     id: "redirectCount",
+    category: "redirect_behavior",
     label: redirectLabel,
     deduction: redirectDeduction,
     triggered: redirectDeduction > 0
@@ -353,13 +362,17 @@ export function calculateSafetyScore(features = {}) {
   for (const rule of COMBINATION_RULES) {
     const triggered = Boolean(rule.when(features));
     const appliedDeduction = triggered ? rule.deduction : 0;
+    const category = rule.category || inferRuleCategory(rule.id);
 
     if (triggered) {
-      addCategoryDeduction(categoryTotals, rule.category || inferRuleCategory(rule.id), rule.deduction);
+      addCategoryDeduction(categoryTotals, category, rule.deduction);
+      addCategoryAuditValue(rawCategoryTotals, category, rule.deduction);
+      addCategoryAuditValue(rawCategoryPositiveDeductions, category, rule.deduction);
     }
 
     deductions.push({
       id: rule.id,
+      category,
       label: rule.label,
       deduction: appliedDeduction,
       triggered
@@ -372,10 +385,13 @@ export function calculateSafetyScore(features = {}) {
 
     if (triggered) {
       addCategoryDeduction(categoryTotals, "technical_security", -rule.credit);
+      addCategoryAuditValue(rawCategoryTotals, "technical_security", -rule.credit);
+      addCategoryAuditValue(rawCategoryMitigationCredits, "technical_security", rule.credit);
     }
 
     deductions.push({
       id: rule.id,
+      category: "technical_security",
       label: rule.label,
       deduction: triggered ? -appliedCredit : 0,
       triggered
@@ -391,6 +407,31 @@ export function calculateSafetyScore(features = {}) {
     totalDeduction += cappedValue;
   }
 
+  const categoryAudit = {};
+
+  for (const category of new Set([
+    ...Object.keys(rawCategoryTotals),
+    ...Object.keys(rawCategoryPositiveDeductions),
+    ...Object.keys(rawCategoryMitigationCredits),
+    ...Object.keys(cappedCategoryDeductions)
+  ])) {
+    const rawTotal = rawCategoryTotals[category] || 0;
+    const positiveDeductions = rawCategoryPositiveDeductions[category] || 0;
+    const mitigationCredits = rawCategoryMitigationCredits[category] || 0;
+    const cap = CATEGORY_CAPS[category] ?? 100;
+    const appliedDeduction = cappedCategoryDeductions[category] || 0;
+
+    categoryAudit[category] = {
+      rawTotal,
+      positiveDeductions,
+      mitigationCredits,
+      cap,
+      appliedDeduction,
+      wasCapped: positiveDeductions > cap,
+      wasFloored: rawTotal < 0 && appliedDeduction === 0
+    };
+  }
+
   const boundedTotalDeduction = clamp(totalDeduction, 0, 100);
   const score = clamp(100 - boundedTotalDeduction, 0, 100);
 
@@ -398,6 +439,7 @@ export function calculateSafetyScore(features = {}) {
     score,
     totalDeduction: boundedTotalDeduction,
     categoryDeductions: cappedCategoryDeductions,
+    categoryAudit,
     deductions
   };
 }
@@ -440,6 +482,15 @@ function addCategoryDeduction(categoryTotals, category, deduction) {
 
   const key = category || "technical_security";
   categoryTotals[key] = (categoryTotals[key] || 0) + deduction;
+}
+
+function addCategoryAuditValue(target, category, value) {
+  if (!value) {
+    return;
+  }
+
+  const key = category || "technical_security";
+  target[key] = (target[key] || 0) + value;
 }
 
 function inferRuleCategory(ruleId) {
