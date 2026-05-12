@@ -926,7 +926,7 @@ function shouldShowWarningModal(analysis) {
     return true;
   }
 
-  if (Number.isFinite(score) && score < 60) {
+  if (Number.isFinite(score) && score < 80) {
     return true;
   }
 
@@ -1073,7 +1073,7 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
       return "DILI paused navigation because this link shows several warning signs commonly seen in malicious redirects, scam campaigns, or deceptive destination changes.";
     }
 
-    if (classification.includes("suspicious") || (Number.isFinite(score) && score < 60)) {
+    if (classification.includes("suspicious") || (Number.isFinite(score) && score < 80)) {
       return "DILI paused navigation because this link has enough warning signs that you should review it before opening.";
     }
 
@@ -4366,6 +4366,11 @@ function renderBadge(post, viewModel) {
     return;
   }
 
+  if (!isPanelMountWideEnoughForRender(mountPoint, owningPost)) {
+    scanStatus.panelMountFallbackUsed += 1;
+    return;
+  }
+
   const panels = [...owningPost.querySelectorAll(".dili-panel[data-dili-owned='true']")];
 
   if (panels.length > 1) {
@@ -6160,8 +6165,8 @@ function buildTechnicalDetails(analysis = {}) {
   function normalizeInlineSeverityLevel(viewModel = {}) {
     const explicit = String(viewModel.severityLevel || "").toLowerCase();
     if (["safe", "caution", "suspicious", "high-risk", "unverified", "no-link", "low-caution"].includes(explicit)) {
-      if (explicit === "low-caution") {
-        return "caution";
+      if (explicit === "low-caution" || explicit === "caution") {
+        return "suspicious";
       }
 
       return explicit;
@@ -6172,20 +6177,16 @@ function buildTechnicalDetails(analysis = {}) {
     }
 
 if (String(viewModel.state || "").toLowerCase() === "changed") {
-  return Number(viewModel.safetyScore) < 40 ? "high-risk" : "suspicious";
+  return Number(viewModel.safetyScore) < 50 ? "high-risk" : "suspicious";
 }
 
     const score = Number(viewModel.safetyScore);
     if (Number.isFinite(score)) {
-      if (score >= 90) {
+      if (score >= 80) {
         return "safe";
       }
 
-      if (score >= 60) {
-        return "caution";
-      }
-
-      if (score >= 40) {
+      if (score >= 50) {
         return "suspicious";
       }
 
@@ -6211,11 +6212,11 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
     }
 
     if (sourceText.includes("low caution")) {
-      return "caution";
+      return "suspicious";
     }
 
     if (sourceText.includes("caution")) {
-      return "caution";
+      return "suspicious";
     }
 
     if (sourceText.includes("unverified")) {
@@ -6238,7 +6239,7 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
       case "safe":
         return "Safe";
       case "caution":
-        return "Caution";
+        return "Suspicious";
       case "suspicious":
         return "Suspicious";
       case "high-risk":
@@ -6255,7 +6256,7 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
       case "safe":
         return "SAFE";
       case "caution":
-        return "CAUTION";
+        return "SUSPICIOUS";
       case "suspicious":
         return "SUSPICIOUS";
       case "high-risk":
@@ -6272,15 +6273,15 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
       case "safe":
         return "No major warning signs were detected for this destination.";
       case "caution":
-        return "This link has minor warning signs or limited verification.";
+        return "This link has warning signs and should be reviewed before opening.";
       case "suspicious":
-        return "This link shows warning signs and should be opened carefully.";
+        return "This link has warning signs and should be reviewed before opening.";
       case "high-risk":
-        return "This link may be unsafe and could lead to phishing or malware.";
+        return "This link may be unsafe and could lead to phishing, malware, or scams.";
       case "no-link":
         return "This post is still being monitored for future link insertions.";
       default:
-        return "This link could not be verified in time.";
+        return "This link could not be fully verified.";
     }
   }
 
@@ -6308,17 +6309,11 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
       viewModel.interceptionRecommended === true ||
       label.includes("high risk") ||
       label.includes("suspicious") ||
-      (Number.isFinite(score) && score < 60)
+      severityLevel === "suspicious" ||
+      severityLevel === "high-risk" ||
+      (Number.isFinite(score) && score < 80)
     ) {
       return "DILI will pause navigation before opening this link.";
-    }
-
-    if (
-      label.includes("caution") ||
-      severityLevel === "caution" ||
-      (Number.isFinite(score) && score >= 60 && score < 90)
-    ) {
-      return "DILI will show this warning in the post, but will not block navigation by default.";
     }
 
     if (severityLevel === "unverified" || label.includes("unverified")) {
@@ -6500,6 +6495,35 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
   function getSafePanelMountOwner(post) {
     const owner = getTopLevelPanelOwner(post);
     return owner instanceof Element ? owner : post;
+  }
+
+  function isPanelMountWideEnoughForRender(mountPoint, post) {
+    if (!(mountPoint instanceof Element) || !(post instanceof Element)) {
+      return false;
+    }
+
+    const mountRect = mountPoint.getBoundingClientRect();
+    const postRect = post.getBoundingClientRect();
+
+    if (mountRect.width <= 0 || postRect.width <= 0) {
+      return false;
+    }
+
+    // Prevent rendering inside narrow shared-story/media columns.
+    if (mountRect.width < postRect.width * 0.72) {
+      return false;
+    }
+
+    // Also avoid obviously narrow card/media slots.
+    if (mountRect.width < 360) {
+      return false;
+    }
+
+    if (isLikelyEmbeddedPreviewContainer(mountPoint) || isLikelyActionBarOrControlContainer(mountPoint)) {
+      return false;
+    }
+
+    return true;
   }
 
   function getArticleAncestors(element) {

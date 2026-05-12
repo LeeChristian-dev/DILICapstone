@@ -295,10 +295,8 @@ const MITIGATION_RULES = [
 ];
 
 export const SAFETY_SCORE_BANDS = {
-  SAFE_MIN: 90,
-  LOW_CAUTION_MIN: 75,
-  CAUTION_MIN: 60,
-  SUSPICIOUS_MIN: 40
+  SAFE_MIN: 80,
+  SUSPICIOUS_MIN: 50
 };
 
 /**
@@ -447,7 +445,7 @@ export function calculateSafetyScore(features = {}) {
 /**
  * Convert a numeric score into the extension's safety classification.
  * @param {number} score
- * @returns {"Safe" | "Low Caution" | "Caution" | "Suspicious" | "High Risk" | "Unverified"}
+ * @returns {"Safe" | "Suspicious" | "High Risk" | "Unverified"}
  */
 export function classifySafetyScore(score) {
   const value = Number(score);
@@ -458,14 +456,6 @@ export function classifySafetyScore(score) {
 
   if (value >= SAFETY_SCORE_BANDS.SAFE_MIN) {
     return "Safe";
-  }
-
-  if (value >= SAFETY_SCORE_BANDS.LOW_CAUTION_MIN) {
-    return "Low Caution";
-  }
-
-  if (value >= SAFETY_SCORE_BANDS.CAUTION_MIN) {
-    return "Caution";
   }
 
   if (value >= SAFETY_SCORE_BANDS.SUSPICIOUS_MIN) {

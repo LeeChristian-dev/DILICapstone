@@ -107,16 +107,14 @@ DILI computes a **Safety Score** using a subtractive model:
 
 ### Safety Score Classifications
 
-- `90-100`: **Safe** — no major warning signs detected
-- `75-89`: **Low Caution** — minor uncertainty; DILI does not pause navigation by default
-- `60-74`: **Caution** — review the destination; no hard pause unless combined with strong risk signs
-- `40-59`: **Suspicious** — navigation pause/interception recommended
-- `0-39`: **High Risk** — strong warning/interception recommended
-- `Unverified`: DILI could not fully verify the destination; this is independent of suspicious unless other risk signs are also present
+- `80-100`: **Safe** — no major warning signs detected
+- `50-79`: **Suspicious** — warning signs detected; navigation pause/interception recommended
+- `0-49`: **High Risk** — strong warning signs or provider flag; navigation pause/interception recommended
+- `Unverified`: DILI could not fully verify the destination
 
 **Provider-flagged results:** URLs flagged by Google Safe Browsing, URLhaus, or optional VirusTotal are classified as High Risk. Provider errors and rate limits do not directly deduct score points.
 
-DILI uses score bands for display and navigation decisions. Suspicious results, High Risk results, provider-flagged results, and final scores below 60 trigger a navigation pause before opening the destination. Caution and Low Caution are shown inline but do not block by default unless combined with stronger evidence.
+DILI uses score bands for display and navigation decisions. Suspicious results, High Risk results, provider-flagged results, and final scores below 80 trigger a navigation pause before opening the destination.
 
 ### Local domain memory
 
@@ -138,7 +136,7 @@ DILI only pauses navigation by default when:
 
 - a provider flags the URL,
 - classification is Suspicious or High Risk,
-- or the final score is below `60`.
+- or the final score is below `80`.
 
 ## Popup Dashboard
 
@@ -235,7 +233,7 @@ DILI may apply conservative false-positive mitigation for explicitly mapped bran
 
 Sensitive article-topic words in legitimate news URLs, such as crime, abuse, assault, investigation, violence, or porn, are not treated as phishing terms by themselves. DILI only treats those topic words as suspicious when they appear together with phishing or scam intent such as login, verify, claim, reward, wallet, password, payment, account, free, or urgent.
 
-DILI also applies a narrow trusted redirect destination mitigation for clean redirects to selected productivity and content platforms such as `docs.google.com`, `forms.google.com`, `drive.google.com`, `youtube.com`, `twitch.tv`, `discord.com`, `github.com`, `notion.so`, and `canva.com`. Known campaign or tracking redirects to those destinations are treated as expected redirect behavior when providers are clean. Unknown shorteners to those destinations remain at Low Caution rather than Safe. Unknown redirects to unknown destinations, provider-flagged URLs, and phishing-pattern destinations remain strict.
+DILI also applies a narrow trusted redirect destination mitigation for clean redirects to selected productivity and content platforms such as `docs.google.com`, `forms.google.com`, `drive.google.com`, `youtube.com`, `twitch.tv`, `discord.com`, `github.com`, `notion.so`, and `canva.com`. Known campaign or tracking redirects to those destinations are treated as expected redirect behavior when providers are clean. Unknown shorteners to those destinations remain Suspicious rather than Safe. Unknown redirects to unknown destinations, provider-flagged URLs, and phishing-pattern destinations remain strict.
 
 ## Provider Caveats
 

@@ -673,7 +673,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     providerOverride === true ||
     finalClassification === "High Risk" ||
     finalClassification === "Suspicious" ||
-    Number(finalScore) < 60;
+    Number(finalScore) < 80;
   const finalUrlFeatureAnalysis = {
     ...enrichedUrlFeatures,
     providerCheckedUrl: reusableUrlAnalysis.providerCheckedUrl || "",
@@ -2529,8 +2529,8 @@ if (
       details.push("Navigation pause reason: High Risk classification.");
     } else if (analysis.classification === "Suspicious") {
       details.push("Navigation pause reason: Suspicious classification.");
-    } else if (Number.isFinite(score) && score < 60) {
-      details.push("Navigation pause reason: final score below 60.");
+    } else if (Number.isFinite(score) && score < 80) {
+      details.push("Navigation pause reason: final score below 80.");
     }
   }
 
@@ -2689,7 +2689,7 @@ function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
     return true;
   }
 
-  if (Number.isFinite(score) && score < 60) {
+  if (Number.isFinite(score) && score < 80) {
     return true;
   }
 
