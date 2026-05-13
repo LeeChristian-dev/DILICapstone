@@ -2020,8 +2020,7 @@ async function processPost(post) {
   const hasPriorBaseline = Boolean(
     baseline?.urlHash ||
     baseline?.baselineState === "no_link" ||
-    baseline?.hadLinkAtBaseline === false ||
-    baseline?.postTextHash
+    baseline?.hadLinkAtBaseline === false
   );
   const linkFingerprint = linkInfo.linkFingerprint;
 
@@ -2329,6 +2328,7 @@ async function setNoLinkState(post, postId, postTextSnapshot = null, postIdentit
     type: MESSAGE_TYPES.SET_NO_LINK_STATE,
     postId,
     baselineState: stable ? "no_link" : "observed_no_link_unstable",
+    postIdentityStable: stable,
     postTextHash: postTextSnapshot?.postTextHash || "",
     normalizedVisiblePostText: postTextSnapshot?.normalizedVisiblePostText || ""
   });
@@ -6016,6 +6016,23 @@ function buildTechnicalDetails(analysis = {}) {
 
   if (analysis.linkInsertedAfterBaseline || analysis.features?.linkInsertedAfterBaseline) {
     pushUniqueTechnicalDetail(details, "A link was inserted after a stored no-link baseline.");
+  }
+
+  if (
+    (analysis.provisionalNoLinkBaseline || analysis.features?.provisionalNoLinkBaseline) &&
+    (analysis.currentHasUsableLinkCandidate || analysis.features?.currentHasUsableLinkCandidate)
+  ) {
+    pushUniqueTechnicalDetail(
+      details,
+      "A provisional no-link baseline later exposed a link, likely due to Facebook lazy-loading. Post-integrity scoring was not applied."
+    );
+  }
+
+  if (
+    (analysis.confirmedNoLinkBaseline || analysis.features?.confirmedNoLinkBaseline) &&
+    !(analysis.matureConfirmedNoLinkBaseline || analysis.features?.matureConfirmedNoLinkBaseline)
+  ) {
+    pushUniqueTechnicalDetail(details, "A no-link baseline was too recent to treat this as post-publication link insertion.");
   }
 
   if (analysis.baselineFirstSeenAt) {

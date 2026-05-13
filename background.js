@@ -74,6 +74,7 @@ const PROVIDER_RESULT_CACHE_TTL_MS = 10 * 60 * 1000;
 const PROVIDER_ERROR_CACHE_TTL_MS = 60 * 1000;
 const PROVIDER_PENDING_CACHE_TTL_MS = 15 * 1000;
 const PROVIDER_CACHE_MAX_ENTRIES = 300;
+const POST_INTEGRITY_MIN_NO_LINK_BASELINE_AGE_MS = 15000;
 const VIRUSTOTAL_MIN_REQUEST_INTERVAL_MS = 20 * 1000;
 const VIRUSTOTAL_SOFT_DEADLINE_MS = 2800;
 const VIRUSTOTAL_PENDING_FOLLOWUP_INTERVAL_MS = 20 * 1000;
@@ -274,6 +275,7 @@ async function setNoLinkState(message) {
     baselineFirstSeenAt: firstSeenAt,
     lastSeenAt: now,
     lastChecked: now,
+    postIdentityStable: Boolean(message.postIdentityStable),
     state: isConfirmedNoLink ? "no_link" : "truncated",
     classification: isConfirmedNoLink ? "No Link" : "Caption Collapsed",
     safetyScore: null,
@@ -484,11 +486,6 @@ const previousBaselineState =
   "";
 
   const previousPostTextHash = String(existingBaseline?.postTextHash || existingBaseline?.currentPostTextHash || "");
-const baselineHadNoLink = Boolean(
-  previousBaselineState === "no_link" ||
-  previousBaselineState === "observed_no_link_unstable" ||
-  existingBaseline?.hadLinkAtBaseline === false
-);
 const postTextChangedSinceBaseline = Boolean(
   isReanalysis &&
   previousPostTextHash &&
@@ -502,25 +499,39 @@ const currentHasUsableLinkCandidate = Boolean(
   analysisUrl ||
   normalizedUrl
 );
+const baselineFirstSeenTime = Number(
+  existingBaseline?.baselineFirstSeenAt ||
+  existingBaseline?.firstSeenAt ||
+  0
+);
+const baselineAgeMs = baselineFirstSeenTime > 0
+  ? Date.now() - baselineFirstSeenTime
+  : 0;
 const stableIdentityMatch = Boolean(
   compatibleBaseline?.postIdentityStable === true &&
   normalizedCandidateContext.postIdentityStable === true
 );
-const likelySamePostDespiteUnstableIdentity = Boolean(
-  !stableIdentityMatch &&
-  baselineHadNoLink &&
-  postTextChangedSinceBaseline &&
-  currentHasUsableLinkCandidate &&
-  previousPostTextHash
+const confirmedNoLinkBaseline = Boolean(
+  previousBaselineState === "no_link" &&
+  existingBaseline?.hadLinkAtBaseline === false &&
+  compatibleBaseline?.postIdentityStable === true
+);
+const provisionalNoLinkBaseline = Boolean(
+  previousBaselineState === "observed_no_link_unstable" ||
+  previousBaselineState === "truncated_unexpanded" ||
+  compatibleBaseline?.postIdentityStable !== true
+);
+const matureConfirmedNoLinkBaseline = Boolean(
+  confirmedNoLinkBaseline &&
+  baselineAgeMs >= POST_INTEGRITY_MIN_NO_LINK_BASELINE_AGE_MS
 );
 const canUseNoLinkInjectionBaseline = Boolean(
   isReanalysis &&
-  baselineHadNoLink &&
+  matureConfirmedNoLinkBaseline &&
+  stableIdentityMatch &&
   currentHasUsableLinkCandidate &&
-  (
-    stableIdentityMatch ||
-    likelySamePostDespiteUnstableIdentity
-  )
+  normalizedCandidateContext.candidateMode === "single" &&
+  postTextChangedSinceBaseline
 );
 
   const linkInsertedAfterBaseline = Boolean(canUseNoLinkInjectionBaseline);
@@ -528,7 +539,12 @@ const canUseNoLinkInjectionBaseline = Boolean(
     domainPreviouslyFlagged,
     textMismatch: textComparison.mismatch,
     postTextChangedSinceBaseline,
-    baselineHadNoLink,
+    baselineHadNoLink: confirmedNoLinkBaseline,
+    confirmedNoLinkBaseline,
+    provisionalNoLinkBaseline,
+    matureConfirmedNoLinkBaseline,
+    baselineAgeMs,
+    currentHasUsableLinkCandidate,
     linkInsertedAfterBaseline,
     integrityHashMismatch: Boolean(linkInsertedAfterBaseline || (isReanalysis && stableIdentityMatch && normalizedCandidateContext.candidateMode === "single" && hasCompatibleIntegrityMismatch(compatibleBaseline, {
       currentHash,
@@ -739,7 +755,11 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     previousPostTextHash,
     currentPostTextHash,
     postTextChangedSinceBaseline,
-    baselineHadNoLink,
+    baselineHadNoLink: confirmedNoLinkBaseline,
+    confirmedNoLinkBaseline,
+    provisionalNoLinkBaseline,
+    matureConfirmedNoLinkBaseline,
+    baselineAgeMs,
     baselineFirstSeenAt,
     detectedAt,
     hadLinkAtBaseline: Boolean(existingBaseline?.hadLinkAtBaseline === true || existingBaseline?.baselineState === "link"),
@@ -774,7 +794,12 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         postIntegrityEvent: linkInsertedAfterBaseline ? "link_inserted_after_no_link_baseline" : "",
         linkInsertedAfterBaseline,
         postTextChangedSinceBaseline,
-        baselineHadNoLink,
+        baselineHadNoLink: confirmedNoLinkBaseline,
+        confirmedNoLinkBaseline,
+        provisionalNoLinkBaseline,
+        matureConfirmedNoLinkBaseline,
+        baselineAgeMs,
+        currentHasUsableLinkCandidate,
         baselineFirstSeenAt,
         previousPostTextHash,
         currentPostTextHash,
@@ -2636,6 +2661,18 @@ if (riskRelevantDisplayChain.length > 0) {
 
   if (analysis?.linkInsertedAfterBaseline || analysis?.features?.linkInsertedAfterBaseline) {
     details.push("A link was inserted after a stored no-link baseline.");
+  }
+
+  const provisionalNoLinkBaseline = Boolean(analysis?.provisionalNoLinkBaseline || analysis?.features?.provisionalNoLinkBaseline);
+  const currentHasUsableLinkCandidate = Boolean(analysis?.currentHasUsableLinkCandidate || analysis?.features?.currentHasUsableLinkCandidate);
+  if (provisionalNoLinkBaseline && currentHasUsableLinkCandidate) {
+    details.push("A provisional no-link baseline later exposed a link, likely due to Facebook lazy-loading. Post-integrity scoring was not applied.");
+  }
+
+  const confirmedNoLinkBaseline = Boolean(analysis?.confirmedNoLinkBaseline || analysis?.features?.confirmedNoLinkBaseline);
+  const matureConfirmedNoLinkBaseline = Boolean(analysis?.matureConfirmedNoLinkBaseline || analysis?.features?.matureConfirmedNoLinkBaseline);
+  if (confirmedNoLinkBaseline && !matureConfirmedNoLinkBaseline) {
+    details.push("A no-link baseline was too recent to treat this as post-publication link insertion.");
   }
 
   if (analysis.baselineFirstSeenAt) {
