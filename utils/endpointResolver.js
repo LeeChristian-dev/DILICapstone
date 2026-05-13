@@ -28,6 +28,10 @@ const FACEBOOK_HOST_PATTERN = /(^|\.)facebook\.com$/i;
  *   endpointConfidence: "high" | "medium" | "low",
  *   resolutionMethod: string,
  *   resolutionChain: string[],
+ *   fullObservedRedirectTrace: string[],
+ *   fullObservedRedirectEvents: Array<{ url: string, host: string, registrableDomain: string, method: string, status: string, source: string, note: string }>,
+ *   fullRedirectCount: number,
+ *   fullRedirectDomains: string[],
  *   warnings: string[],
  *   errors: string[]
  * }>}
@@ -67,6 +71,8 @@ export async function resolveEndpoint(rawUrl) {
       resolvedUrl: unwrappedUrl,
       effectiveEndpoint: unwrappedUrl,
       resolutionChain: compactChain([...(wrapperAnalysis?.chain || []), unwrappedUrl]),
+      fullObservedRedirectTrace: compactChain([...(wrapperAnalysis?.chain || []), unwrappedUrl]),
+      fullObservedRedirectEvents: [],
       resolutionMethod: "internal-facebook-wrapper-ignored",
       endpointConfidence: "high",
       warnings,
@@ -85,6 +91,8 @@ export async function resolveEndpoint(rawUrl) {
       resolvedUrl: unwrappedUrl,
       effectiveEndpoint: unwrappedUrl,
       resolutionChain: [unwrappedUrl],
+      fullObservedRedirectTrace: [unwrappedUrl],
+      fullObservedRedirectEvents: [],
       resolutionMethod: "internal-facebook-link-ignored",
       endpointConfidence: "high",
       warnings,
@@ -126,6 +134,11 @@ export async function resolveEndpoint(rawUrl) {
     ...(redirectAnalysis?.redirectChain || []),
     resolvedUrl
   ]);
+  const fullObservedRedirectTrace = compactChain([
+    ...(wrapperAnalysis?.chain || []),
+    ...(redirectAnalysis?.fullObservedRedirectTrace || redirectAnalysis?.redirectChain || []),
+    resolvedUrl
+  ]);
 
   if (isShortener && resolutionChain.length <= 1) {
     endpointConfidence = "low";
@@ -140,6 +153,10 @@ export async function resolveEndpoint(rawUrl) {
     redirectAnalysis,
     effectiveEndpoint: resolvedUrl || unwrappedUrl || normalizedRawUrl,
     resolutionChain,
+    fullObservedRedirectTrace,
+    fullObservedRedirectEvents: redirectAnalysis?.fullObservedRedirectEvents || [],
+    fullRedirectCount: Math.max(0, fullObservedRedirectTrace.length - 1),
+    fullRedirectDomains: fullObservedRedirectTrace.map((url) => safeHostname(url)).filter(Boolean),
     resolutionMethod,
     endpointConfidence,
     warnings,
@@ -158,6 +175,7 @@ function buildEndpointResult(input) {
   const effectiveEndpoint = input.effectiveEndpoint || input.resolvedUrl || input.unwrappedUrl || input.normalizedRawUrl || "";
   const effectiveDomain = safeHostname(effectiveEndpoint) || "";
   const registrableDomain = getRegistrableDomain(effectiveDomain);
+  const fullObservedRedirectTrace = compactChain(input.fullObservedRedirectTrace || input.resolutionChain || []);
 
   return {
     rawUrl: input.rawUrl,
@@ -174,6 +192,16 @@ function buildEndpointResult(input) {
     endpointConfidence: input.endpointConfidence || "low",
     resolutionMethod: input.resolutionMethod || "unknown",
     resolutionChain: compactChain(input.resolutionChain || []),
+    fullObservedRedirectTrace,
+    fullObservedRedirectEvents: Array.isArray(input.fullObservedRedirectEvents)
+      ? input.fullObservedRedirectEvents
+      : [],
+    fullRedirectCount: Number.isFinite(Number(input.fullRedirectCount))
+      ? Number(input.fullRedirectCount)
+      : Math.max(0, fullObservedRedirectTrace.length - 1),
+    fullRedirectDomains: Array.isArray(input.fullRedirectDomains)
+      ? input.fullRedirectDomains
+      : fullObservedRedirectTrace.map((url) => safeHostname(url)).filter(Boolean),
     warnings: unique(input.warnings || []),
     errors: unique(input.errors || [])
   };
@@ -193,7 +221,9 @@ function buildEmptyResult(rawUrl, method, errors) {
     isFacebookWrapper: false,
     isInternalFacebook: false,
     isShortener: false,
-    resolutionChain: []
+    resolutionChain: [],
+    fullObservedRedirectTrace: [],
+    fullObservedRedirectEvents: []
   });
 }
 

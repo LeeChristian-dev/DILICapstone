@@ -130,6 +130,15 @@ Single weak indicators, such as an ordinary shortener, are treated mildly to red
 
 Visible-domain fallback is not treated as proof of danger by itself. It is a limited verification mode used when Facebook does not expose the full endpoint during passive scanning.
 
+### Redirect trace visibility
+
+DILI separates redirect evidence into two views:
+
+- **Full observed redirect trace** — every redirect stage DILI could observe through wrapper parameters and allowed network probing.
+- **Risk-relevant redirect chain** — the simplified chain used for scoring and user-facing risk explanation.
+
+Some redirects may still be invisible when a service uses JavaScript redirects, meta refresh, anti-bot behavior, or browser-only navigation. In those cases, DILI reports the endpoint it could verify and the observed trace it could collect.
+
 ### Interception Policy
 
 DILI only pauses navigation by default when:
@@ -228,6 +237,8 @@ DILI caches Google Safe Browsing, URLhaus, and optional VirusTotal results per c
 Facebook can lazy-load or mutate posts after they first appear, so DILI performs short delayed rescans to catch newly exposed destinations. Once an unchanged post already has a completed panel, DILI protects that panel from unnecessary visible re-rendering to avoid repeated "Analyzing" flicker.
 
 Cached provider results preserve their original `checkedAt` timestamp and do not change Safety Score rules. The provider cache is cleared when session logs are cleared, the session is restarted, or provider keys change.
+
+DILI stores a no-link baseline for posts where no external destination is detected. If the same observed post later exposes an external link, DILI treats it as a post-publication link insertion and applies post-integrity scoring. When Facebook does not expose a stable post identity, DILI uses a conservative fallback based on an existing no-link baseline plus a changed post-text hash and a newly detected usable link. Text-only edits without a new external link are not penalized.
 
 DILI may apply conservative false-positive mitigation for explicitly mapped branded campaign redirectors when providers are clean and the final destination matches the expected brand family. Current examples include `cnn.it` to `cnn.com`/`edition.cnn.com`, known `hoyo.link` campaign redirects to approved HoYoverse/Twitch/YouTube destinations, DITO internal redirects, and same-domain Coca-Cola campaign redirects. This does not apply to unknown shorteners or provider-flagged links.
 

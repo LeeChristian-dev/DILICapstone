@@ -45,6 +45,11 @@ const ACTIVE_PROBE_REDIRECT_HOSTS = new Set([
  *   redirectCount: number,
  *   redirectChain: string[],
  *   chain: string[],
+ *   fullObservedRedirectTrace: string[],
+ *   fullObservedRedirectEvents: Array<{ url: string, host: string, registrableDomain: string, method: string, status: string, source: string, note: string }>,
+ *   fullRedirectCount: number,
+ *   fullRedirectDomains: string[],
+ *   fullUniqueRegistrableDomains: string[],
  *   redirectDomains: string[],
  *   uniqueRegistrableDomains: string[],
  *   resolvedUrl: string,
@@ -64,6 +69,8 @@ const ACTIVE_PROBE_REDIRECT_HOSTS = new Set([
 export async function analyzeRedirects(rawUrl) {
   const notes = [];
   const redirectChain = [];
+  const fullObservedRedirectTrace = [];
+  const fullObservedRedirectEvents = [];
   const visited = new Set();
 
   let currentUrl = canonicalizeUrl(rawUrl, { stripTracking: false });
@@ -78,6 +85,10 @@ export async function analyzeRedirects(rawUrl) {
 
     visited.add(currentCanonical);
     redirectChain.push(currentCanonical);
+    pushObservedRedirectTrace(fullObservedRedirectTrace, fullObservedRedirectEvents, currentCanonical, {
+      method: "wrapper-param",
+      source: "heuristic-wrapper"
+    });
 
     const nextUrl = extractLikelyRedirectTarget(currentCanonical);
     if (!nextUrl) {
@@ -94,6 +105,10 @@ export async function analyzeRedirects(rawUrl) {
       break;
     }
 
+    pushObservedRedirectTrace(fullObservedRedirectTrace, fullObservedRedirectEvents, nextCanonical, {
+      method: "wrapper-param",
+      source: "heuristic-wrapper-target"
+    });
     currentUrl = nextCanonical;
   }
 
@@ -103,6 +118,7 @@ export async function analyzeRedirects(rawUrl) {
     originalUrl: rawUrl,
     redirectChain
   });
+  mergeObservedRedirectTrace(fullObservedRedirectTrace, fullObservedRedirectEvents, fetchResolution);
   if (fetchResolution.note && (fetchResolution.fetchAttempted || fetchResolution.shouldReportNote)) {
     pushUniqueNote(notes, fetchResolution.note);
   }
@@ -110,6 +126,12 @@ export async function analyzeRedirects(rawUrl) {
   if (fetchResolution.success && fetchResolution.finalUrl && !isSameComparableUrl(fetchResolution.finalUrl, redirectChain[redirectChain.length - 1])) {
     const finalCanonical = safelyCanonicalize(fetchResolution.finalUrl, { stripTracking: false }) || fetchResolution.finalUrl;
     redirectChain.push(finalCanonical);
+    pushObservedRedirectTrace(fullObservedRedirectTrace, fullObservedRedirectEvents, finalCanonical, {
+      method: fetchResolution.method || "network-follow",
+      status: fetchResolution.status || "",
+      source: "network-resolution",
+      note: "Network probing observed this final URL."
+    });
     currentUrl = finalCanonical;
     pushUniqueNote(notes, "Network probing observed an additional redirect hop.");
 
@@ -124,9 +146,26 @@ export async function analyzeRedirects(rawUrl) {
 
   if (redirectChain.length === 0) {
     redirectChain.push(currentUrl);
+    pushObservedRedirectTrace(fullObservedRedirectTrace, fullObservedRedirectEvents, currentUrl, {
+      method: "legacy-chain",
+      source: "redirect-chain"
+    });
   }
 
   const redirectSummary = summarizeRedirectChain(redirectChain);
+  const returnedObservedTrace = fullObservedRedirectTrace.length > 0 ? fullObservedRedirectTrace : redirectChain;
+  const returnedObservedEvents = fullObservedRedirectEvents.length > 0
+    ? fullObservedRedirectEvents
+    : redirectChain.map((url) => ({
+        url,
+        host: safeHostname(url),
+        registrableDomain: getRegistrableDomain(safeHostname(url)),
+        method: "legacy-chain",
+        status: "",
+        source: "redirect-chain",
+        note: ""
+      }));
+  const fullObservedSummary = summarizeObservedRedirectTrace(returnedObservedTrace);
 
   if (redirectSummary.wrapperToExternalDestination) {
     pushUniqueNote(notes, "A Facebook wrapper concealed an external destination.");
@@ -158,6 +197,11 @@ export async function analyzeRedirects(rawUrl) {
     redirectCount: redirectSummary.redirectCount,
     redirectChain,
     chain: redirectChain,
+    fullObservedRedirectTrace: returnedObservedTrace,
+    fullObservedRedirectEvents: returnedObservedEvents,
+    fullRedirectCount: fullObservedSummary.fullRedirectCount,
+    fullRedirectDomains: fullObservedSummary.fullRedirectDomains,
+    fullUniqueRegistrableDomains: fullObservedSummary.fullUniqueRegistrableDomains,
     redirectDomains: redirectSummary.redirectDomains,
     uniqueRegistrableDomains: redirectSummary.uniqueRegistrableDomains,
     resolvedUrl: normalizeUrl(currentUrl, { stripTracking: false }),
@@ -190,6 +234,8 @@ async function attemptNetworkResolution(rawUrl, context = {}) {
       method: "heuristic-only",
       finalUrl: null,
       status: "skipped",
+      fullObservedRedirectTrace: [],
+      fullObservedRedirectEvents: [],
       shouldReportNote: probePolicy.shouldReportNote,
       note: probePolicy.note
     };
@@ -203,6 +249,8 @@ async function attemptNetworkResolution(rawUrl, context = {}) {
       method: "heuristic-only",
       finalUrl: null,
       status: "skipped",
+      fullObservedRedirectTrace: [],
+      fullObservedRedirectEvents: [],
       shouldReportNote: true,
       note: "Fetch is not available in the current extension context."
     };
@@ -223,6 +271,11 @@ async function attemptNetworkResolution(rawUrl, context = {}) {
 }
 
 async function attemptFetch(rawUrl, method) {
+  const manualResult = await attemptManualRedirectFetch(rawUrl, method);
+  if (manualResult.success || manualResult.status === "timeout") {
+    return manualResult;
+  }
+
   const controller = new AbortController();
   const timeoutId = self.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
@@ -241,6 +294,15 @@ async function attemptFetch(rawUrl, method) {
       method: method.toLowerCase() + "-follow",
       status: `http-${response.status}`,
       finalUrl: response.url || rawUrl,
+      fullObservedRedirectTrace: compactObservedTrace([rawUrl, response.url || rawUrl]),
+      fullObservedRedirectEvents: response.url && !isSameComparableUrl(response.url, rawUrl)
+        ? buildObservedEventsFromTrace([rawUrl, response.url], {
+            method: method.toLowerCase() + "-follow",
+            status: `http-${response.status}`,
+            source: "network-follow",
+            note: "Network probing observed this final URL."
+          })
+        : [],
       note: ""
     };
   } catch (error) {
@@ -252,6 +314,8 @@ async function attemptFetch(rawUrl, method) {
       method: method.toLowerCase() + "-follow",
       status: timedOut ? "timeout" : "failed",
       finalUrl: null,
+      fullObservedRedirectTrace: [],
+      fullObservedRedirectEvents: [],
       note: timedOut
         ? "Active redirect probing timed out before a final endpoint was confirmed."
         : "DILI could not fully confirm whether this custom shortlink redirects further."
@@ -259,6 +323,159 @@ async function attemptFetch(rawUrl, method) {
   } finally {
     self.clearTimeout(timeoutId);
   }
+}
+
+async function attemptManualRedirectFetch(rawUrl, method) {
+  const trace = [];
+  const events = [];
+  const startedAt = Date.now();
+  let currentUrl = safelyCanonicalize(rawUrl, { stripTracking: false }) || rawUrl;
+
+  pushObservedRedirectTrace(trace, events, currentUrl, {
+    method: method.toLowerCase() + "-manual",
+    source: "network-start"
+  });
+
+  for (let depth = 0; depth < MAX_REDIRECT_DEPTH; depth += 1) {
+    const remainingMs = Math.max(0, FETCH_TIMEOUT_MS - (Date.now() - startedAt));
+    if (remainingMs <= 0) {
+      return buildManualFetchResult({
+        success: false,
+        method,
+        status: "timeout",
+        finalUrl: null,
+        trace,
+        events,
+        note: "Active redirect probing timed out before a final endpoint was confirmed."
+      });
+    }
+
+    const controller = new AbortController();
+    const timeoutId = self.setTimeout(() => controller.abort(), remainingMs);
+
+    try {
+      const response = await fetch(currentUrl, {
+        method,
+        redirect: "manual",
+        cache: "no-store",
+        signal: controller.signal
+      });
+
+      if (response.type === "opaqueredirect" || Number(response.status) === 0) {
+        return buildManualFetchResult({
+          success: false,
+          method,
+          status: "manual-location-unavailable",
+          finalUrl: null,
+          trace,
+          events,
+          note: ""
+        });
+      }
+
+      const status = `http-${response.status}`;
+      const location = response.headers?.get("location") || "";
+
+      if (isRedirectStatus(response.status)) {
+        if (!location) {
+          return buildManualFetchResult({
+            success: false,
+            method,
+            status: "manual-location-unavailable",
+            finalUrl: null,
+            trace,
+            events,
+            note: ""
+          });
+        }
+
+        const nextUrl = resolveRedirectLocation(location, currentUrl);
+        if (!nextUrl) {
+          return buildManualFetchResult({
+            success: false,
+            method,
+            status: "manual-location-invalid",
+            finalUrl: null,
+            trace,
+            events,
+            note: ""
+          });
+        }
+
+        const nextCanonical = safelyCanonicalize(nextUrl, { stripTracking: false }) || nextUrl;
+        pushObservedRedirectTrace(trace, events, nextCanonical, {
+          method: method.toLowerCase() + "-manual",
+          status,
+          source: "network-location",
+          note: "Network probing observed this redirect stage."
+        });
+
+        if (isSameComparableUrl(nextCanonical, currentUrl)) {
+          return buildManualFetchResult({
+            success: true,
+            method,
+            status,
+            finalUrl: nextCanonical,
+            trace,
+            events,
+            note: "Redirect parsing stopped because the same URL appeared twice."
+          });
+        }
+
+        currentUrl = nextCanonical;
+        continue;
+      }
+
+      return buildManualFetchResult({
+        success: true,
+        method,
+        status,
+        finalUrl: currentUrl,
+        trace,
+        events,
+        note: ""
+      });
+    } catch (error) {
+      const timedOut = error?.name === "AbortError";
+      return buildManualFetchResult({
+        success: false,
+        method,
+        status: timedOut ? "timeout" : "failed",
+        finalUrl: null,
+        trace,
+        events,
+        note: timedOut
+          ? "Active redirect probing timed out before a final endpoint was confirmed."
+          : ""
+      });
+    } finally {
+      self.clearTimeout(timeoutId);
+    }
+  }
+
+  return buildManualFetchResult({
+    success: true,
+    method,
+    status: "max-depth",
+    finalUrl: currentUrl,
+    trace,
+    events,
+    note: "Redirect parsing stopped after the maximum redirect depth."
+  });
+}
+
+function buildManualFetchResult({ success, method, status, finalUrl, trace, events, note }) {
+  return {
+    fetchAllowed: true,
+    fetchAttempted: true,
+    success,
+    method: method.toLowerCase() + "-manual",
+    status,
+    finalUrl,
+    fullObservedRedirectTrace: compactObservedTrace(trace),
+    fullObservedRedirectEvents: Array.isArray(events) ? events : [],
+    note
+  };
 }
 
 function getActiveProbePolicy(rawUrl, context = {}) {
@@ -373,6 +590,93 @@ function looksLikeTrackingHop(rawUrl, hostname) {
     source.includes("away") ||
     source.includes("out=")
   );
+}
+
+function resolveRedirectLocation(location, baseUrl) {
+  try {
+    return new URL(String(location || "").trim(), baseUrl).toString();
+  } catch {
+    return "";
+  }
+}
+
+function isRedirectStatus(status) {
+  return [301, 302, 303, 307, 308].includes(Number(status));
+}
+
+function pushObservedRedirectTrace(trace, events, url, meta = {}) {
+  const value = safelyCanonicalize(url, { stripTracking: false }) || String(url || "").trim();
+
+  if (!value) {
+    return;
+  }
+
+  if (trace[trace.length - 1] !== value) {
+    trace.push(value);
+    events.push({
+      url: value,
+      host: safeHostname(value),
+      registrableDomain: getRegistrableDomain(safeHostname(value)),
+      method: meta.method || "unknown",
+      status: meta.status || "",
+      source: meta.source || "observed",
+      note: meta.note || ""
+    });
+  }
+}
+
+function summarizeObservedRedirectTrace(trace = []) {
+  const urls = Array.isArray(trace) ? trace.filter(Boolean) : [];
+  const domains = urls.map((url) => safeHostname(url)).filter(Boolean);
+  const registrableDomains = domains.map((domain) => getRegistrableDomain(domain)).filter(Boolean);
+  const uniqueRegistrableDomains = unique(registrableDomains);
+
+  return {
+    fullRedirectCount: Math.max(0, urls.length - 1),
+    fullRedirectDomains: domains,
+    fullUniqueRegistrableDomains: uniqueRegistrableDomains
+  };
+}
+
+function compactObservedTrace(values = []) {
+  const trace = [];
+  const events = [];
+
+  for (const value of Array.isArray(values) ? values : []) {
+    pushObservedRedirectTrace(trace, events, value);
+  }
+
+  return trace;
+}
+
+function buildObservedEventsFromTrace(trace = [], meta = {}) {
+  const compactTrace = [];
+  const events = [];
+
+  for (const value of Array.isArray(trace) ? trace : []) {
+    pushObservedRedirectTrace(compactTrace, events, value, meta);
+  }
+
+  return events;
+}
+
+function mergeObservedRedirectTrace(trace, events, fetchResolution = {}) {
+  const observedTrace = Array.isArray(fetchResolution.fullObservedRedirectTrace)
+    ? fetchResolution.fullObservedRedirectTrace
+    : [];
+  const observedEvents = Array.isArray(fetchResolution.fullObservedRedirectEvents)
+    ? fetchResolution.fullObservedRedirectEvents
+    : [];
+
+  observedTrace.forEach((url, index) => {
+    const event = observedEvents[index] || {};
+    pushObservedRedirectTrace(trace, events, url, {
+      method: event.method || fetchResolution.method || "network-follow",
+      status: event.status || fetchResolution.status || "",
+      source: event.source || "network-resolution",
+      note: event.note || ""
+    });
+  });
 }
 
 function looksLikeRedirectWrapper(rawUrl, hostname, currentDomain, nextDomain) {

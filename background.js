@@ -418,6 +418,10 @@ recordMaxPerformanceStat("maxEndpointMs", endpointMs);
       redirectAnalysis: {
         redirectCount: 0,
         redirectChain: endpointResult.resolutionChain,
+        fullObservedRedirectTrace: endpointResult.fullObservedRedirectTrace || endpointResult.resolutionChain,
+        fullObservedRedirectEvents: endpointResult.fullObservedRedirectEvents || [],
+        fullRedirectCount: endpointResult.fullRedirectCount || 0,
+        fullRedirectDomains: endpointResult.fullRedirectDomains || [],
         notes: endpointResult.warnings
       },
       state: "internal-facebook",
@@ -479,21 +483,54 @@ const previousBaselineState =
   existingBaseline?.baselineState ||
   "";
 
+  const previousPostTextHash = String(existingBaseline?.postTextHash || existingBaseline?.currentPostTextHash || "");
+const baselineHadNoLink = Boolean(
+  previousBaselineState === "no_link" ||
+  previousBaselineState === "observed_no_link_unstable" ||
+  existingBaseline?.hadLinkAtBaseline === false
+);
+const postTextChangedSinceBaseline = Boolean(
+  isReanalysis &&
+  previousPostTextHash &&
+  currentPostTextHash &&
+  previousPostTextHash !== currentPostTextHash
+);
+const currentHasUsableLinkCandidate = Boolean(
+  normalizedCandidateContext.selectedNormalizedTarget ||
+  normalizedCandidateContext.rawHref ||
+  normalizedCandidateContext.unwrappedCandidateUrl ||
+  analysisUrl ||
+  normalizedUrl
+);
+const stableIdentityMatch = Boolean(
+  compatibleBaseline?.postIdentityStable === true &&
+  normalizedCandidateContext.postIdentityStable === true
+);
+const likelySamePostDespiteUnstableIdentity = Boolean(
+  !stableIdentityMatch &&
+  baselineHadNoLink &&
+  postTextChangedSinceBaseline &&
+  currentHasUsableLinkCandidate &&
+  previousPostTextHash
+);
 const canUseNoLinkInjectionBaseline = Boolean(
   isReanalysis &&
-  previousBaselineState === "no_link" &&
-  compatibleBaseline?.postIdentityStable === true &&
-  normalizedCandidateContext.postIdentityStable === true &&
-  normalizedCandidateContext.candidateMode === "single"
+  baselineHadNoLink &&
+  currentHasUsableLinkCandidate &&
+  (
+    stableIdentityMatch ||
+    likelySamePostDespiteUnstableIdentity
+  )
 );
 
   const linkInsertedAfterBaseline = Boolean(canUseNoLinkInjectionBaseline);
-  const previousPostTextHash = String(existingBaseline?.postTextHash || existingBaseline?.currentPostTextHash || "");
   const postContextFeatures = {
     domainPreviouslyFlagged,
     textMismatch: textComparison.mismatch,
+    postTextChangedSinceBaseline,
+    baselineHadNoLink,
     linkInsertedAfterBaseline,
-    integrityHashMismatch: Boolean(linkInsertedAfterBaseline || (isReanalysis && compatibleBaseline?.postIdentityStable === true && normalizedCandidateContext.candidateMode === "single" && hasCompatibleIntegrityMismatch(compatibleBaseline, {
+    integrityHashMismatch: Boolean(linkInsertedAfterBaseline || (isReanalysis && stableIdentityMatch && normalizedCandidateContext.candidateMode === "single" && hasCompatibleIntegrityMismatch(compatibleBaseline, {
       currentHash,
       analysisUrl,
       normalizedUrl,
@@ -701,6 +738,8 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     normalizedVisiblePostText: normalizedCurrentPostText,
     previousPostTextHash,
     currentPostTextHash,
+    postTextChangedSinceBaseline,
+    baselineHadNoLink,
     baselineFirstSeenAt,
     detectedAt,
     hadLinkAtBaseline: Boolean(existingBaseline?.hadLinkAtBaseline === true || existingBaseline?.baselineState === "link"),
@@ -734,6 +773,8 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
       analysis: {
         postIntegrityEvent: linkInsertedAfterBaseline ? "link_inserted_after_no_link_baseline" : "",
         linkInsertedAfterBaseline,
+        postTextChangedSinceBaseline,
+        baselineHadNoLink,
         baselineFirstSeenAt,
         previousPostTextHash,
         currentPostTextHash,
@@ -1334,10 +1375,26 @@ function getNormalizedProviderResult(providerResults, providerName) {
 
 function normalizeRedirectAnalysis(redirectAnalysis = {}) {
   const safe = redirectAnalysis && typeof redirectAnalysis === "object" ? redirectAnalysis : {};
+  const fullObservedRedirectTrace = Array.isArray(safe.fullObservedRedirectTrace)
+    ? safe.fullObservedRedirectTrace
+    : Array.isArray(safe.redirectChain)
+      ? safe.redirectChain
+      : [];
+
   return {
     redirectCount: Number(safe.redirectCount || 0),
     redirectChain: Array.isArray(safe.redirectChain) ? safe.redirectChain : Array.isArray(safe.chain) ? safe.chain : [],
     chain: Array.isArray(safe.chain) ? safe.chain : Array.isArray(safe.redirectChain) ? safe.redirectChain : [],
+    fullObservedRedirectTrace,
+    fullObservedRedirectEvents: Array.isArray(safe.fullObservedRedirectEvents)
+      ? safe.fullObservedRedirectEvents
+      : [],
+    fullRedirectCount: Number.isFinite(Number(safe.fullRedirectCount))
+      ? Number(safe.fullRedirectCount)
+      : Math.max(0, fullObservedRedirectTrace.length - 1),
+    fullRedirectDomains: Array.isArray(safe.fullRedirectDomains)
+      ? safe.fullRedirectDomains
+      : [],
     redirectDomains: Array.isArray(safe.redirectDomains) ? safe.redirectDomains : [],
     uniqueRegistrableDomains: Array.isArray(safe.uniqueRegistrableDomains) ? safe.uniqueRegistrableDomains : [],
     resolvedUrl: safe.resolvedUrl || "",
@@ -2247,6 +2304,29 @@ function formatCompactRedirectChainDetail(chain = []) {
   return `Redirect chain: ${compactDomains.join(" -> ")} (${hopText}).`;
 }
 
+function formatRedirectTraceDomains(chain = []) {
+  const domains = (Array.isArray(chain) ? chain : [])
+    .map((url) => safeHostname(url).replace(/^www\./i, ""))
+    .filter(Boolean);
+
+  const compact = [];
+
+  for (const domain of domains) {
+    if (compact[compact.length - 1] !== domain) {
+      compact.push(domain);
+    }
+  }
+
+  if (compact.length === 0) {
+    return "unavailable";
+  }
+
+  const hopCount = Math.max(0, compact.length - 1);
+  const hopText = hopCount === 1 ? "1 domain change shown" : `${hopCount} domain changes shown`;
+
+  return `${compact.join(" -> ")} (${hopText})`;
+}
+
 function isMessagingOrCommunityInviteDomain(domain) {
   const value = String(domain || "").toLowerCase().replace(/^www\./, "");
   return [
@@ -2397,6 +2477,16 @@ const redirectChain =
   redirectAnalysis.redirectChain ||
   endpointResult.resolutionChain ||
   [];
+const fullObservedRedirectTrace =
+  redirectAnalysis.fullObservedRedirectTrace ||
+  endpointResult.fullObservedRedirectTrace ||
+  redirectAnalysis.redirectChain ||
+  endpointResult.resolutionChain ||
+  [];
+const riskRelevantRedirectChain =
+  redirectAnalysis.redirectChain ||
+  endpointResult.resolutionChain ||
+  [];
   const candidateSource = String(candidateContext.candidateSource || "").trim();
   const candidateCompleteness = String(candidateContext.candidateUrlCompleteness || "").trim();
   const providerCheckedUrl = getPrimaryProviderCheckedUrl(providerResults) || urlFeatureAnalysis.providerCheckedUrl || "";
@@ -2433,7 +2523,7 @@ const redirectChain =
     details.push(`Facebook wrapper unwrapped to ${effectiveDomain}.`);
   }
 
-if (redirectChain.length > 0) {
+if (redirectChain.length > 0 || fullObservedRedirectTrace.length > 0 || riskRelevantRedirectChain.length > 0) {
   const visiblePostValue =
     candidateContext.unwrappedCandidateUrl ||
     candidateContext.selectedNormalizedTarget ||
@@ -2462,20 +2552,14 @@ if (redirectChain.length > 0) {
     details.push(`Checked fallback URL: ${endpointResult.effectiveEndpoint}.`);
   }
 
-const observedRedirectChain = prependKnownFacebookWrapperForDisplay(redirectChain, facebookWrapperUrl);
-const observedRedirectChainDetail = formatCompactRedirectChainDetail(observedRedirectChain);
-if (observedRedirectChainDetail) {
-  details.push(observedRedirectChainDetail.replace(/^Redirect chain:/, "Observed redirect chain:"));
+const fullObservedDisplayChain = prependKnownFacebookWrapperForDisplay(fullObservedRedirectTrace, facebookWrapperUrl);
+if (fullObservedDisplayChain.length > 0) {
+  details.push(`Full observed redirect trace: ${formatRedirectTraceDomains(fullObservedDisplayChain)}.`);
 }
 
-const riskRelevantRedirectChain = buildRiskRelevantRedirectChain(observedRedirectChain);
-const riskRelevantRedirectChainDetail = formatCompactRedirectChainDetail(riskRelevantRedirectChain);
-if (
-  riskRelevantRedirectChainDetail &&
-  riskRelevantRedirectChain.length > 0 &&
-  riskRelevantRedirectChain.length !== observedRedirectChain.length
-) {
-  details.push(riskRelevantRedirectChainDetail.replace(/^Redirect chain:/, "Risk-relevant redirect chain:"));
+const riskRelevantDisplayChain = buildRiskRelevantRedirectChain(prependKnownFacebookWrapperForDisplay(riskRelevantRedirectChain, facebookWrapperUrl));
+if (riskRelevantDisplayChain.length > 0) {
+  details.push(`Risk-relevant redirect chain: ${formatRedirectTraceDomains(riskRelevantDisplayChain)}.`);
 }
 }
   if (urlFeatureAnalysis.sourceNormalizedUrl && urlFeatureAnalysis.sourceRawComparableUrl && urlFeatureAnalysis.sourceNormalizedUrl !== urlFeatureAnalysis.sourceRawComparableUrl) {
@@ -2542,7 +2626,15 @@ if (
     details.push(`Post integrity event: ${String(analysis.postIntegrityEvent).replace(/_/g, " ")}.`);
   }
 
-  if (analysis.linkInsertedAfterBaseline) {
+  if (analysis?.postTextChangedSinceBaseline || analysis?.features?.postTextChangedSinceBaseline) {
+    details.push("Post text changed after the stored baseline.");
+  }
+
+  if (analysis?.baselineHadNoLink || analysis?.features?.baselineHadNoLink) {
+    details.push("Stored baseline had no detected external link.");
+  }
+
+  if (analysis?.linkInsertedAfterBaseline || analysis?.features?.linkInsertedAfterBaseline) {
     details.push("A link was inserted after a stored no-link baseline.");
   }
 
