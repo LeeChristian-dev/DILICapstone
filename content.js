@@ -1907,6 +1907,18 @@ async function processPost(post) {
     reason: postIdentity.reason
   });
 
+  if (!postIdentity.stable) {
+    console.debug("[DILI] Post identity used fallback", {
+      postId,
+      reason: postIdentity.reason
+    });
+    scanStatus.lastAnalysisPipelineState = {
+      ...(scanStatus.lastAnalysisPipelineState || {}),
+      postIdentityStable: postIdentity.stable,
+      postIdentityReason: postIdentity.reason
+    };
+  }
+
   const extractStartedAt = nowMs();
   const postTextSnapshot = await buildVisiblePostTextSnapshot(owningPost);
   const linkInfo = extractRelevantLinks(owningPost, postId);
@@ -2068,6 +2080,8 @@ async function processPost(post) {
     signature,
     linkFingerprint,
     linkCount: linkInfo.links.length,
+    postIdentityStable: postIdentity.stable,
+    postIdentityReason: postIdentity.reason,
     timestamp: Date.now()
   };
 
@@ -4735,7 +4749,7 @@ function renderDetailListItem(detail) {
     `;
   }
 
-  const match = text.match(/^(Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Checked fallback URL|Full observed redirect trace|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Google Safe Browsing checked URL|URLhaus checked URL|VirusTotal checked URL):\s*(.+)$/i);
+  const match = text.match(/^(Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Checked fallback URL|Previous baseline URL|Full observed redirect trace|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Google Safe Browsing checked URL|URLhaus checked URL|VirusTotal checked URL):\s*(.+)$/i);
 
   if (!match) {
     return `<li>${escapeHtml(text)}</li>`;
@@ -4791,7 +4805,7 @@ function classifyTechnicalDetailGroup(text) {
   }
 
   if (
-    /^(Candidate source|Candidate completeness|Provider checked full endpoint URL|Provider checked URL|Normalized comparison URL|Display URL|Visible post URL\/text|Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Endpoint URL|Checked fallback URL|Full observed redirect trace|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Facebook wrapper unwrapped)/i.test(value)
+    /^(Candidate source|Candidate completeness|Provider checked full endpoint URL|Provider checked URL|Normalized comparison URL|Display URL|Visible post URL\/text|Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Endpoint URL|Checked fallback URL|Previous baseline URL|Full observed redirect trace|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Facebook wrapper unwrapped)/i.test(value)
   ) {
     return "endpoint";
   }
@@ -6018,6 +6032,14 @@ function buildTechnicalDetails(analysis = {}) {
     pushUniqueTechnicalDetail(details, "A link was inserted after a stored no-link baseline.");
   }
 
+  if (analysis.features?.integrityHashMismatch && !analysis.features?.linkInsertedAfterBaseline) {
+    pushUniqueTechnicalDetail(details, "The post hyperlink changed after the original link baseline was stored.");
+  }
+
+  if (analysis.previousBaselineUrl && analysis.features?.integrityHashMismatch) {
+    pushUniqueTechnicalDetail(details, `Previous baseline URL: ${analysis.previousBaselineUrl}.`);
+  }
+
   if (
     (analysis.provisionalNoLinkBaseline || analysis.features?.provisionalNoLinkBaseline) &&
     (analysis.currentHasUsableLinkCandidate || analysis.features?.currentHasUsableLinkCandidate)
@@ -6418,25 +6440,40 @@ if (String(viewModel.state || "").toLowerCase() === "changed") {
     }
 
     const authorText = extractAuthorText(post);
-    const previewDomainText = extractPreviewDomainText(post);
-    const ctaText = extractCtaText(post);
     const sponsoredMarker = /\bsponsored\b/i.test(post.textContent || "") ? "sponsored" : "";
-    const cleanedPostText = String(post.textContent || "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 160);
     const timestampText = extractTimestampText(post);
-    const source = [authorText, sponsoredMarker, cleanedPostText, timestampText, previewDomainText, ctaText]
+    const stableFallbackText = extractStableFallbackPostText(post);
+
+    // Fallback identity intentionally avoids URLs, preview domains, and CTA text.
+    // Those can change during post-publication link edits, and using them in the
+    // postId would prevent DILI from comparing the old link baseline to the new link.
+    const source = [
+      authorText,
+      sponsoredMarker,
+      timestampText,
+      stableFallbackText
+    ]
       .filter(Boolean)
       .join("|");
     const identity = {
-      id: `session-${sponsoredMarker || "post"}-${hashString(source || cleanedPostText || "unknown-post")}`,
+      id: `session-${sponsoredMarker || "post"}-${hashString(source || stableFallbackText || "unknown-post")}`,
       stable: false,
       reason: "Session-only deterministic post fingerprint."
     };
 
     postIdCache.set(post, identity);
     return identity;
+  }
+
+  function extractStableFallbackPostText(post) {
+    const source = String(post?.textContent || "")
+      .replace(/\b(?:https?:\/\/|www\.)[^\s]+/gi, " ")
+      .replace(new RegExp(DOMAIN_TEXT_PATTERN.source, "gi"), " ")
+      .replace(/\b(?:shop now|learn more|sign up|apply now|download|watch more|order now|get offer|subscribe|contact us)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    return source.slice(0, 80);
   }
 
   function extractStableFacebookPostToken(value) {

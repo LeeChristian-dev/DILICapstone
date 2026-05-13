@@ -437,6 +437,11 @@ recordMaxPerformanceStat("maxEndpointMs", endpointMs);
   });
   const normalizedUrl = urlFeatures.normalizedUrl;
   const existingBaseline = await getBaseline(postId);
+  const previousBaselineUrl =
+    existingBaseline?.analysisUrl ||
+    existingBaseline?.normalizedUrl ||
+    existingBaseline?.rawUrl ||
+    "";
   const compatibleBaseline = getCompatibleBaseline(existingBaseline);
 
   if (existingBaseline && !compatibleBaseline) {
@@ -535,6 +540,17 @@ const canUseNoLinkInjectionBaseline = Boolean(
 );
 
   const linkInsertedAfterBaseline = Boolean(canUseNoLinkInjectionBaseline);
+  const existingLinkIntegrityMismatch = Boolean(
+    isReanalysis &&
+    compatibleBaseline?.urlHash &&
+    !linkInsertedAfterBaseline &&
+    hasCompatibleIntegrityMismatch(compatibleBaseline, {
+      currentHash,
+      analysisUrl,
+      normalizedUrl,
+      candidateContext: normalizedCandidateContext
+    })
+  );
   const postContextFeatures = {
     domainPreviouslyFlagged,
     textMismatch: textComparison.mismatch,
@@ -546,12 +562,7 @@ const canUseNoLinkInjectionBaseline = Boolean(
     baselineAgeMs,
     currentHasUsableLinkCandidate,
     linkInsertedAfterBaseline,
-    integrityHashMismatch: Boolean(linkInsertedAfterBaseline || (isReanalysis && stableIdentityMatch && normalizedCandidateContext.candidateMode === "single" && hasCompatibleIntegrityMismatch(compatibleBaseline, {
-      currentHash,
-      analysisUrl,
-      normalizedUrl,
-      candidateContext: normalizedCandidateContext
-    })))
+    integrityHashMismatch: Boolean(linkInsertedAfterBaseline || existingLinkIntegrityMismatch)
   };
   const enrichedUrlFeatures = {
     ...reusableUrlAnalysis.urlFeatureAnalysis,
@@ -752,6 +763,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     urlHash: currentHash,
     postTextHash: currentPostTextHash,
     normalizedVisiblePostText: normalizedCurrentPostText,
+    previousBaselineUrl,
     previousPostTextHash,
     currentPostTextHash,
     postTextChangedSinceBaseline,
@@ -801,6 +813,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         baselineAgeMs,
         currentHasUsableLinkCandidate,
         baselineFirstSeenAt,
+        previousBaselineUrl,
         previousPostTextHash,
         currentPostTextHash,
         candidateContext: normalizedCandidateContext,
@@ -2661,6 +2674,14 @@ if (riskRelevantDisplayChain.length > 0) {
 
   if (analysis?.linkInsertedAfterBaseline || analysis?.features?.linkInsertedAfterBaseline) {
     details.push("A link was inserted after a stored no-link baseline.");
+  }
+
+  if (analysis?.features?.integrityHashMismatch && !analysis?.features?.linkInsertedAfterBaseline) {
+    details.push("The post hyperlink changed after the original link baseline was stored.");
+  }
+
+  if (analysis?.previousBaselineUrl && analysis?.features?.integrityHashMismatch) {
+    details.push(`Previous baseline URL: ${analysis.previousBaselineUrl}.`);
   }
 
   const provisionalNoLinkBaseline = Boolean(analysis?.provisionalNoLinkBaseline || analysis?.features?.provisionalNoLinkBaseline);
