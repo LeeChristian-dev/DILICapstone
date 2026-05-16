@@ -10,6 +10,10 @@ import {
 
 const MAX_REDIRECT_DEPTH = 6;
 const FETCH_TIMEOUT_MS = 4000;
+const SUPPORTED_NETWORK_PROTOCOLS = new Set([
+  "http:",
+  "https:"
+]);
 const ACTIVE_PROBE_REDIRECT_HOSTS = new Set([
   "l.facebook.com",
   "lm.facebook.com",
@@ -37,6 +41,37 @@ const ACTIVE_PROBE_REDIRECT_HOSTS = new Set([
   "my.dito.ph",
   "coca-cola.com"
 ]);
+
+export function isFetchableNetworkProtocol(url) {
+  try {
+    const parsed = new URL(String(url || "").trim());
+    return SUPPORTED_NETWORK_PROTOCOLS.has(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+
+export function getProtocolName(url) {
+  try {
+    return new URL(String(url || "").trim()).protocol || "";
+  } catch {
+    return "";
+  }
+}
+
+function isUnsupportedNetworkProtocol(url) {
+  const protocol = getProtocolName(url);
+  return Boolean(protocol && !SUPPORTED_NETWORK_PROTOCOLS.has(protocol));
+}
+
+function normalizeRedirectCandidate(url, options = {}) {
+  const value = String(url || "").trim();
+  if (isUnsupportedNetworkProtocol(value)) {
+    return value;
+  }
+
+  return safelyCanonicalize(value, options) || value;
+}
 
 /**
  * Analyze redirect wrappers and optional low-cost network redirects.
@@ -73,10 +108,12 @@ export async function analyzeRedirects(rawUrl) {
   const fullObservedRedirectEvents = [];
   const visited = new Set();
 
-  let currentUrl = canonicalizeUrl(rawUrl, { stripTracking: false });
+  let currentUrl = isUnsupportedNetworkProtocol(rawUrl)
+    ? String(rawUrl || "").trim()
+    : canonicalizeUrl(rawUrl, { stripTracking: false });
 
   for (let depth = 0; depth < MAX_REDIRECT_DEPTH; depth += 1) {
-    const currentCanonical = safelyCanonicalize(currentUrl, { stripTracking: false }) || currentUrl;
+    const currentCanonical = normalizeRedirectCandidate(currentUrl, { stripTracking: false });
 
     if (visited.has(currentCanonical)) {
       pushUniqueNote(notes, "Redirect parsing stopped because the same URL appeared twice.");
@@ -95,7 +132,7 @@ export async function analyzeRedirects(rawUrl) {
       break;
     }
 
-    const nextCanonical = safelyCanonicalize(nextUrl, { stripTracking: false }) || nextUrl;
+    const nextCanonical = normalizeRedirectCandidate(nextUrl, { stripTracking: false });
     const currentHost = safeHostname(currentCanonical);
     const nextHost = safeHostname(nextCanonical);
     const currentDomain = getRegistrableDomain(currentHost);
@@ -112,7 +149,7 @@ export async function analyzeRedirects(rawUrl) {
     currentUrl = nextCanonical;
   }
 
-  const probeInputUrl = safelyCanonicalize(redirectChain[redirectChain.length - 1] || currentUrl, { stripTracking: true }) || (redirectChain[redirectChain.length - 1] || currentUrl);
+  const probeInputUrl = normalizeRedirectCandidate(redirectChain[redirectChain.length - 1] || currentUrl, { stripTracking: true });
   const probeInputHost = safeHostname(probeInputUrl);
   const fetchResolution = await attemptNetworkResolution(probeInputUrl, {
     originalUrl: rawUrl,
@@ -124,7 +161,7 @@ export async function analyzeRedirects(rawUrl) {
   }
 
   if (fetchResolution.success && fetchResolution.finalUrl && !isSameComparableUrl(fetchResolution.finalUrl, redirectChain[redirectChain.length - 1])) {
-    const finalCanonical = safelyCanonicalize(fetchResolution.finalUrl, { stripTracking: false }) || fetchResolution.finalUrl;
+    const finalCanonical = normalizeRedirectCandidate(fetchResolution.finalUrl, { stripTracking: false });
     redirectChain.push(finalCanonical);
     pushObservedRedirectTrace(fullObservedRedirectTrace, fullObservedRedirectEvents, finalCanonical, {
       method: fetchResolution.method || "network-follow",
@@ -204,10 +241,17 @@ export async function analyzeRedirects(rawUrl) {
     fullUniqueRegistrableDomains: fullObservedSummary.fullUniqueRegistrableDomains,
     redirectDomains: redirectSummary.redirectDomains,
     uniqueRegistrableDomains: redirectSummary.uniqueRegistrableDomains,
-    resolvedUrl: normalizeUrl(currentUrl, { stripTracking: false }),
-    resolutionMethod: fetchResolution.fetchAllowed ? fetchResolution.method : "heuristic-only",
+    resolvedUrl: isUnsupportedNetworkProtocol(currentUrl)
+      ? currentUrl
+      : normalizeUrl(currentUrl, { stripTracking: false }),
+    resolutionMethod: fetchResolution.skipReason === "unsupported_protocol"
+      ? fetchResolution.method
+      : fetchResolution.fetchAllowed ? fetchResolution.method : "heuristic-only",
     fetchMethod: fetchResolution.method,
     fetchStatus: fetchResolution.status || "",
+    skipped: Boolean(fetchResolution.skipped),
+    skipReason: fetchResolution.skipReason || "",
+    protocol: fetchResolution.protocol || "",
     notes,
     fetchAttempted: fetchResolution.fetchAttempted,
     fetchAllowed: fetchResolution.fetchAllowed,
@@ -225,6 +269,37 @@ export async function analyzeRedirects(rawUrl) {
 async function attemptNetworkResolution(rawUrl, context = {}) {
   const host = safeHostname(rawUrl);
   const probePolicy = getActiveProbePolicy(rawUrl, context);
+
+  if (!isFetchableNetworkProtocol(rawUrl)) {
+    const protocol = getProtocolName(rawUrl);
+    console.debug(
+      "[DILI] Skipped network probing for unsupported protocol:",
+      protocol,
+      rawUrl
+    );
+    return {
+      redirected: true,
+      finalUrl: rawUrl,
+      skipped: true,
+      skipReason: "unsupported_protocol",
+      protocol,
+      method: "unsupported-protocol",
+      status: "",
+      chain: [rawUrl],
+      fetchAllowed: false,
+      fetchAttempted: false,
+      success: true,
+      fullObservedRedirectTrace: [rawUrl],
+      fullObservedRedirectEvents: buildObservedEventsFromTrace([rawUrl], {
+        method: "unsupported-protocol",
+        status: "",
+        source: "unsupported-protocol",
+        note: "Network probing skipped because the endpoint uses a non-web protocol."
+      }),
+      shouldReportNote: true,
+      note: "Network probing was skipped because the redirect chain ended in a non-web application protocol."
+    };
+  }
 
   if (!probePolicy.allowed) {
     return {
@@ -271,6 +346,34 @@ async function attemptNetworkResolution(rawUrl, context = {}) {
 }
 
 async function attemptFetch(rawUrl, method) {
+  if (!isFetchableNetworkProtocol(rawUrl)) {
+    const protocol = getProtocolName(rawUrl);
+    console.debug(
+      "[DILI] Skipped network probing for unsupported protocol:",
+      protocol,
+      rawUrl
+    );
+    return {
+      fetchAllowed: false,
+      fetchAttempted: false,
+      success: true,
+      skipped: true,
+      skipReason: "unsupported_protocol",
+      protocol,
+      method: "unsupported-protocol",
+      status: "",
+      finalUrl: rawUrl,
+      fullObservedRedirectTrace: [rawUrl],
+      fullObservedRedirectEvents: buildObservedEventsFromTrace([rawUrl], {
+        method: "unsupported-protocol",
+        status: "",
+        source: "unsupported-protocol",
+        note: "Network probing skipped because the endpoint uses a non-web protocol."
+      }),
+      note: "Network probing was skipped because the redirect chain ended in a non-web application protocol."
+    };
+  }
+
   const manualResult = await attemptManualRedirectFetch(rawUrl, method);
   if (manualResult.success || manualResult.status === "timeout") {
     return manualResult;
@@ -329,7 +432,35 @@ async function attemptManualRedirectFetch(rawUrl, method) {
   const trace = [];
   const events = [];
   const startedAt = Date.now();
-  let currentUrl = safelyCanonicalize(rawUrl, { stripTracking: false }) || rawUrl;
+  let currentUrl = normalizeRedirectCandidate(rawUrl, { stripTracking: false });
+
+  if (!isFetchableNetworkProtocol(currentUrl)) {
+    const protocol = getProtocolName(currentUrl);
+    console.debug(
+      "[DILI] Skipped network probing for unsupported protocol:",
+      protocol,
+      currentUrl
+    );
+    return buildManualFetchResult({
+      success: true,
+      method: "unsupported-protocol",
+      status: "",
+      finalUrl: currentUrl,
+      trace: [currentUrl],
+      events: buildObservedEventsFromTrace([currentUrl], {
+        method: "unsupported-protocol",
+        status: "",
+        source: "unsupported-protocol",
+        note: "Network probing skipped because the endpoint uses a non-web protocol."
+      }),
+      note: "Network probing was skipped because the redirect chain ended in a non-web application protocol.",
+      fetchAllowed: false,
+      fetchAttempted: false,
+      skipped: true,
+      skipReason: "unsupported_protocol",
+      protocol
+    });
+  }
 
   pushObservedRedirectTrace(trace, events, currentUrl, {
     method: method.toLowerCase() + "-manual",
@@ -402,13 +533,36 @@ async function attemptManualRedirectFetch(rawUrl, method) {
           });
         }
 
-        const nextCanonical = safelyCanonicalize(nextUrl, { stripTracking: false }) || nextUrl;
+        const nextCanonical = normalizeRedirectCandidate(nextUrl, { stripTracking: false });
         pushObservedRedirectTrace(trace, events, nextCanonical, {
           method: method.toLowerCase() + "-manual",
           status,
           source: "network-location",
           note: "Network probing observed this redirect stage."
         });
+
+        if (!isFetchableNetworkProtocol(nextCanonical)) {
+          const protocol = getProtocolName(nextCanonical);
+          console.debug(
+            "[DILI] Skipped network probing for unsupported protocol:",
+            protocol,
+            nextCanonical
+          );
+          return buildManualFetchResult({
+            success: true,
+            method: "unsupported-protocol",
+            status: "unsupported_protocol",
+            finalUrl: nextCanonical,
+            trace,
+            events,
+            note: "Network probing was skipped because the redirect chain ended in a non-web application protocol.",
+            fetchAllowed: true,
+            fetchAttempted: true,
+            skipped: true,
+            skipReason: "unsupported_protocol",
+            protocol
+          });
+        }
 
         if (isSameComparableUrl(nextCanonical, currentUrl)) {
           return buildManualFetchResult({
@@ -464,12 +618,32 @@ async function attemptManualRedirectFetch(rawUrl, method) {
   });
 }
 
-function buildManualFetchResult({ success, method, status, finalUrl, trace, events, note }) {
+function buildManualFetchResult({
+  success,
+  method,
+  status,
+  finalUrl,
+  trace,
+  events,
+  note,
+  fetchAllowed = true,
+  fetchAttempted = true,
+  skipped = false,
+  skipReason = "",
+  protocol = ""
+}) {
+  const normalizedMethod = String(method || "").includes("-")
+    ? String(method || "")
+    : String(method || "").toLowerCase() + "-manual";
+
   return {
-    fetchAllowed: true,
-    fetchAttempted: true,
+    fetchAllowed,
+    fetchAttempted,
     success,
-    method: method.toLowerCase() + "-manual",
+    skipped,
+    skipReason,
+    protocol,
+    method: normalizedMethod,
     status,
     finalUrl,
     fullObservedRedirectTrace: compactObservedTrace(trace),

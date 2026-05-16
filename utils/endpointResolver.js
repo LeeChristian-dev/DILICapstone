@@ -1,4 +1,8 @@
-import { analyzeRedirects } from "./redirectAnalyzer.js";
+import {
+  analyzeRedirects,
+  getProtocolName,
+  isFetchableNetworkProtocol
+} from "./redirectAnalyzer.js";
 import {
   canonicalizeUrl,
   getRegistrableDomain,
@@ -49,7 +53,9 @@ export async function resolveEndpoint(rawUrl) {
   let wrapperAnalysis = null;
 
   try {
-    normalizedRawUrl = canonicalizeUrl(source, { stripTracking: false });
+    normalizedRawUrl = getProtocolName(source) && !isFetchableNetworkProtocol(source)
+      ? source
+      : canonicalizeUrl(source, { stripTracking: false });
     wrapperAnalysis = unwrapKnownRedirectWrappers(source);
   } catch (error) {
     errors.push(error?.message || "URL normalization failed.");
@@ -58,7 +64,10 @@ export async function resolveEndpoint(rawUrl) {
 
   const rawHost = safeHostname(normalizedRawUrl);
   const isFacebookWrapper = isFacebookWrapperHost(rawHost);
-  const unwrappedUrl = safelyNormalize(wrapperAnalysis?.finalUrl || normalizedRawUrl) || normalizedRawUrl;
+  const initialEndpoint = getProtocolName(normalizedRawUrl) && !isFetchableNetworkProtocol(normalizedRawUrl)
+    ? normalizedRawUrl
+    : wrapperAnalysis?.finalUrl || normalizedRawUrl;
+  const unwrappedUrl = safelyNormalize(initialEndpoint) || normalizedRawUrl;
   const unwrappedHost = safeHostname(unwrappedUrl);
   const internalFacebook = isFacebookHost(unwrappedHost);
   const isShortener = isShortenerHost(rawHost) || isShortenerHost(unwrappedHost);
@@ -107,17 +116,26 @@ export async function resolveEndpoint(rawUrl) {
   let resolvedUrl = unwrappedUrl;
   let resolutionMethod = wrapperAnalysis?.usedWrapper ? "wrapper-unwrapped" : "normalized";
   let endpointConfidence = wrapperAnalysis?.usedWrapper || !isShortener ? "medium" : "low";
+  let nonWebProtocolDetected = false;
+  let nonWebProtocol = "";
 
   try {
     redirectAnalysis = await analyzeRedirects(source);
     if (redirectAnalysis?.resolvedUrl) {
-      resolvedUrl = normalizeUrl(redirectAnalysis.resolvedUrl, { stripTracking: false });
+      resolvedUrl = getProtocolName(redirectAnalysis.resolvedUrl) && !isFetchableNetworkProtocol(redirectAnalysis.resolvedUrl)
+        ? redirectAnalysis.resolvedUrl
+        : normalizeUrl(redirectAnalysis.resolvedUrl, { stripTracking: false });
       resolutionMethod = redirectAnalysis.resolutionMethod || resolutionMethod;
-      endpointConfidence = redirectAnalysis.fetchAttempted
-        ? redirectAnalysis.fetchSucceeded && redirectAnalysis.resolvedUrl
+      const resolvedProtocolIsFetchable = isFetchableNetworkProtocol(resolvedUrl);
+      nonWebProtocolDetected = !resolvedProtocolIsFetchable;
+      nonWebProtocol = nonWebProtocolDetected ? getProtocolName(resolvedUrl) : "";
+      if (nonWebProtocolDetected) {
+        endpointConfidence = "medium";
+      } else if (redirectAnalysis.fetchAttempted) {
+        endpointConfidence = redirectAnalysis.fetchSucceeded && redirectAnalysis.resolvedUrl
           ? "high"
-          : "low"
-        : endpointConfidence;
+          : "low";
+      }
     }
 
     for (const note of redirectAnalysis?.notes || []) {
@@ -127,6 +145,12 @@ export async function resolveEndpoint(rawUrl) {
     endpointConfidence = "low";
     pushUnique(warnings, "Endpoint resolution was limited because redirect probing failed.");
     errors.push(error?.message || "Redirect probing failed.");
+  }
+
+  if (!nonWebProtocolDetected && resolvedUrl && !isFetchableNetworkProtocol(resolvedUrl)) {
+    nonWebProtocolDetected = true;
+    nonWebProtocol = getProtocolName(resolvedUrl);
+    endpointConfidence = "medium";
   }
 
   const resolutionChain = compactChain([
@@ -159,6 +183,8 @@ export async function resolveEndpoint(rawUrl) {
     fullRedirectDomains: fullObservedRedirectTrace.map((url) => safeHostname(url)).filter(Boolean),
     resolutionMethod,
     endpointConfidence,
+    nonWebProtocolDetected,
+    nonWebProtocol,
     warnings,
     errors,
     isFacebookWrapper,
@@ -202,6 +228,12 @@ function buildEndpointResult(input) {
     fullRedirectDomains: Array.isArray(input.fullRedirectDomains)
       ? input.fullRedirectDomains
       : fullObservedRedirectTrace.map((url) => safeHostname(url)).filter(Boolean),
+    ...(input.nonWebProtocolDetected
+      ? {
+          nonWebProtocolDetected: true,
+          nonWebProtocol: input.nonWebProtocol || getProtocolName(effectiveEndpoint)
+        }
+      : {}),
     warnings: unique(input.warnings || []),
     errors: unique(input.errors || [])
   };
@@ -233,6 +265,10 @@ function isFacebookHost(hostname) {
 
 function safelyNormalize(rawUrl) {
   try {
+    if (getProtocolName(rawUrl) && !isFetchableNetworkProtocol(rawUrl)) {
+      return String(rawUrl || "").trim();
+    }
+
     return normalizeUrl(rawUrl, { stripTracking: false });
   } catch {
     return String(rawUrl || "").trim();

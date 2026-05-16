@@ -1027,6 +1027,10 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
       );
     }
 
+    if (analysis?.nonWebProtocolDetected || analysis?.endpointResult?.nonWebProtocolDetected) {
+      reasons.push("This link redirects into an external application instead of a normal website.");
+    }
+
     if (features.shortenedUrl) {
       reasons.push("The link uses a shortened URL that hides the full destination.");
     }
@@ -5418,6 +5422,11 @@ function isMessagingOrCommunityInviteDomain(domain) {
 function getProviderOutcomeSummary(provider = {}) {
   const providerName = String(provider.provider || "").toLowerCase();
   const status = String(provider.details?.status || "").toLowerCase();
+  const reason = String(provider.details?.reason || "").toLowerCase();
+
+  if (status === "skipped" && reason === "unsupported_protocol") {
+    return "Provider skipped because the destination uses a non-web protocol.";
+  }
 
   if (providerName === "virustotal") {
     if (!provider.configured || status === "not-configured") {
@@ -5943,6 +5952,14 @@ function buildTechnicalDetails(analysis = {}) {
     pushUniqueTechnicalDetail(
       details,
       `Endpoint confidence: ${endpoint.endpointConfidence || analysis.endpointConfidence}.`
+    );
+  }
+
+  if (analysis.nonWebProtocolDetected || endpoint.nonWebProtocolDetected) {
+    const protocol = analysis.nonWebProtocol || endpoint.nonWebProtocol || "";
+    pushUniqueTechnicalDetail(
+      details,
+      `The redirect chain ended in a non-web application protocol (${protocol}). Network verification was limited because the destination is intended for an external application.`
     );
   }
 

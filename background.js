@@ -798,6 +798,8 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     providerOverride,
     providerResults,
     providerCheckedUrl: reusableUrlAnalysis.providerCheckedUrl || "",
+    nonWebProtocolDetected: Boolean(endpointResult.nonWebProtocolDetected),
+    nonWebProtocol: endpointResult.nonWebProtocol || "",
     technicalDetails: buildTechnicalDetails({
       endpointResult,
       redirectAnalysis,
@@ -822,6 +824,8 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         safetyScore: finalScore,
         scoreAudit,
         providerOverride,
+        nonWebProtocolDetected: Boolean(endpointResult.nonWebProtocolDetected),
+        nonWebProtocol: endpointResult.nonWebProtocol || "",
         interceptionRecommended: finalInterceptionRecommended,
         deductions: scoring.deductions
       },
@@ -947,6 +951,15 @@ function resolveAnalysisUrl(urlFeatures, redirectAnalysis) {
 }
 
 function pickProviderCheckedUrl({ endpointResult = {}, redirectAnalysis = {}, urlFeatures = {} } = {}) {
+  if (endpointResult.nonWebProtocolDetected) {
+    return (
+      endpointResult.effectiveEndpoint ||
+      endpointResult.resolvedUrl ||
+      redirectAnalysis.resolvedUrl ||
+      ""
+    );
+  }
+
   const candidates = [
     endpointResult.effectiveEndpoint,
     endpointResult.resolvedUrl,
@@ -1210,6 +1223,8 @@ recordMaxPerformanceStat("maxProviderMs", providerMs);
     sourceRawComparableUrl: urlFeatures.rawComparableUrl,
     finalAnalysisUrl: analysisUrl,
     providerCheckedUrl,
+    nonWebProtocolDetected: Boolean(safeEndpointResult.nonWebProtocolDetected),
+    nonWebProtocol: safeEndpointResult.nonWebProtocol || "",
     normalizedComparisonUrl: urlFeatures.normalizedUrl,
     displayUrl: urlFeatures.rawComparableUrl || urlFeatures.unwrappedUrl || urlFeatures.normalizedUrl || "",
     finalDomain: domain,
@@ -1242,6 +1257,8 @@ recordMaxPerformanceStat("maxProviderMs", providerMs);
     providerResults,
     endpointResult: safeEndpointResult,
     providerCheckedUrl,
+    nonWebProtocolDetected: Boolean(safeEndpointResult.nonWebProtocolDetected),
+    nonWebProtocol: safeEndpointResult.nonWebProtocol || "",
     urlFeatureAnalysis: stableUrlFeatureAnalysis,
     urlLevelFeatures
   };
@@ -1439,6 +1456,9 @@ function normalizeRedirectAnalysis(redirectAnalysis = {}) {
     resolutionMethod: safe.resolutionMethod || "unknown",
     fetchMethod: safe.fetchMethod || "",
     fetchStatus: safe.fetchStatus || "",
+    skipped: Boolean(safe.skipped),
+    skipReason: safe.skipReason || "",
+    protocol: safe.protocol || "",
     notes: Array.isArray(safe.notes) ? safe.notes : [],
     fetchAttempted: Boolean(safe.fetchAttempted),
     fetchAllowed: Boolean(safe.fetchAllowed),
@@ -2608,6 +2628,18 @@ if (riskRelevantDisplayChain.length > 0) {
     details.push(`Endpoint confidence: ${endpointResult.endpointConfidence}.`);
   }
 
+  const nonWebProtocol =
+    endpointResult.nonWebProtocol ||
+    analysis.nonWebProtocol ||
+    urlFeatureAnalysis.nonWebProtocol ||
+    redirectAnalysis.protocol ||
+    "";
+  if (endpointResult.nonWebProtocolDetected || analysis.nonWebProtocolDetected || urlFeatureAnalysis.nonWebProtocolDetected) {
+    details.push(
+      `The redirect chain ended in a non-web application protocol (${nonWebProtocol}). Network verification was limited because the destination is intended for an external application.`
+    );
+  }
+
   if (isMessagingOrCommunityInviteDomain(getRegistrableDomain(effectiveDomain))) {
     details.push("DILI verified the link destination, but it cannot verify the trustworthiness of content inside this messaging or community platform.");
   }
@@ -3238,6 +3270,14 @@ function stripUrlAnalysisCacheMetadata(entry) {
   return payload;
 }
 async function runThreatIntelligenceChecks(normalizedUrl) {
+  if (!isProviderScannableUrl(normalizedUrl)) {
+    return normalizeProviderResults([
+      createSkippedUnsupportedProtocolProviderResult("gsb", normalizedUrl),
+      createSkippedUnsupportedProtocolProviderResult("urlhaus", normalizedUrl),
+      createSkippedUnsupportedProtocolProviderResult("virustotal", normalizedUrl)
+    ]);
+  }
+
   const providerTasks = [
     getCachedOrInFlightProviderResult("gsb", normalizedUrl, () => lookupGoogleSafeBrowsing(normalizedUrl)),
     getCachedOrInFlightProviderResult("urlhaus", normalizedUrl, () => lookupUrlhaus(normalizedUrl)),
@@ -4952,6 +4992,11 @@ function withProviderOutcomeSummary(result) {
 function getProviderOutcomeSummary(result = {}) {
   const provider = String(result.provider || "").toLowerCase();
   const status = String(result.details?.status || "").toLowerCase();
+  const reason = String(result.details?.reason || "").toLowerCase();
+
+  if (status === "skipped" && reason === "unsupported_protocol") {
+    return "Provider skipped because the destination uses a non-web protocol.";
+  }
 
   if (provider === "virustotal") {
     if (!result.configured || status === "not-configured") {
@@ -5054,6 +5099,24 @@ function createSkippedUrlhausProviderResult(checkedUrl = "") {
   });
 }
 
+function createSkippedUnsupportedProtocolProviderResult(provider, checkedUrl = "") {
+  return withProviderOutcomeSummary({
+    provider,
+    configured: true,
+    checked: false,
+    checkedUrl,
+    checkedAt: new Date().toISOString(),
+    durationMs: 0,
+    flagged: false,
+    category: null,
+    details: {
+      status: "skipped",
+      reason: "unsupported_protocol",
+      message: "Provider lookup skipped because the URL uses a non-web protocol."
+    }
+  });
+}
+
 function createDefaultProviderResult(provider, checkedUrl = "") {
   return withProviderOutcomeSummary({
     provider,
@@ -5092,6 +5155,15 @@ function isSupportedFacebookUrl(url) {
   try {
     const parsed = new URL(url);
     return parsed.protocol.startsWith("http") && parsed.hostname.includes("facebook.com");
+  } catch {
+    return false;
+  }
+}
+
+function isProviderScannableUrl(url) {
+  try {
+    const parsed = new URL(String(url || "").trim());
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
   } catch {
     return false;
   }
