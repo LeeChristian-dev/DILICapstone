@@ -160,6 +160,33 @@
   color: rgba(15, 23, 42, 0.76);
 }
 
+.dili-panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.dili-restart-scan-button {
+  appearance: none;
+  border: 1px solid rgba(71, 85, 105, 0.28);
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1f2937;
+  cursor: pointer;
+  font: 800 12px/1.2 "Segoe UI", Tahoma, sans-serif;
+  padding: 7px 10px;
+  max-width: 100%;
+}
+
+.dili-restart-scan-button:hover,
+.dili-restart-scan-button:focus-visible {
+  border-color: rgba(37, 99, 235, 0.45);
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
 .dili-pill {
   display: inline-flex;
   align-items: center;

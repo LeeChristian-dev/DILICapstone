@@ -15,6 +15,7 @@
     REANALYZE_LINK: "DILI_REANALYZE_LINK",
     REFRESH_VIRUSTOTAL_RESULT: "DILI_REFRESH_VIRUSTOTAL_RESULT",
     FINALIZE_PENDING_PROVIDER_STATE: "DILI_FINALIZE_PENDING_PROVIDER_STATE",
+    CLEAR_POST_ANALYSIS_STATE: "DILI_CLEAR_POST_ANALYSIS_STATE",
     GET_POST_STATE: "DILI_GET_POST_STATE",
     SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
     GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
@@ -162,12 +163,15 @@ const UNSAFE_PANEL_ANCESTOR_SELECTOR =
   const selectedPostLinkCache = new Map();
   const observedPostIds = new Map();
   const latestRequestByPostId = new Map();
+  const analysisInFlightByPostId = new Map();
   const cachedPanelByPostId = new Map();
   const noLinkRescanCountsByPostId = new Map();
   const recentlyRenderedPanelByPostId = new Map();
+  const completedAnalysisSessionCache = new Map();
   const pendingVirusTotalRefreshByPostId = new Map();
   const pendingVirusTotalRefreshAttemptsByPostId = new Map();
   const pendingCountdownTimerByPostId = new Map();
+  const manualRestartPostIds = new Set();
   const VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS = [30000, 60000, 120000];
   const COMPLETED_PANEL_RENDER_COOLDOWN_MS = 30 * 1000;
   let manualRescanBypassUntil = 0;
@@ -1071,7 +1075,7 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
     const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
     const vt = findProviderResult(analysis?.providerResults, "virustotal");
     const classification = String(analysis?.classification || "").toLowerCase();
-    const score = Number(analysis?.safetyScore);
+    const score = toFiniteUiScoreOrNull(analysis?.safetyScore);
 
     if (gsb?.flagged || urlhaus?.flagged || vt?.flagged) {
       return "DILI paused navigation because this destination was flagged by a threat-intelligence provider and may expose you to phishing, malware, or other unsafe behavior.";
@@ -1081,7 +1085,7 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
       return "DILI paused navigation because this link shows several warning signs commonly seen in malicious redirects, scam campaigns, or deceptive destination changes.";
     }
 
-    if (classification.includes("suspicious") || (Number.isFinite(score) && score < 80)) {
+    if (classification.includes("suspicious") || (score !== null && score < 80)) {
       return "DILI paused navigation because this link has enough warning signs that you should review it before opening.";
     }
 
@@ -2041,10 +2045,23 @@ async function processPost(post) {
     baseline?.hadLinkAtBaseline === false
   );
   const linkFingerprint = linkInfo.linkFingerprint;
+  const manualRestartRequested = manualRestartPostIds.has(postId);
+
+  if (
+    !manualRestartRequested &&
+    shouldSkipFullAnalysisForExistingLifecycle({
+      postId,
+      post: owningPost,
+      signature,
+      linkFingerprint,
+      postTextHash: postTextSnapshot.postTextHash
+    })
+  ) {
+    return;
+  }
 
   if (
     !isManualRescanCooldownBypassActive() &&
-    !isVirusTotalRefreshDueForBaseline(baseline, postId) &&
     shouldReuseCompletedUnchangedPostAnalysis({
       postId,
       signature,
@@ -2055,7 +2072,7 @@ async function processPost(post) {
   ) {
     scanStatus.unchangedPostAnalysisSkippedCooldown += 1;
     scanStatus.lastAnalysisPipelineState = {
-      stage: "unchanged-post-analysis-skipped-cooldown",
+      stage: "unchanged-post-analysis-reused-session",
       postId,
       signature,
       linkFingerprint,
@@ -2075,6 +2092,13 @@ async function processPost(post) {
     signature,
     linkFingerprint,
     postTextHash: postTextSnapshot.postTextHash
+  });
+  analysisInFlightByPostId.set(postId, {
+    requestId,
+    signature,
+    linkFingerprint,
+    postTextHash: postTextSnapshot.postTextHash,
+    startedAt: Date.now()
   });
 
   scanStatus.analysisRequestsSent += 1;
@@ -2103,23 +2127,59 @@ async function processPost(post) {
 
   const backgroundStartedAt = nowMs();
 
-  const response = await sendRuntimeMessage({
-    type: messageType,
-    postId,
-    url: linkInfo.links[0]?.url,
-    links: linkInfo.links,
-    displayedText: linkInfo.displayText,
-    postTextHash: postTextSnapshot.postTextHash,
-    normalizedVisiblePostText: postTextSnapshot.normalizedVisiblePostText,
-    candidateContext: {
-      ...linkInfo.candidateContext,
-      postIdentityStable: postIdentity.stable
-    },
-    requestId,
-    postSignature: signature,
-    linkFingerprint
-  });
+  let response = null;
+  try {
+    response = await withTimeout(
+      sendRuntimeMessage({
+        type: messageType,
+        postId,
+        url: linkInfo.links[0]?.url,
+        links: linkInfo.links,
+        displayedText: linkInfo.displayText,
+        postTextHash: postTextSnapshot.postTextHash,
+        normalizedVisiblePostText: postTextSnapshot.normalizedVisiblePostText,
+        candidateContext: {
+          ...linkInfo.candidateContext,
+          postIdentityStable: postIdentity.stable
+        },
+        requestId,
+        postSignature: signature,
+        linkFingerprint
+      }),
+      20000,
+      "DILI background analysis"
+    );
+  } catch (error) {
+    renderBadge(owningPost, {
+      label: "Verification Incomplete",
+      safetyScore: null,
+      state: "verification-incomplete",
+      severityLevel: "unverified",
+      summaryLine: "DILI could not complete this scan in time.",
+      detailsSummary: "Scan details",
+      actionHint: "DILI could not complete this scan in time. You may restart the scan.",
+      restartAvailable: true,
+      details: [
+        error?.message || "Background analysis timed out.",
+        "DILI stopped showing the analyzing state so this post does not remain stuck."
+      ],
+      reportSections: {
+        resultLine: "Verification Incomplete. DILI could not complete this scan in time.",
+        checkedLine: "Endpoint resolution or provider checks did not return before the content-script timeout.",
+        reasons: ["The scan timed out before a complete analysis was returned."],
+        recommendation: "Use Rescan Now from the extension popup to try again.",
+        verificationNotes: ["No final safety score is available for this timed-out scan."],
+        technicalDetails: [error?.message || "Background analysis timed out."]
+      }
+    });
+    latestRequestByPostId.delete(postId);
+    analysisInFlightByPostId.delete(postId);
+    manualRestartPostIds.delete(postId);
+    return;
+  }
   if (shouldAbortForRuntimeInvalidation(response)) {
+    analysisInFlightByPostId.delete(postId);
+    manualRestartPostIds.delete(postId);
     return;
   }
 
@@ -2189,6 +2249,8 @@ async function processPost(post) {
       timestamp: Date.now()
     };
 
+    analysisInFlightByPostId.delete(postId);
+    manualRestartPostIds.delete(postId);
     return;
   }
 
@@ -2201,9 +2263,12 @@ async function processPost(post) {
       summaryLine: "This link could not be verified in time.",
       detailsSummary: "Why this result was given",
       actionHint: "DILI may pause navigation until you decide whether to proceed.",
+      restartAvailable: true,
       details: [response?.error || "Background analysis did not return data."]
     });
 
+    analysisInFlightByPostId.delete(postId);
+    manualRestartPostIds.delete(postId);
     return;
   }
 
@@ -2219,6 +2284,8 @@ async function processPost(post) {
 
   renderBadge(owningPost, mapAnalysisToViewModel(response.analysis));
   rememberAnalysisForLinkInfo(postId, linkInfo, response.analysis);
+  analysisInFlightByPostId.delete(postId);
+  manualRestartPostIds.delete(postId);
 
   const renderMs = elapsedMs(renderStartedAt);
   scanStatus.perfLastRenderMs = renderMs;
@@ -2242,6 +2309,70 @@ function isManualRescanCooldownBypassActive() {
   return Date.now() < Number(manualRescanBypassUntil || 0);
 }
 
+function shouldSkipFullAnalysisForExistingLifecycle({
+  postId,
+  post,
+  signature,
+  linkFingerprint,
+  postTextHash
+} = {}) {
+  const inFlight = analysisInFlightByPostId.get(postId);
+  if (
+    inFlight &&
+    inFlight.signature === signature &&
+    inFlight.linkFingerprint === linkFingerprint &&
+    inFlight.postTextHash === postTextHash
+  ) {
+    const cachedPanel = cachedPanelByPostId.get(postId);
+    if (post instanceof Element && cachedPanel) {
+      renderBadge(post, cachedPanel);
+    }
+
+    console.debug("[DILI][scan-lifecycle] Full analysis skipped because already in flight.", {
+      postId,
+      signature,
+      linkFingerprint,
+      requestId: inFlight.requestId
+    });
+    return true;
+  }
+
+  const cachedPanel = cachedPanelByPostId.get(postId);
+  const analysis = normalizeProviderDisplayAnalysis(cachedPanel?.analysis || {});
+  const pending = Boolean(
+    cachedPanel?.state === "pending-provider" ||
+    analysis?.state === "pending-provider" ||
+    analysis?.scanFinalized === false ||
+    hasActualPendingProvider(analysis)
+  );
+
+  if (!pending) {
+    return false;
+  }
+
+  const latestRequest = latestRequestByPostId.get(postId) || {};
+  const sameFingerprint = !latestRequest.linkFingerprint || latestRequest.linkFingerprint === linkFingerprint;
+  const sameText = !latestRequest.postTextHash || latestRequest.postTextHash === postTextHash;
+  const sameSignature = !latestRequest.signature || latestRequest.signature === signature;
+
+  if (!sameFingerprint || !sameText || !sameSignature) {
+    return false;
+  }
+
+  if (post instanceof Element && cachedPanel) {
+    renderBadge(post, cachedPanel);
+    schedulePendingVirusTotalPanelRefresh(post, cachedPanel);
+  }
+
+  console.debug("[DILI][scan-lifecycle] Full analysis skipped because provider refresh is pending.", {
+    postId,
+    signature,
+    linkFingerprint,
+    state: cachedPanel?.state || analysis?.state || ""
+  });
+  return true;
+}
+
 function shouldReuseCompletedUnchangedPostAnalysis({
   postId,
   signature,
@@ -2251,9 +2382,10 @@ function shouldReuseCompletedUnchangedPostAnalysis({
 } = {}) {
   const recent = recentlyRenderedPanelByPostId.get(postId);
   const cachedPanel = cachedPanelByPostId.get(postId);
-  const analysis = normalizeProviderDisplayAnalysis(cachedPanel?.analysis || {});
+  const sessionCacheEntry = completedAnalysisSessionCache.get(postId);
+  const analysis = normalizeProviderDisplayAnalysis(cachedPanel?.analysis || sessionCacheEntry?.analysis || {});
 
-  if (!recent || !cachedPanel || !analysis || typeof analysis !== "object") {
+  if (!analysis || typeof analysis !== "object") {
     return false;
   }
 
@@ -2261,16 +2393,24 @@ function shouldReuseCompletedUnchangedPostAnalysis({
     return false;
   }
 
+  const cachedSignature = recent?.signature || sessionCacheEntry?.postSignature || "";
+  const cachedLinkFingerprint = recent?.linkFingerprint || sessionCacheEntry?.linkFingerprint || "";
+  const cachedPostTextHash = recent?.postTextHash || sessionCacheEntry?.postTextHash || "";
+
   if (
-    recent.signature !== signature ||
-    recent.linkFingerprint !== linkFingerprint ||
-    recent.postTextHash !== postTextHash
+    cachedSignature !== signature ||
+    cachedLinkFingerprint !== linkFingerprint ||
+    cachedPostTextHash !== postTextHash
   ) {
     return false;
   }
 
+  const panelModel = cachedPanel || sessionCacheEntry?.viewModel || mapAnalysisToViewModel(analysis);
+
   if (post instanceof Element && !post.querySelector(".dili-panel[data-dili-owned='true']")) {
-    renderBadge(post, cachedPanel);
+    renderBadge(post, panelModel);
+    cachedPanelByPostId.set(postId, { ...panelModel });
+    rememberRecentlyRenderedPanel(postId, post, panelModel);
   }
 
   return true;
@@ -4290,6 +4430,8 @@ function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
     removeOwnedWarningOverlays();
     cachedPanelByPostId.clear();
     recentlyRenderedPanelByPostId.clear();
+    analysisInFlightByPostId.clear();
+    manualRestartPostIds.clear();
     clearAllPendingVirusTotalPanelRefreshes();
     clearAllPendingCountdownTimers();
     postSignatureCache = new WeakMap(); 
@@ -4301,6 +4443,8 @@ function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
     clickAnalysisCache.clear();
     observedPostIds.clear();
     latestRequestByPostId.clear();
+analysisInFlightByPostId.clear();
+manualRestartPostIds.clear();
 recentlyRenderedPanelByPostId.clear();
 clearAllPendingVirusTotalPanelRefreshes();
 noLinkRescanCountsByPostId.clear();
@@ -4484,6 +4628,7 @@ function renderBadge(post, viewModel) {
     const countdownLine = viewModel.state === "pending-provider"
       ? buildPendingCountdownLine(viewModel.analysis || {})
       : "";
+    const restartAvailable = shouldShowRestartScanButton(viewModel);
 
     badge.className = `dili-panel dili-panel-${severityClass} dili-state-${safeState}`;
     const reportHtml = viewModel.reportSections
@@ -4503,12 +4648,34 @@ function renderBadge(post, viewModel) {
         </div>
         ${actionHint ? `<p class="dili-action-hint">${escapeHtml(actionHint)}</p>` : ""}
         ${countdownLine ? `<p class="dili-pending-countdown" data-dili-countdown="true">${escapeHtml(countdownLine)}</p>` : ""}
+        ${restartAvailable ? `
+          <div class="dili-panel-actions">
+            <button type="button" class="dili-restart-scan-button" data-dili-action="restart-scan">Restart scan</button>
+          </div>
+        ` : ""}
       </div>
  <details class="dili-details">
   <summary>${escapeHtml(detailsSummary)}</summary>
   ${reportHtml}
 </details>
     `;
+
+    const restartButton = badge.querySelector("[data-dili-action='restart-scan']");
+    restartButton?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === "function") {
+        event.stopImmediatePropagation();
+      }
+
+      console.debug("[DILI][scan-lifecycle] Restart scan clicked.", {
+        postId: renderedPostId,
+        state: viewModel.state || ""
+      });
+      restartScanForPost(owningPost, "manual-post-restart").catch((error) => {
+        console.debug("[DILI][scan-lifecycle] Restart scan failed.", error);
+      });
+    });
 
     if (viewModel.state === "pending-provider" && viewModel.analysis?.providerRetryPlan?.nextRetryAt) {
       startPendingCountdownTimer(renderedPostId, owningPost, viewModel.analysis);
@@ -4540,6 +4707,32 @@ function rememberRecentlyRenderedPanel(postId, post, viewModel = {}) {
     return;
   }
 
+  completedAnalysisSessionCache.set(postId, {
+    postSignature: latestRequest.signature || "",
+    linkFingerprint: latestRequest.linkFingerprint || "",
+    postTextHash: latestRequest.postTextHash || analysis.postTextHash || analysis.currentPostTextHash || "",
+    analysis: {
+      ...analysis,
+      providerResults: Array.isArray(analysis.providerResults) ? analysis.providerResults.map((item) => ({ ...item })) : analysis.providerResults,
+      providerCompletion: analysis.providerCompletion ? { ...analysis.providerCompletion } : analysis.providerCompletion,
+      pendingProviders: Array.isArray(analysis.pendingProviders) ? analysis.pendingProviders.slice() : analysis.pendingProviders,
+      linkAnalysisSnapshots: Array.isArray(analysis.linkAnalysisSnapshots)
+        ? analysis.linkAnalysisSnapshots.map((item) => ({ ...item }))
+        : analysis.linkAnalysisSnapshots,
+      pendingLinkRefreshTargets: Array.isArray(analysis.pendingLinkRefreshTargets)
+        ? analysis.pendingLinkRefreshTargets.map((item) => ({ ...item }))
+        : analysis.pendingLinkRefreshTargets,
+      pendingProviderRefreshTarget: analysis.pendingProviderRefreshTarget ? { ...analysis.pendingProviderRefreshTarget } : analysis.pendingProviderRefreshTarget,
+      scoreAudit: analysis.scoreAudit ? { ...analysis.scoreAudit } : analysis.scoreAudit,
+      features: analysis.features ? { ...analysis.features } : analysis.features,
+      endpointResult: analysis.endpointResult ? { ...analysis.endpointResult } : analysis.endpointResult,
+      redirectAnalysis: analysis.redirectAnalysis ? { ...analysis.redirectAnalysis } : analysis.redirectAnalysis,
+      urlFeatureAnalysis: analysis.urlFeatureAnalysis ? { ...analysis.urlFeatureAnalysis } : analysis.urlFeatureAnalysis
+    },
+    viewModel: { ...viewModel },
+    timestamp: Date.now()
+  });
+
   recentlyRenderedPanelByPostId.set(postId, {
     signature: latestRequest.signature || "",
     linkFingerprint: latestRequest.linkFingerprint || "",
@@ -4550,6 +4743,92 @@ function rememberRecentlyRenderedPanel(postId, post, viewModel = {}) {
     vtStatus: String(vt?.details?.status || "").toLowerCase()
   });
 }
+
+function shouldShowRestartScanButton(viewModel = {}) {
+  const analysis = viewModel.analysis || {};
+  if (analysis.providerOverride === true || viewModel.providerOverride === true) {
+    return false;
+  }
+
+  const state = String(viewModel.state || analysis.state || "").toLowerCase();
+  const label = String(viewModel.label || analysis.classification || "").toLowerCase();
+  const retryStatus = String(analysis.providerRetryPlan?.status || "").toLowerCase();
+  const retryReason = String(analysis.scoreAudit?.retryBudgetExhausted || analysis.providerResults?.find?.((item) => item?.provider === "virustotal")?.details?.reason || "").toLowerCase();
+
+  return Boolean(
+    viewModel.restartAvailable === true ||
+    state === "verification-incomplete" ||
+    state === "completed-limited" ||
+    retryStatus === "exhausted" ||
+    retryReason === "retry_budget_exhausted" ||
+    label.includes("verification incomplete") ||
+    (
+      label.includes("unverified") &&
+      toFiniteUiScoreOrNull(viewModel.safetyScore ?? analysis.safetyScore) === null
+    )
+  );
+}
+
+async function restartScanForPost(post, reason = "manual-post-restart") {
+  const owningPost = getTopLevelPanelOwner(post);
+  if (!(owningPost instanceof Element) || !owningPost.isConnected) {
+    return;
+  }
+
+  const postId = getStablePostId(owningPost);
+  const postTextSnapshot = await buildVisiblePostTextSnapshot(owningPost);
+  const linkInfo = extractRelevantLinks(owningPost, postId, { suppressDiagnostics: true });
+  const postSignature = buildPostSignature(linkInfo);
+  const linkFingerprint = linkInfo?.linkFingerprint || "";
+
+  clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+  clearPendingCountdownTimer(postId);
+  analysisInFlightByPostId.delete(postId);
+  latestRequestByPostId.delete(postId);
+  cachedPanelByPostId.delete(postId);
+  recentlyRenderedPanelByPostId.delete(postId);
+  completedAnalysisSessionCache.delete(postId);
+  selectedPostLinkCache.delete(postId);
+  postSignatureCache.delete(owningPost);
+  manualRestartPostIds.add(postId);
+
+  renderBadge(owningPost, {
+    label: "Analyzing",
+    safetyScore: null,
+    state: "monitored",
+    severityLevel: "unverified",
+    summaryLine: "Restarting scan for this post.",
+    detailsSummary: "Scan details",
+    details: ["Manual post-level restart requested."]
+  });
+
+  const response = await sendRuntimeMessage({
+    type: MESSAGE_TYPES.CLEAR_POST_ANALYSIS_STATE,
+    postId,
+    postSignature,
+    linkFingerprint,
+    postTextHash: postTextSnapshot.postTextHash,
+    reason
+  });
+
+  if (shouldAbortForRuntimeInvalidation(response)) {
+    manualRestartPostIds.delete(postId);
+    return;
+  }
+
+  console.debug("[DILI][scan-lifecycle] Stale post state cleared.", {
+    postId,
+    cleared: response?.cleared === true,
+    reason
+  });
+
+  try {
+    await processPost(owningPost);
+  } finally {
+    manualRestartPostIds.delete(postId);
+  }
+}
+
 function schedulePendingVirusTotalPanelRefresh(post, viewModel = {}) {
   const owningPost = getTopLevelPanelOwner(post);
   const analysis = normalizeProviderDisplayAnalysis(viewModel.analysis);
@@ -4561,17 +4840,45 @@ function schedulePendingVirusTotalPanelRefresh(post, viewModel = {}) {
   const vt = findProviderResult(refreshTarget?.providerResults, "virustotal");
   const status = String(vt?.details?.status || refreshTarget?.status || "").toLowerCase();
   const postId = owningPost ? getStablePostId(owningPost) : "";
+  if (analysis?.providerOverride === true) {
+    clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+    return;
+  }
   const scanPending = Boolean(
     isAnalysisPendingForUi(analysis) ||
     status === "pending"
   );
-  const virusTotalPending = Boolean(refreshTarget && vt && ["pending", "timeout", "rate-limited"].includes(status) && vt.flagged !== true && refreshTarget.providerCheckedUrl);
+  const retryable = vt?.details?.retryable !== false && !vt?.details?.terminal;
+  const virusTotalPending = Boolean(refreshTarget && vt && status === "pending" && retryable && vt.flagged !== true && refreshTarget.providerCheckedUrl);
 
   if (!postId) {
     return;
   }
 
   if (!scanPending || !virusTotalPending) {
+    if (scanPending && vt && ["retry-budget-exhausted", "rate-limited", "error", "parse-error"].includes(status)) {
+      finalizePendingProviderState(postId, owningPost, {
+        post: owningPost,
+        postId,
+        requestId: (latestRequestByPostId.get(postId) || {}).requestId || "",
+        postSignature: (latestRequestByPostId.get(postId) || {}).signature || "",
+        linkFingerprint: (latestRequestByPostId.get(postId) || {}).linkFingerprint || "",
+        postTextHash: (latestRequestByPostId.get(postId) || {}).postTextHash || analysis?.postTextHash || analysis?.currentPostTextHash || "",
+        pendingLinkIndex: refreshTarget?.pendingLinkIndex || refreshTarget?.index || null,
+        analysisUrl: refreshTarget?.analysisUrl || analysis?.analysisUrl || "",
+        normalizedUrl: refreshTarget?.normalizedUrl || analysis?.normalizedUrl || "",
+        providerCheckedUrl: refreshTarget?.providerCheckedUrl || vt?.checkedUrl || analysis?.analysisUrl || analysis?.normalizedUrl || "",
+        retryAttempt: analysis?.providerRetryPlan?.attempt || pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0,
+        retryMaxAttempts: analysis?.providerRetryPlan?.maxAttempts || VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
+        nextRetryAt: 0,
+        lastAttemptAt: Date.now(),
+        lastAttemptStatus: status
+      }).catch((error) => {
+        console.debug("[DILI][scan-lifecycle] Terminal pending provider finalization failed", error);
+      });
+      return;
+    }
+
     if (vt && (status === "checked" || status === "completed" || vt.flagged === true || status === "error" || status === "parse-error" || status === "not-configured" || status === "skipped")) {
       scanStatus.vtRefreshSkippedAlreadyCompleted += 1;
       clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
@@ -4584,7 +4891,12 @@ function schedulePendingVirusTotalPanelRefresh(post, viewModel = {}) {
     return;
   }
 
-  const nextAttempt = Number(pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0) + 1;
+  const persistedAttempt = Number(analysis?.providerRetryPlan?.attempt || refreshTarget?.providerRetryPlan?.attempt || 0);
+  const memoryAttempt = Number(pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0);
+  const nextAttempt = Math.max(
+    Number.isFinite(persistedAttempt) ? persistedAttempt : 0,
+    Number.isFinite(memoryAttempt) ? memoryAttempt : 0
+  ) + 1;
   if (nextAttempt > VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length) {
     markPendingProviderRefreshStatus(owningPost, "exhausted", {
       lastAttemptStatus: "retry budget exhausted"
@@ -4599,9 +4911,14 @@ function schedulePendingVirusTotalPanelRefresh(post, viewModel = {}) {
       pendingLinkIndex: refreshTarget?.pendingLinkIndex || refreshTarget?.index || null,
       analysisUrl: refreshTarget?.analysisUrl || analysis?.analysisUrl || "",
       normalizedUrl: refreshTarget?.normalizedUrl || analysis?.normalizedUrl || "",
-      providerCheckedUrl: refreshTarget?.providerCheckedUrl || vt?.checkedUrl || analysis?.analysisUrl || analysis?.normalizedUrl || ""
+      providerCheckedUrl: refreshTarget?.providerCheckedUrl || vt?.checkedUrl || analysis?.analysisUrl || analysis?.normalizedUrl || "",
+      retryAttempt: nextAttempt,
+      retryMaxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
+      nextRetryAt: 0,
+      lastAttemptAt: Date.now(),
+      lastAttemptStatus: "retry budget exhausted"
     }).catch((error) => {
-      console.debug("[DILI] Pending provider finalization failed", error);
+      console.debug("[DILI][scan-lifecycle] Pending provider finalization failed", error);
     });
     return;
   }
@@ -4643,19 +4960,40 @@ function schedulePendingVirusTotalPanelRefresh(post, viewModel = {}) {
     pendingLinkIndex: refreshTarget?.pendingLinkIndex || refreshTarget?.index || null,
     analysisUrl: refreshTarget?.analysisUrl || analysis?.analysisUrl || "",
     normalizedUrl: refreshTarget?.normalizedUrl || analysis?.normalizedUrl || "",
-    providerCheckedUrl: refreshTarget?.providerCheckedUrl || vt?.checkedUrl || analysis?.analysisUrl || analysis?.normalizedUrl || ""
+    providerCheckedUrl: refreshTarget?.providerCheckedUrl || vt?.checkedUrl || analysis?.analysisUrl || analysis?.normalizedUrl || "",
+    retryAttempt: nextAttempt,
+    retryMaxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
+    nextRetryAt: analysis?.providerRetryPlan?.nextRetryAt || 0,
+    lastAttemptAt: Date.now(),
+    lastAttemptStatus: analysis?.providerRetryPlan?.lastAttemptStatus || ""
   };
 
   pendingVirusTotalRefreshAttemptsByPostId.set(postId, nextAttempt);
   pendingVirusTotalRefreshByPostId.set(
     postId,
     window.setTimeout(() => {
+      console.debug("[DILI] Sending VirusTotal pending refresh.", {
+        postId,
+        providerCheckedUrl: entry.providerCheckedUrl,
+        attempt: nextAttempt,
+        maxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length
+      });
       refreshPendingVirusTotalPanel(entry).catch((error) => {
-        console.debug("[DILI] VirusTotal panel refresh failed", error);
+        console.debug("[DILI][scan-lifecycle] VirusTotal panel refresh failed", error);
         clearPendingVirusTotalPanelRefresh(postId);
+        handlePendingProviderRefreshFailure(owningPost, entry, error?.message || "refresh failed").catch((failureError) => {
+          console.debug("[DILI][scan-lifecycle] VirusTotal refresh failure handling failed", failureError);
+        });
       });
     }, VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS[nextAttempt - 1])
   );
+  console.debug("[DILI] Scheduled VirusTotal pending refresh.", {
+    postId,
+    providerCheckedUrl: entry.providerCheckedUrl,
+    attempt: nextAttempt,
+    maxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
+    nextRetryAt: analysis?.providerRetryPlan?.nextRetryAt || 0
+  });
   startPendingCountdownTimer(postId, owningPost, analysis);
 }
 
@@ -4875,7 +5213,12 @@ async function refreshPendingVirusTotalPanel(entry = {}) {
         requestId: entry.requestId,
         postSignature: entry.postSignature,
         linkFingerprint: entry.linkFingerprint,
-        postTextHash: entry.postTextHash
+        postTextHash: entry.postTextHash,
+        retryAttempt: entry.attempt,
+        retryMaxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
+        nextRetryAt: 0,
+        lastAttemptAt: Date.now(),
+        lastAttemptStatus: "refresh sent"
       }),
       45000,
       "VirusTotal pending refresh"
@@ -4912,28 +5255,68 @@ async function refreshPendingVirusTotalPanel(entry = {}) {
 
   const refreshedTarget = getPendingVirusTotalRefreshTargetForUi(response.analysis);
   const refreshedPending = Boolean(refreshedTarget);
-  const viewModel = mapAnalysisToViewModel(response.analysis);
+  const updatedViewModel = mapAnalysisToViewModel(response.analysis);
   const currentLinkInfo = extractRelevantLinks(post, postId, { suppressDiagnostics: true });
-  cachedPanelByPostId.set(postId, viewModel);
-  renderBadge(post, viewModel);
+  cachedPanelByPostId.set(postId, updatedViewModel);
   if (currentLinkInfo) {
     rememberAnalysisForLinkInfo(postId, currentLinkInfo, response.analysis);
   }
 
   if (response.analysis.scanFinalized === true) {
+    renderBadge(post, {
+      ...updatedViewModel,
+      suppressPendingRefreshSchedule: true
+    });
     clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
     clearPendingCountdownTimer(postId);
     return;
   }
 
   if (refreshedPending) {
-    console.debug("[DILI] VirusTotal still pending; scheduled next provider refresh if attempts remain.", {
-      postId,
-      attempt: pendingVirusTotalRefreshAttemptsByPostId.get(postId)
+    renderBadge(post, {
+      ...updatedViewModel,
+      suppressPendingRefreshSchedule: true
     });
+    console.debug("[DILI][scan-lifecycle] Provider refresh still pending; next retry will be scheduled.", {
+      postId,
+      providerCheckedUrl: refreshedTarget.providerCheckedUrl || entry.providerCheckedUrl,
+      attempt: pendingVirusTotalRefreshAttemptsByPostId.get(postId),
+      maxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
+      providerRefreshStatus: response.providerRefreshStatus || "",
+      reason: response.reason || ""
+    });
+    const attempts = Number(pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0);
+    if (attempts >= VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length) {
+      markPendingProviderRefreshStatus(post, "exhausted", {
+        lastAttemptStatus: response.providerRefreshReason || response.providerRefreshStatus || "retry budget exhausted"
+      });
+      await finalizePendingProviderState(postId, post, {
+        ...entry,
+        retryAttempt: attempts,
+        retryMaxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
+        nextRetryAt: 0,
+        lastAttemptAt: Date.now(),
+        lastAttemptStatus: "retry budget exhausted"
+      });
+      return;
+    }
+
+    schedulePendingVirusTotalPanelRefresh(post, updatedViewModel);
+    const scheduledPanel = cachedPanelByPostId.get(postId);
+    if (scheduledPanel) {
+      renderBadge(post, {
+        ...scheduledPanel,
+        suppressPendingRefreshSchedule: true
+      });
+    }
+    return;
   }
 
   if (!refreshedPending) {
+    renderBadge(post, {
+      ...updatedViewModel,
+      suppressPendingRefreshSchedule: true
+    });
     clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
     clearPendingCountdownTimer(postId);
   }
@@ -4956,7 +5339,12 @@ async function finalizePendingProviderState(postId, post, entry = {}) {
     requestId: entry.requestId,
     postSignature: entry.postSignature,
     linkFingerprint: entry.linkFingerprint,
-    postTextHash: entry.postTextHash
+    postTextHash: entry.postTextHash,
+    retryAttempt: entry.retryAttempt || entry.attempt || pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0,
+    retryMaxAttempts: entry.retryMaxAttempts || VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
+    nextRetryAt: entry.nextRetryAt || 0,
+    lastAttemptAt: entry.lastAttemptAt || Date.now(),
+    lastAttemptStatus: entry.lastAttemptStatus || "finalizing pending provider"
   });
 
   if (shouldAbortForRuntimeInvalidation(response)) {
@@ -4976,6 +5364,31 @@ async function finalizePendingProviderState(postId, post, entry = {}) {
   clearPendingCountdownTimer(postId);
 
   if (!response?.analysis || response.finalized === false) {
+    renderBadge(post, {
+      label: "Verification Incomplete",
+      safetyScore: null,
+      state: "verification-incomplete",
+      severityLevel: "unverified",
+      summaryLine: "VirusTotal did not complete before the retry limit.",
+      detailsSummary: "Scan details",
+      actionHint: "Use Rescan Now from the extension popup to try again.",
+      details: [
+        response?.reason || "Pending provider finalization did not return an analysis.",
+        "DILI stopped retrying this provider check to avoid an endless Scan Pending state."
+      ],
+      reportSections: {
+        resultLine: "Verification Incomplete. VirusTotal did not complete before the retry limit.",
+        checkedLine: "DILI used available completed providers and heuristic indicators.",
+        reasons: ["VirusTotal did not return a completed URL-specific result within the retry window."],
+        recommendation: "Use Rescan Now from the extension popup to try again.",
+        verificationNotes: ["No final safety score is available for this timed-out provider check."],
+        technicalDetails: [
+          `VirusTotal checked URL: ${entry.providerCheckedUrl || "Unavailable"}.`,
+          `VirusTotal retry attempt: ${entry.retryAttempt || entry.attempt || pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0}/${entry.retryMaxAttempts || VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length}.`,
+          `VirusTotal last refresh result: ${response?.reason || "missing finalized analysis"}.`
+        ]
+      }
+    });
     return;
   }
 
@@ -5147,7 +5560,8 @@ function renderPanelReportSections(report = {}) {
         report.multiLinkNote
           ? `
             <p><strong>Multiple links:</strong> ${escapeHtml(report.multiLinkNote)}</p>
-            ${report.lowestScoringLinkDomain ? `<p><strong>Lowest-scoring link shown:</strong> ${escapeHtml(report.lowestScoringLinkDomain)}.</p>` : ""}
+            ${report.pendingLinkDomain ? `<p><strong>Pending link shown:</strong> ${escapeHtml(report.pendingLinkDomain)}.</p>` : ""}
+            ${!report.pendingLinkDomain && report.lowestScoringLinkDomain ? `<p><strong>Lowest-scoring link shown:</strong> ${escapeHtml(report.lowestScoringLinkDomain)}.</p>` : ""}
             ${multiLinkItems ? `<p><strong>Analyzed links:</strong></p><ul class="dili-detail-list">${multiLinkItems}</ul>` : ""}
           `
           : ""
@@ -5175,7 +5589,7 @@ function renderDetailListItems(items = []) {
 
 function renderDetailListItem(detail) {
   const text = String(detail || "").trim();
-  const scoreMatch = text.match(/^(Score starts at|DILI's rule scoring lowered it to|DILI's rule scoring kept it at|Endpoint-hiding warning signs totaled|A threat-intelligence provider flagged this URL, so DILI capped the final score at|No provider override was applied|Because the endpoint was .+?, DILI capped the score at|DILI applied an uncertainty cap, lowering the score to|Demo\/testing mode lowered the score to|Final score|Score calculation|Note|Warning sign applied|Mitigation noted|Mitigation note|Provider override|Navigation decision|Verification state):\s*(.+)$/i);
+  const scoreMatch = text.match(/^(Score starts at|DILI's rule scoring lowered it to|DILI's rule scoring kept it at|Endpoint-hiding warning signs totaled|A threat-intelligence provider flagged this URL, so DILI capped the final score at|No provider override was applied|Because the endpoint was .+?, DILI capped the score at|DILI applied an uncertainty cap, lowering the score to|Demo\/testing mode lowered the score to|Clean-provider recovery|Clean-provider recovery floor|Clean-provider recovery blocked|Active heuristic groups|Mitigated heuristic groups|Final score|Score calculation|Note|Warning sign applied|Mitigation noted|Mitigation note|Provider override|Navigation decision|Verification state):\s*(.+)$/i);
 
   if (scoreMatch) {
     return `
@@ -5186,7 +5600,7 @@ function renderDetailListItem(detail) {
     `;
   }
 
-  const match = text.match(/^(Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Checked fallback URL|Previous baseline URL|Full observed redirect trace|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Google Safe Browsing checked URL|URLhaus checked URL|VirusTotal checked URL):\s*(.+)$/i);
+  const match = text.match(/^(Facebook click wrapper URL|Unwrapped URL|Full endpoint URL|Checked fallback URL|Previous baseline URL|Full observed redirect trace|Observed redirect chain|Risk-relevant redirect chain|Redirect chain domains|Google Safe Browsing checked URL|Google Safe Browsing checked URL candidates|Google Safe Browsing flagged candidate URL|URLhaus checked URL|URLhaus checked URL candidates|URLhaus flagged candidate URL|VirusTotal checked URL|VirusTotal analysis ID|VirusTotal retry state|VirusTotal retry attempt|VirusTotal retry status|VirusTotal last retry attempt|VirusTotal next retry time|VirusTotal last refresh result):\s*(.+)$/i);
 
   if (!match) {
     return `<li>${escapeHtml(text)}</li>`;
@@ -5232,12 +5646,12 @@ function classifyTechnicalDetailGroup(text) {
   const value = String(text || "");
 
   if (
-    /^(Score starts at|DILI's rule scoring|Endpoint-hiding warning signs totaled|A threat-intelligence provider flagged this URL|No provider override was applied|Because the endpoint was|DILI applied an uncertainty cap|Demo\/testing mode lowered the score|Final score|Score calculation|Note: The final score uses|Warning sign applied|Additional warning signs|Mitigation noted|Mitigation note|Provider override|Navigation decision|Verification state):/i.test(value)
+    /^(Score starts at|DILI's rule scoring|Endpoint-hiding warning signs totaled|A threat-intelligence provider flagged this URL|No provider override was applied|Because the endpoint was|DILI applied an uncertainty cap|Demo\/testing mode lowered the score|Clean-provider recovery|Clean-provider recovery floor|Clean-provider recovery blocked|Active heuristic groups|Mitigated heuristic groups|Final score|Score calculation|Note: The final score uses|Warning sign applied|Additional warning signs|Mitigation noted|Mitigation note|Provider override|Navigation decision|Verification state):/i.test(value)
   ) {
     return "advanced";
   }
 
-  if (/^(Google Safe Browsing|URLhaus|VirusTotal) (checked URL|result|status|malicious detections|suspicious detections):/i.test(value)) {
+  if (/^(Google Safe Browsing|URLhaus|VirusTotal) (checked URL|checked URL candidates|flagged candidate URL|result|status|malicious detections|suspicious detections|analysis ID|retry state|retry attempt|retry status|last retry attempt|next retry time|last refresh result):/i.test(value)) {
     return "verification";
   }
 
@@ -5352,6 +5766,23 @@ function buildSafetyScoreBreakdownDetails(analysis = {}) {
       (Number.isFinite(triggeredMitigationCreditTotal) && triggeredMitigationCreditTotal > 0)
     ) {
       details.push("Note: The final score uses the applied category deduction, not a simple sum of every visible rule and mitigation line.");
+    }
+
+    if (scoreAudit.recoveryApplied === true) {
+      details.push(`Clean-provider recovery: applied. ${scoreAudit.recoveryReason || "Clean providers and high-confidence endpoint resolution recovered explainable redirect/tracking warnings."}`);
+      if (Number.isFinite(Number(scoreAudit.recoveryFloor))) {
+        details.push(`Clean-provider recovery floor: ${Number(scoreAudit.recoveryFloor)}.`);
+      }
+    } else if (Array.isArray(scoreAudit.recoveryBlockedReasons) && scoreAudit.recoveryBlockedReasons.length > 0) {
+      details.push(`Clean-provider recovery blocked: ${scoreAudit.recoveryBlockedReasons.slice(0, 3).join("; ")}.`);
+    }
+
+    if (Array.isArray(scoreAudit.activeHeuristicGroups) && scoreAudit.activeHeuristicGroups.length > 0) {
+      details.push(`Active heuristic groups: ${scoreAudit.activeHeuristicGroups.join(", ")}.`);
+    }
+
+    if (Array.isArray(scoreAudit.mitigatedHeuristicGroups) && scoreAudit.mitigatedHeuristicGroups.length > 0) {
+      details.push(`Mitigated heuristic groups: ${scoreAudit.mitigatedHeuristicGroups.join(", ")}.`);
     }
   const scoreWithheld = Boolean(
     isPendingUiClassification(analysis.classification) ||
@@ -5474,18 +5905,33 @@ function buildSafetyScoreBreakdownDetails(analysis = {}) {
 
   function mapAnalysisToViewModel(analysis) {
     analysis = normalizeProviderDisplayAnalysis(analysis);
-    const reportSections = buildPanelReportSections(analysis);
-    const providerFlagged = Boolean(
-      (Array.isArray(analysis?.providerResults) && analysis.providerResults.some((provider) => provider?.flagged === true)) ||
-      (Array.isArray(analysis?.linkScoreSummary) && analysis.linkScoreSummary.some((item) => item?.providerOverride === true || String(item?.classification || "").toLowerCase() === "high risk"))
-    );
-    const pendingScan = isAnalysisPendingForUi(analysis);
+    const displayState = normalizeDisplayState(analysis);
+    const reportSections = buildPanelReportSections({
+      ...analysis,
+      classification: displayState.classification,
+      safetyScore: displayState.safetyScore,
+      scanFinalized: displayState.scanFinalized,
+      state: displayState.state
+    });
+const providerFlagged = Boolean(
+  analysis.providerOverride === true ||
+  (Array.isArray(analysis.providerResults) && analysis.providerResults.some((provider) => provider?.flagged === true)) ||
+  (Array.isArray(analysis.linkScoreSummary) && analysis.linkScoreSummary.some((item) => item?.providerOverride === true)) ||
+  (Array.isArray(analysis.linkAnalysisSnapshots) && analysis.linkAnalysisSnapshots.some((item) => item?.providerOverride === true))
+);
+    const pendingScan = displayState.pending;
 
     if (pendingScan && !providerFlagged) {
       return {
-        analysis,
+        analysis: {
+          ...analysis,
+          classification: displayState.classification,
+          safetyScore: displayState.safetyScore,
+          scanFinalized: displayState.scanFinalized,
+          state: displayState.state
+        },
         label: "Scan Pending",
-        reportSections: buildPanelReportSections(analysis),
+        reportSections,
         details: buildPendingProviderDetails(analysis),
         safetyScore: null,
         state: "pending-provider",
@@ -5499,50 +5945,63 @@ function buildSafetyScoreBreakdownDetails(analysis = {}) {
     }
 
     const severityLevel = normalizeInlineSeverityLevel({
-      label: analysis.classification,
-      state: analysis.state,
-      safetyScore: analysis.safetyScore
+      label: displayState.classification,
+      state: displayState.state,
+      safetyScore: displayState.safetyScore,
+      severityLevel: displayState.severityLevel
     });
-    const details = buildPanelDetails(analysis);
+    const displayAnalysis = {
+      ...analysis,
+      classification: displayState.classification,
+      safetyScore: displayState.safetyScore,
+      scanFinalized: displayState.scanFinalized,
+      state: displayState.state
+    };
+    const details = buildPanelDetails(displayAnalysis);
+    const providerOverrideDisplay = Boolean(displayState.severityLevel === "high-risk" && providerFlagged);
 
     return {
-      analysis,
-      label: analysis.classification || "Unknown",
+      analysis: displayAnalysis,
+      label: displayState.label,
       reportSections,
       details,
-      safetyScore: analysis.safetyScore,
-      state: analysis.state,
-      severityLevel,
+      safetyScore: displayState.safetyScore,
+      state: displayState.state,
+      severityLevel: displayState.severityLevel || severityLevel,
       finalDomain: analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
-      summaryLine: buildInlineSummaryLine(
-        {
-          label: analysis.classification || "Unknown",
-          state: analysis.state,
-          safetyScore: analysis.safetyScore
-        },
-        severityLevel
-      ),
+      summaryLine: providerOverrideDisplay
+        ? "A completed provider flagged this link."
+        : buildInlineSummaryLine(
+            {
+              label: displayState.label,
+              state: displayState.state,
+              safetyScore: displayState.safetyScore
+            },
+            displayState.severityLevel || severityLevel
+          ),
       scoreLabel: buildInlineScoreLabel(
         {
-          safetyScore: analysis.safetyScore
+          safetyScore: displayState.safetyScore,
+          scanFinalized: displayState.scanFinalized,
+          state: displayState.state
         },
-        severityLevel
+        displayState.severityLevel || severityLevel
       ),
       actionHint: buildInlineActionHint(
         {
-          label: analysis.classification || "Unknown",
-          state: analysis.state,
-          safetyScore: analysis.safetyScore,
-          interceptionRecommended: analysis.interceptionRecommended
+          label: displayState.label,
+          state: displayState.state,
+          safetyScore: displayState.safetyScore,
+          interceptionRecommended: providerOverrideDisplay ? true : analysis.interceptionRecommended
         },
-        severityLevel
+        displayState.severityLevel || severityLevel
       ),
 detailsSummary: buildInlineDetailsSummary(
   {
-    label: analysis.classification || "Unknown",
-    state: analysis.state
+    label: displayState.label,
+    state: displayState.state
   },
-  severityLevel
+  displayState.severityLevel || severityLevel
 )
     };
   }
@@ -5669,6 +6128,80 @@ detailsSummary: buildInlineDetailsSummary(
     return value === "pending" || value === "scan pending";
   }
 
+  function normalizeDisplayState(analysis = {}) {
+    const score = toFiniteUiScoreOrNull(analysis.safetyScore);
+const providerFlagged = Boolean(
+  analysis.providerOverride === true ||
+  (Array.isArray(analysis.providerResults) && analysis.providerResults.some((provider) => provider?.flagged === true)) ||
+  (Array.isArray(analysis.linkScoreSummary) && analysis.linkScoreSummary.some((item) => item?.providerOverride === true)) ||
+  (Array.isArray(analysis.linkAnalysisSnapshots) && analysis.linkAnalysisSnapshots.some((item) => item?.providerOverride === true))
+);
+    if (providerFlagged) {
+      const providerScore = score !== null
+        ? score
+        : toFiniteUiScoreOrNull(analysis.computedSafetyScore);
+
+      return {
+        classification: "High Risk",
+        label: "High Risk",
+        safetyScore: providerScore,
+        scanFinalized: true,
+        state: "completed",
+        severityLevel: "high-risk",
+        pending: false,
+        terminalIncomplete: false
+      };
+    }
+
+    if (isAnalysisPendingForUi(analysis)) {
+      return {
+        classification: "Scan Pending",
+        label: "Scan Pending",
+        safetyScore: null,
+        scanFinalized: false,
+        state: "pending-provider",
+        severityLevel: "pending",
+        pending: true,
+        terminalIncomplete: false
+      };
+    }
+
+    const state = String(analysis.state || "").toLowerCase();
+    const terminalIncomplete = Boolean(
+      state === "verification-incomplete" ||
+      state === "completed-limited" ||
+      String(analysis.classification || "").toLowerCase() === "verification incomplete" ||
+      (
+        String(analysis.classification || "").toLowerCase() === "unverified" &&
+        score === null
+      )
+    );
+
+    if (terminalIncomplete) {
+      return {
+        classification: "Unverified",
+        label: "Verification Incomplete",
+        safetyScore: null,
+        scanFinalized: true,
+        state: state || "verification-incomplete",
+        severityLevel: "unverified",
+        pending: false,
+        terminalIncomplete: true
+      };
+    }
+
+    return {
+      classification: analysis.classification || "Unverified",
+      label: analysis.classification || "Unverified",
+      safetyScore: analysis.scanFinalized === true && score !== null ? score : null,
+      scanFinalized: analysis.scanFinalized === true,
+      state: analysis.state || "monitored",
+      severityLevel: "",
+      pending: false,
+      terminalIncomplete: false
+    };
+  }
+
   function classifyUiScore(score) {
     const numeric = toFiniteUiScoreOrNull(score);
 
@@ -5747,6 +6280,7 @@ detailsSummary: buildInlineDetailsSummary(
       status === "not-configured" ||
       status === "skipped" ||
       status === "unsupported_protocol" ||
+      status === "retry-budget-exhausted" ||
       status === "rate-limited" ||
       status === "timeout" ||
       status === "error" ||
@@ -5916,7 +6450,13 @@ detailsSummary: buildInlineDetailsSummary(
     const finalDomain = analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || safeHostname(analysis.analysisUrl) || "unknown site";
     const originalDomain = getUserFacingStartDomain(analysis);
     const scoreLabel = Number.isFinite(analysis.safetyScore) ? `safety score ${analysis.safetyScore}` : "no score";
-    const classification = analysis.classification || "Unverified";
+    const terminalIncomplete = isTerminalIncompleteDisplayState({
+      label: analysis.classification,
+      state: analysis.state,
+      summaryLine: analysis.summaryLine,
+      resultLine: analysis.resultLine
+    });
+    const classification = terminalIncomplete ? "Verification Incomplete" : (analysis.classification || "Unverified");
     const severityLevel = normalizeInlineSeverityLevel({
       label: classification,
       state: analysis.state,
@@ -5953,6 +6493,7 @@ detailsSummary: buildInlineDetailsSummary(
   }
 function buildPanelReportSections(analysis = {}) {
   analysis = normalizeProviderDisplayAnalysis(analysis);
+  const displayState = normalizeDisplayState(analysis);
   const finalDomain =
     analysis.endpointResult?.effectiveDomain ||
     analysis.urlFeatureAnalysis?.finalDomain ||
@@ -5960,13 +6501,15 @@ function buildPanelReportSections(analysis = {}) {
     "unknown site";
 
   const originalDomain = getUserFacingStartDomain(analysis);
-  const pendingScan = isAnalysisPendingForUi(analysis);
+  const pendingScan = displayState.pending;
 
-  const classification = analysis.classification || "Unverified";
+  const terminalIncomplete = displayState.terminalIncomplete;
+  const classification = terminalIncomplete ? "Verification Incomplete" : (displayState.classification || analysis.classification || "Unverified");
   const severityLevel = normalizeInlineSeverityLevel({
     label: classification,
-    state: analysis.state,
-    safetyScore: analysis.safetyScore
+    state: displayState.state,
+    safetyScore: displayState.safetyScore,
+    severityLevel: displayState.severityLevel
   });
 
   const reasons = buildEndUserRiskReasons(analysis, severityLevel);
@@ -6029,6 +6572,12 @@ function buildPanelReportSections(analysis = {}) {
   );
 
   if (pendingScan) {
+    const pendingLink = linkScoreSummary.find((item) => (
+      isPendingUiClassification(item?.classification) ||
+      item?.scanFinalized === false ||
+      item?.providerCompletion?.hasPendingProvider === true ||
+      (Array.isArray(item?.pendingProviders) && item.pendingProviders.length > 0)
+    ));
     const providerStates = getProviderStatesForUi(analysis);
     const providerStatusDetails = providerStates.map((provider) => {
       const name = formatProviderName(provider.provider || "unknown");
@@ -6048,7 +6597,8 @@ function buildPanelReportSections(analysis = {}) {
       multiLinkNote: multiLinkPost
         ? "Some links are still being verified. The post result will be finalized after all required provider checks complete."
         : "",
-      lowestScoringLinkDomain: multiLinkPost ? lowestScoringLinkDomain : "",
+      pendingLinkDomain: multiLinkPost && pendingLink ? (pendingLink.domain || safeHostname(pendingLink.url) || "") : "",
+      lowestScoringLinkDomain: "",
       linkScoreSummary: multiLinkPost ? linkScoreSummary.slice(0, 8) : [],
       reasons: [`DILI is waiting for: ${pendingProviderNames}.`],
       recommendation: "DILI has not completed all provider checks for this link. Proceed only if you trust the source and destination.",
@@ -6058,8 +6608,25 @@ function buildPanelReportSections(analysis = {}) {
     };
   }
 
+  if (terminalIncomplete) {
+    return {
+      resultLine: `Verification Incomplete for ${finalDomain}.`,
+      checkedLine: "One or more provider checks did not finish. DILI used available completed checks and heuristic indicators, but the result is not fully verified.",
+      multiLinkNote: multiLinkPost
+        ? "Some links could not be fully verified. The post result remains limited until all required checks complete or a manual rescan succeeds."
+        : "",
+      lowestScoringLinkDomain: multiLinkPost ? lowestScoringLinkDomain : "",
+      linkScoreSummary: multiLinkPost ? linkScoreSummary.slice(0, 8) : [],
+      reasons,
+      recommendation: "Treat this as not fully verified. Continue only if the source and destination make sense.",
+      verificationNotes,
+      technicalDetails,
+      technicalGroups: buildTechnicalDetailGroups(technicalDetails)
+    };
+  }
+
   return {
-    resultLine: buildPlainResultLine(classification, analysis.safetyScore, finalDomain),
+    resultLine: buildPlainResultLine(classification, displayState.safetyScore, finalDomain),
     checkedLine: domainOnlyFallback
       ? "DILI checked the visible domain because Facebook did not expose a full clickable endpoint during passive scanning."
       : `DILI checked where the link starts and where it finally leads. The clicked/visible link appears to be ${originalDomain}, and the final site appears to be ${finalDomain}.`,
@@ -6204,6 +6771,14 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
 
   if (vt?.flagged) {
     reasons.push("VirusTotal reported malicious or suspicious detections for this destination.");
+  } else if (String(vt?.details?.signalLevel || "").toLowerCase() === "warning") {
+    reasons.push("VirusTotal reported a weak warning signal, but not enough consensus for a provider-confirmed High Risk result.");
+  } else if (String(vt?.details?.signalLevel || "").toLowerCase() === "caution") {
+    reasons.push("VirusTotal reported one suspicious detection, so DILI treats it as a caution note rather than provider-confirmed maliciousness.");
+  }
+
+  if ((gsb?.flagged || urlhaus?.flagged) && String(vt?.details?.status || "").toLowerCase() === "pending") {
+    reasons.push("A completed provider flagged this link. VirusTotal may still be pending, but DILI already has provider-confirmed evidence.");
   }
 
   if (features.demoScoreBiasApplied) {
@@ -6217,7 +6792,7 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
     (analysis.postIntegrityEvent || analysis.linkInsertedAfterBaseline || features.linkInsertedAfterBaseline) &&
     !features.provisionalNoLinkBaseline
   ) {
-    reasons.push("The link appears to have changed after DILI first observed the post.");
+    reasons.push("The post/link changed after the baseline. This is treated as a post-integrity warning, not direct proof of maliciousness.");
   }
 
   const redirectMitigated = Boolean(
@@ -6274,6 +6849,12 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
     !urlhaus?.flagged
   ) {
     reasons.push("The link opens a Google Form. DILI checked the form URL reputation, but users should verify the form owner before submitting personal information.");
+  }
+
+  if (analysis.scoreAudit?.recoveryApplied === true || features.cleanProviderRecoveryApplied) {
+    reasons.push("Provider checks completed clean.");
+    reasons.push("The resolved endpoint was verified with high confidence.");
+    reasons.push("Heuristic warnings were limited to explainable redirect/tracking behavior.");
   }
 
   if (reasons.length === 0) {
@@ -6892,11 +7473,30 @@ function buildTechnicalDetails(analysis = {}) {
     const durationMs = Number(provider.durationMs);
 
     pushUniqueTechnicalDetail(details, `${label} checked URL: ${provider.checkedUrl}.`);
+    if (Array.isArray(provider.details?.checkedUrls) && provider.details.checkedUrls.length > 1) {
+      pushUniqueTechnicalDetail(details, `${label} checked URL candidates: ${provider.details.checkedUrls.join(" | ")}.`);
+    }
+    if (provider.details?.flaggedCandidateUrl) {
+      pushUniqueTechnicalDetail(details, `${label} flagged candidate URL: ${provider.details.flaggedCandidateUrl}.`);
+    }
     pushUniqueTechnicalDetail(details, `${label} result: ${outcomeSummary}`);
     pushUniqueTechnicalDetail(details, `${label} status: ${auditStatus}.`);
 
     if (providerName === "virustotal" && provider.details?.reason === "retry_budget_exhausted") {
       pushUniqueTechnicalDetail(details, "VirusTotal did not complete within the retry window.");
+    }
+
+    if (providerName === "virustotal") {
+      if (provider.details?.analysisId) {
+        pushUniqueTechnicalDetail(details, `VirusTotal analysis ID: ${provider.details.analysisId}.`);
+      }
+
+      if (provider.details?.retryable !== undefined || provider.details?.terminal !== undefined) {
+        pushUniqueTechnicalDetail(
+          details,
+          `VirusTotal retry state: ${provider.details?.retryable === false ? "not retryable" : "retryable"}, ${provider.details?.terminal === true ? "terminal" : "not terminal"}.`
+        );
+      }
     }
 
     if (provider.checkedAt) {
@@ -6922,6 +7522,25 @@ function buildTechnicalDetails(analysis = {}) {
       if (Number.isFinite(suspiciousCount)) {
         pushUniqueTechnicalDetail(details, `${label} suspicious detections: ${suspiciousCount}.`);
       }
+    }
+  }
+
+  const retryPlan = analysis.providerRetryPlan || {};
+  if (retryPlan && typeof retryPlan === "object" && (retryPlan.attempt || retryPlan.status || retryPlan.nextRetryAt || retryPlan.lastAttemptAt)) {
+    if (retryPlan.attempt || retryPlan.maxAttempts) {
+      pushUniqueTechnicalDetail(details, `VirusTotal retry attempt: ${retryPlan.attempt || 0}/${retryPlan.maxAttempts || "unknown"}.`);
+    }
+    if (retryPlan.status) {
+      pushUniqueTechnicalDetail(details, `VirusTotal retry status: ${retryPlan.status}.`);
+    }
+    if (retryPlan.lastAttemptAt) {
+      pushUniqueTechnicalDetail(details, `VirusTotal last retry attempt: ${new Date(Number(retryPlan.lastAttemptAt)).toISOString()}.`);
+    }
+    if (retryPlan.nextRetryAt) {
+      pushUniqueTechnicalDetail(details, `VirusTotal next retry time: ${new Date(Number(retryPlan.nextRetryAt)).toISOString()}.`);
+    }
+    if (retryPlan.lastAttemptStatus) {
+      pushUniqueTechnicalDetail(details, `VirusTotal last refresh result: ${retryPlan.lastAttemptStatus}.`);
     }
   }
 
@@ -7325,16 +7944,21 @@ function buildTechnicalDetails(analysis = {}) {
       return "Verification incomplete";
     }
 
-    if (score !== null) {
+    if (
+      severityLevel === "pending" ||
+      viewModel.state === "pending-provider" ||
+      viewModel.scanFinalized === false ||
+      isPendingUiClassification(viewModel.label || viewModel.classification)
+    ) {
+      return "Not final";
+    }
+
+    if (score !== null && viewModel.scanFinalized === true && viewModel.state !== "pending-provider") {
       return `Safety Score ${score}`;
     }
 
     if (severityLevel === "no-link") {
       return "Monitoring";
-    }
-
-    if (severityLevel === "pending") {
-      return "Not final";
     }
 
     if (severityLevel === "unverified") {
@@ -7354,13 +7978,16 @@ function buildTechnicalDetails(analysis = {}) {
       label.includes("suspicious") ||
       severityLevel === "suspicious" ||
       severityLevel === "high-risk" ||
-      severityLevel === "pending" ||
       (score !== null && score < 80)
     ) {
       if (severityLevel === "pending") {
-        return "DILI will show a caution warning because provider verification is incomplete.";
+        return "Strong heuristic indicators may be present, but provider verification is still pending.";
       }
       return "DILI will pause navigation before opening this link.";
+    }
+
+    if (severityLevel === "pending") {
+      return "No final navigation decision is shown until configured provider checks finish.";
     }
 
     if (severityLevel === "unverified" || label.includes("unverified")) {

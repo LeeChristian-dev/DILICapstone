@@ -112,7 +112,11 @@ DILI computes a **Safety Score** using a subtractive model:
 - `0-49`: **High Risk** — strong warning signs or provider flag; navigation pause/interception recommended
 - `Unverified`: DILI could not fully verify the destination
 
-**Provider-flagged results:** URLs flagged by Google Safe Browsing, URLhaus, or optional VirusTotal are classified as High Risk. Provider errors and rate limits do not directly deduct score points.
+**Evidence-weighted scoring:** DILI treats provider-confirmed detections as primary evidence and local heuristics as supporting evidence. Google Safe Browsing and URLhaus flags can immediately produce a High Risk result without waiting for VirusTotal. VirusTotal is treated as a multi-engine corroboration provider: strong malicious consensus can force High Risk, while single weak detections are warning/caution evidence rather than automatic maliciousness.
+
+Heuristic deductions are category-capped. Post-baseline and link-change events are post-integrity warnings, not direct proof of phishing or malware. Provider errors, limits, pending checks, and unavailable checks do not directly deduct score points.
+
+When configured providers complete clean and the endpoint resolves to a high-confidence HTTPS final destination, DILI may recover explainable Facebook wrapper, tracking, shortener, branded alias, or campaign-redirect penalties to a minimum score of 80. This recovery is a floor, not a raw bonus. Clean provider results never override provider flags, strong VirusTotal consensus, suspicious TLDs, credential tricks, obfuscation, unresolved shorteners, low-confidence endpoints, true unrelated visible-domain mismatches, or verified link changes combined with suspicious/unrelated redirects. Based on the documented use cases of the configured providers, this keeps provider-confirmed threats primary while reducing false positives from normal marketing links.
 
 DILI does not display a final Safety Score while a configured or active provider check is still pending. In that state, the inline panel shows a pending scan result with provider status details instead of Safe, Suspicious, High Risk, or a numeric score. The computed score is retained internally for audit/debug, but it is withheld from the UI until provider verification reaches a terminal state.
 
@@ -120,9 +124,11 @@ Pending VirusTotal checks use controlled delayed follow-ups to update the same i
 
 Pending-provider panels use a dedicated caution theme and show a visible countdown for the next scheduled provider follow-up. VirusTotal pending follow-ups use a fixed delayed retry budget; if VirusTotal does not return a terminal result within that retry window, DILI finalizes the panel using available provider results and records VirusTotal as a provider limitation.
 
+Pending scans show no numeric score in the panel or popup. If provider exhaustion or timeout prevents verification from finishing, DILI finalizes the result as Verification Incomplete / Unverified instead of leaving it in Scan Pending forever.
+
 Completed, unchanged post scans are reused during the same browsing session. If the stable post ID, post signature, link fingerprint, visible text hash, and terminal provider state are unchanged, DILI restores the existing panel instead of sending another analysis request. Manual rescans and actual link/text changes still bypass this reuse.
 
-For multi-link posts, hidden computed scores from pending child links are retained only as internal audit data. They do not drive the visible post-level classification. The post remains **Scan Pending** until every participating provider check for every analyzed link reaches a terminal state, unless a completed provider check already flags one link.
+For multi-link posts, hidden computed scores from pending child links are retained only as internal audit data. They do not drive the visible post-level classification. The post remains **Scan Pending** until every participating provider check for every analyzed link reaches a terminal state, unless a completed provider check already flags one link. Pending VirusTotal refreshes target the actual pending child link rather than a completed sibling or the parent summary.
 
 DILI uses score bands for display and navigation decisions. Suspicious results, High Risk results, provider-flagged results, and final scores below 80 trigger a navigation pause before opening the destination.
 
@@ -274,7 +280,7 @@ DILI also applies a narrow trusted redirect destination mitigation for clean red
 - URLhaus is malware-oriented telemetry, not a complete phishing verdict.
 - URLhaus may run in authenticated or public mode. If authenticated mode fails, DILI attempts a public lookup fallback.
 - URLhaus lookup failures do not automatically reduce the Safety Score.
-- VirusTotal is an optional enrichment provider. It is disabled by default, quota-sensitive, cached/rate-limited, and does not reduce Safety Score when unavailable, pending, or rate-limited. A positive malicious/suspicious VirusTotal result can escalate a URL to High Risk.
+- VirusTotal is an optional enrichment provider. It is disabled by default, quota-sensitive, cached/rate-limited, and does not reduce Safety Score when unavailable, pending, or rate-limited. Strong VirusTotal malicious consensus can escalate a URL to High Risk; weak one-off detections are treated as warning/caution evidence.
 - External lookups can fail due to network, CORS, quota, authentication, or endpoint changes. DILI logs failures and continues with local heuristics.
 - PhishTank was deprecated from active checks because its API behavior is unreliable for direct browser-extension use.
 
@@ -315,7 +321,7 @@ VirusTotal is off unless an API key is configured. It supplements Google Safe Br
 
 When VirusTotal initially returns pending, DILI may perform a small number of delayed follow-up checks and update the visible panel if the result completes. This follow-up is quota-safe and does not reduce Safety Score while pending, rate-limited, timed out, or failed.
 
-Clearing session logs does not necessarily clear pending VirusTotal analysis IDs unless provider configuration changes or the session is fully reset. Pending, timeout, error, and rate-limited VirusTotal states do not reduce Safety Score. Positive malicious/suspicious VirusTotal detections can escalate a URL to High Risk. Do not use demo score bias during real provider accuracy testing.
+Clearing session logs does not necessarily clear pending VirusTotal analysis IDs unless provider configuration changes or the session is fully reset. Pending, timeout, error, and rate-limited VirusTotal states do not reduce Safety Score. Strong VirusTotal malicious consensus can escalate a URL to High Risk. Do not use demo score bias during real provider accuracy testing.
 
 Enable VirusTotal:
 
@@ -328,9 +334,7 @@ chrome.storage.local.set({
 Disable VirusTotal:
 
 ```js
-chrome.storage.local.remove([
-  "dili:config:virustotalApiKey",
-]);
+chrome.storage.local.remove(["dili:config:virustotalApiKey"]);
 ```
 
 ## Debug/Test Mode

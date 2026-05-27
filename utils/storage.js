@@ -65,6 +65,20 @@ export async function updatePostAnalysis(postId, data) {
 }
 
 /**
+ * Remove the stored baseline or analysis record for one Facebook post.
+ * @param {string} postId
+ * @returns {Promise<boolean>}
+ */
+export async function removePostAnalysis(postId) {
+  if (!postId) {
+    return false;
+  }
+
+  await storageRemove(postStorageKey(postId));
+  return true;
+}
+
+/**
  * Mark a domain as flagged by local history.
  * @param {string} domain
  * @returns {Promise<void>}
@@ -279,13 +293,23 @@ function compactPersistentRecord(record = {}) {
     linkType: clampText(record.linkType || features.linkType || (features.shortenedUrl ? "shortened" : "external")),
     score: normalizeScore(record.score ?? record.safetyScore),
     safetyScore: normalizeScore(record.safetyScore ?? record.score),
+    computedSafetyScore: normalizeScore(record.computedSafetyScore),
+    computedClassification: clampText(record.computedClassification || "", 60),
     classification: clampText(record.classification || ""),
+    scanFinalized: record.scanFinalized === true,
+    providerPending: record.providerPending === true,
+    providerCompletion: compactProviderCompletion(record.providerCompletion),
+    pendingProviders: clampList(record.pendingProviders || [], 8),
+    providerRetryPlan: compactProviderRetryPlan(record.providerRetryPlan),
     analyzedLinkCount: Number(record.analyzedLinkCount || 0),
     failedLinkCount: Number(record.failedLinkCount || 0),
     multiLinkPost: record.multiLinkPost === true || Number(record.analyzedLinkCount || 0) > 1,
     lowestScoringLinkDomain: clampText(record.lowestScoringLinkDomain || ""),
     lowestScoringLinkUrl: clampText(record.lowestScoringLinkUrl || ""),
     linkScoreSummary: compactLinkScoreSummary(record.linkScoreSummary),
+    linkAnalysisSnapshots: compactLinkAnalysisSnapshots(record.linkAnalysisSnapshots),
+    pendingLinkRefreshTargets: compactLinkAnalysisSnapshots(record.pendingLinkRefreshTargets),
+    pendingProviderRefreshTarget: compactLinkAnalysisSnapshot(record.pendingProviderRefreshTarget),
     endpointConfidence: clampText(record.endpointConfidence || endpointResult.endpointConfidence || ""),
     baselineState: clampText(record.baselineState || ""),
     hadLinkAtBaseline: record.hadLinkAtBaseline === true,
@@ -340,8 +364,104 @@ function compactLinkScoreSummary(summary = []) {
       domain: clampText(item?.domain || safeHostname(item?.url || ""), 120),
       url: clampText(item?.url || "", 220),
       safetyScore: Number.isFinite(Number(item?.safetyScore)) ? Number(item.safetyScore) : null,
-      classification: clampText(item?.classification || "", 60)
+      computedSafetyScore: normalizeScore(item?.computedSafetyScore),
+      classification: clampText(item?.classification || "", 60),
+      computedClassification: clampText(item?.computedClassification || "", 60),
+      state: clampText(item?.state || "", 60),
+      scanFinalized: item?.scanFinalized === true,
+      providerOverride: item?.providerOverride === true,
+      providerPending: item?.providerPending === true,
+      providerCompletion: compactProviderCompletion(item?.providerCompletion),
+      providerRetryPlan: compactProviderRetryPlan(item?.providerRetryPlan),
+      pendingProviders: clampList(item?.pendingProviders || [], 8)
     }));
+}
+
+function compactLinkAnalysisSnapshots(snapshots = []) {
+  if (!Array.isArray(snapshots)) {
+    return [];
+  }
+
+  return snapshots
+    .slice(0, 8)
+    .map((item, index) => compactLinkAnalysisSnapshot(item, index + 1))
+    .filter(Boolean);
+}
+
+function compactLinkAnalysisSnapshot(item = {}, fallbackIndex = 1) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  return {
+    index: Number(item.index || fallbackIndex),
+    url: clampText(item.url || "", 500),
+    displayUrl: clampText(item.displayUrl || item.url || "", 500),
+    analysisUrl: clampText(item.analysisUrl || item.url || "", 500),
+    normalizedUrl: clampText(item.normalizedUrl || "", 500),
+    providerCheckedUrl: clampText(item.providerCheckedUrl || item.analysisUrl || "", 500),
+    domain: clampText(item.domain || safeHostname(item.analysisUrl || item.url) || "", 120),
+    safetyScore: normalizeScore(item.safetyScore),
+    computedSafetyScore: normalizeScore(item.computedSafetyScore),
+    classification: clampText(item.classification || "", 60),
+    computedClassification: clampText(item.computedClassification || "", 60),
+    scanFinalized: item.scanFinalized === true,
+    state: clampText(item.state || "", 60),
+    providerOverride: item.providerOverride === true,
+    providerPending: item.providerPending === true,
+    providerResults: compactProviderResults(item.providerResults || []),
+    providerCompletion: compactProviderCompletion(item.providerCompletion),
+    providerRetryPlan: compactProviderRetryPlan(item.providerRetryPlan),
+    pendingProviders: clampList(item.pendingProviders || [], 8),
+    verificationState: clampText(item.verificationState || "", 80),
+    limitations: clampList(item.limitations || [], 8)
+  };
+}
+
+function compactProviderCompletion(completion = {}) {
+  if (!completion || typeof completion !== "object") {
+    return null;
+  }
+
+  return {
+    pendingProviders: clampList(completion.pendingProviders || [], 8),
+    incompleteProviders: clampList(completion.incompleteProviders || [], 8),
+    hasPendingProvider: completion.hasPendingProvider === true,
+    allRequiredProvidersTerminal: completion.allRequiredProvidersTerminal === true,
+    activeProviderCount: Number(completion.activeProviderCount || 0),
+    checkedProviderCount: Number(completion.checkedProviderCount || 0),
+    pendingProviderCount: Number(completion.pendingProviderCount || 0),
+    providerStates: Array.isArray(completion.providerStates)
+      ? completion.providerStates.slice(0, 8).map((provider) => ({
+          provider: clampText(provider?.provider || "", 40),
+          status: clampText(provider?.status || "", 60),
+          checked: provider?.checked === true,
+          flagged: provider?.flagged === true,
+          terminal: provider?.terminal === true,
+          pending: provider?.pending === true,
+          retryable: provider?.retryable !== false,
+          checkedUrl: clampText(provider?.checkedUrl || "", 500),
+          checkedAt: clampText(provider?.checkedAt || "", 80),
+          analysisId: clampText(provider?.analysisId || "", 160)
+        }))
+      : []
+  };
+}
+
+function compactProviderRetryPlan(plan = {}) {
+  if (!plan || typeof plan !== "object") {
+    return null;
+  }
+
+  return {
+    attempt: Number(plan.attempt || 0),
+    maxAttempts: Number(plan.maxAttempts || 0),
+    nextRetryAt: Number(plan.nextRetryAt || 0) || null,
+    nextRetryInMs: Number(plan.nextRetryInMs || 0) || null,
+    lastAttemptAt: Number(plan.lastAttemptAt || 0) || null,
+    lastAttemptStatus: clampText(plan.lastAttemptStatus || "", 160),
+    status: clampText(plan.status || "", 60)
+  };
 }
 
 function isDuplicateAnalysisRecord(existing, next) {
@@ -489,7 +609,12 @@ function compactProviderResults(providerResults) {
       httpStatus: item?.details?.httpStatus ?? null,
       mode: clampText(item?.details?.mode || ""),
       message: clampText(item?.details?.message || "", 300),
+      reason: clampText(item?.details?.reason || "", 120),
+      terminal: item?.details?.terminal === true,
+      retryable: item?.details?.retryable !== false,
       queryStatus: clampText(item?.details?.queryStatus || ""),
+      checkedUrls: clampList(item?.details?.checkedUrls || [], 12),
+      flaggedCandidateUrl: clampText(item?.details?.flaggedCandidateUrl || "", 500),
       matchesCount: Number(item?.details?.matchesCount || 0),
       analysisId: clampText(item?.details?.analysisId || "", 160),
       maliciousCount: Number(item?.details?.maliciousCount || 0),

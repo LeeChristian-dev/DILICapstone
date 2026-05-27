@@ -392,10 +392,14 @@ function renderProviderChips(providerSummary) {
 
     const labelSpan = document.createElement("span");
     labelSpan.className = "prov-label";
-    labelSpan.textContent = `${entry.label || key}:`;
+    labelSpan.textContent = `${key === "virustotal" ? "VT Config" : (entry.label || key)}:`;
 
     const textSpan = document.createElement("span");
     textSpan.textContent = String(entry.text || "—");
+
+    if (key === "virustotal") {
+      chip.title = "Provider is configured or available. Individual URL scans may still be pending.";
+    }
 
     chip.appendChild(labelSpan);
     chip.appendChild(textSpan);
@@ -424,29 +428,45 @@ function renderRecentActivity(recentActivity) {
   for (const item of recentActivity) {
     const li = document.createElement("li");
     const title = document.createElement("span");
-    const domain = item.domain || "—";
-const classification = String(item.classification || "").trim() || "Unverified";
+const domain = item.domain || "—";
+const classification = String(item.classification || "").trim();
 const state = String(item.state || "").toLowerCase();
-const scanFinalized = item.scanFinalized === true;
-const pending = !scanFinalized || state === "pending-provider";
-const terminalIncomplete =
+const providerOverride = item.providerOverride === true;
+const scanFinalized = providerOverride || item.scanFinalized === true;
+
+const pending = !providerOverride && (
+  !scanFinalized ||
+  state === "pending-provider" ||
+  classification.toLowerCase() === "scan pending"
+);
+
+const terminalIncomplete = !providerOverride && (
   state === "verification-incomplete" ||
   state === "completed-limited" ||
-  classification.toLowerCase().includes("unverified");
+  classification.toLowerCase() === "verification incomplete" ||
+  classification.toLowerCase() === "unverified"
+);
 
-const scoreValue = Number(item.safetyScore);
-const scoreText =
-  pending
-    ? "not final"
-    : terminalIncomplete || !Number.isFinite(scoreValue)
-      ? "no score"
-      : `score ${scoreValue}`;
+const scoreValue = toFinitePopupScoreOrNull(item.safetyScore);
+const hasScore = (providerOverride || (scanFinalized && !pending && !terminalIncomplete)) &&
+  scoreValue !== null &&
+  Number.isFinite(scoreValue);
 
-const statusLabel = pending
-  ? "Scan Pending"
+const scoreText = pending
+  ? "not final"
   : terminalIncomplete
-    ? "Unverified"
-    : classification;
+    ? "no score"
+    : hasScore
+      ? `score ${scoreValue}`
+      : "no score";
+
+const statusLabel = providerOverride
+  ? "High Risk"
+  : pending
+    ? "Scan Pending"
+    : terminalIncomplete
+      ? "Verification Incomplete"
+      : classification || "Unverified";
 
 title.textContent = `${domain} · ${statusLabel} · ${scoreText}`;
 
@@ -603,7 +623,7 @@ function convertRecordsToCsv(records) {
 }
 
 function inferInterceptionRecommended(record = {}) {
-  const score = Number(record.safetyScore);
+  const score = toFinitePopupScoreOrNull(record.safetyScore);
   const classification = String(record.classification || "").toLowerCase();
   const gsb = findProviderResult(record.providerResults, "gsb");
   const urlhaus = findProviderResult(record.providerResults, "urlhaus");
@@ -615,12 +635,21 @@ function inferInterceptionRecommended(record = {}) {
     record.providerOverride === true ||
     classification === "high risk" ||
     classification === "suspicious" ||
-    (Number.isFinite(score) && score < 60) ||
+    (score !== null && Number.isFinite(score) && score < 60) ||
     providerFlagged ||
     gsb?.flagged === true ||
     urlhaus?.flagged === true ||
     vt?.flagged === true
   );
+}
+
+function toFinitePopupScoreOrNull(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
 }
 
 function downloadCsv(csvText) {

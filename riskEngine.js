@@ -1,130 +1,118 @@
 const DEDUCTION_RULES = [
-  {
-    id: "googleSafeBrowsingFlagged",
-    category: "provider_reputation",
-    deduction: 70,
-    label: "Google Safe Browsing flagged the URL."
-  },
-  {
-    id: "urlhausFlagged",
-    category: "provider_reputation",
-    deduction: 60,
-    label: "URLhaus flagged the URL as malicious or suspicious."
-  },
 {
   id: "domainPreviouslyFlagged",
   category: "provider_reputation",
-  deduction: 6,
+  deduction: 4,
   label: "This domain matched a previous provider-flagged result in this browser."
 },
   {
     id: "wrapperToExternalDestination",
     category: "endpoint_resolution",
-    deduction: 6,
+    deduction: 3,
     label: "A Facebook or tracking wrapper concealed an external destination."
   },
   {
     id: "shortenedUrl",
     category: "endpoint_resolution",
-    deduction: 8,
+    deduction: 4,
     label: "The URL uses a shortening service."
   },
   {
     id: "shortenerToUnrelatedDomain",
     category: "redirect_behavior",
-    deduction: 8,
+    deduction: 4,
     label: "A shortened URL redirects to an unrelated external domain."
   },
   {
     id: "obfuscatedUrl",
     category: "obfuscation",
-    deduction: 10,
+    deduction: 5,
     label: "The URL contains encoded or obfuscated indicators."
   },
   {
     id: "usernamePasswordTrick",
     category: "obfuscation",
-    deduction: 24,
+    deduction: 8,
     label: "The URL uses a username-style segment that can hide the true host."
   },
   {
     id: "suspiciousTld",
     category: "technical_security",
-    deduction: 12,
+    deduction: 4,
     label: "The URL uses a TLD often abused in phishing campaigns."
   },
   {
     id: "textMismatch",
     category: "display_mismatch",
-    deduction: 12,
+    deduction: 4,
     label: "The visible link text suggests a different destination domain."
   },
   {
     id: "suspiciousPath",
     category: "content_context",
-    deduction: 12,
+    deduction: 4,
     label: "The destination path contains phishing or credential-themed keywords."
   },
   {
     id: "excessiveQueryComplexity",
     category: "technical_security",
-    deduction: 4,
+    deduction: 1,
     label: "The destination URL uses an unusually complex query string."
   },
   {
     id: "excessiveSubdomainDepth",
     category: "technical_security",
-    deduction: 5,
+    deduction: 2,
     label: "The destination uses unusually deep subdomains."
   },
 {
   id: "crossDomainRedirectChain",
   category: "redirect_behavior",
-  deduction: 10,
+  deduction: 5,
   label: "The link passes through more than one website before reaching the final destination."
 },
   {
     id: "redirectChainToDifferentRegistrantLikeTarget",
     category: "redirect_behavior",
-    deduction: 6,
+    deduction: 4,
     label: "The redirect chain ends on a different registrable domain than it started on."
   },
   {
     id: "trackingHopToUnrelatedDomain",
     category: "redirect_behavior",
-    deduction: 6,
+    deduction: 4,
     label: "A tracking or wrapper hop leads to a different external domain."
   },
 {
   id: "suspiciousRedirectPattern",
   category: "redirect_behavior",
-  deduction: 12,
+  deduction: 6,
   label: "The redirect pattern makes the final destination harder to verify."
 },
   {
     id: "integrityHashMismatch",
     category: "post_integrity",
-    deduction: 50,
+    deduction: 6,
     label: "The post hyperlink changed after the original baseline was stored."
   }
 ];
 
 const CATEGORY_CAPS = {
-  provider_reputation: 90,
-  endpoint_resolution: 20,
-  redirect_behavior: 25,
-  obfuscation: 30,
-  display_mismatch: 25,
-  post_integrity: 60,
-  content_context: 20,
-  technical_security: 15
+  provider_reputation: 4,
+  endpoint_resolution: 10,
+  redirect_behavior: 18,
+  obfuscation: 18,
+  display_mismatch: 10,
+  post_integrity: 12,
+  content_context: 8,
+  technical_security: 10
 };
 
 const COMBINATION_RULES = [
   {
     id: "shortenerCrossDomainRedirectCombo",
     category: "redirect_behavior",
-    deduction: 10,
+    deduction: 4,
     label: "A shortened URL also redirects across domains.",
     when(features) {
       return Boolean(
@@ -140,7 +128,7 @@ const COMBINATION_RULES = [
   {
     id: "shortenerVisibleMismatchCombo",
     category: "display_mismatch",
-    deduction: 12,
+    deduction: 4,
     label: "A shortened URL hides a destination that does not match the visible text.",
     when(features) {
       return Boolean(features.shortenedUrl && features.textMismatch);
@@ -149,7 +137,7 @@ const COMBINATION_RULES = [
   {
     id: "facebookWrapperShortenerExternalCombo",
     category: "endpoint_resolution",
-    deduction: 8,
+    deduction: 4,
     label: "A Facebook wrapper and shortened URL add multiple layers before the external destination.",
     when(features) {
       return Boolean(
@@ -162,7 +150,7 @@ const COMBINATION_RULES = [
   {
     id: "suspiciousPathHiddenDestinationCombo",
     category: "obfuscation",
-    deduction: 20,
+    deduction: 6,
     label: "Credential, payment, or prize-themed path indicators are combined with hidden destination behavior.",
     when(features) {
       const redirectCount = Number(features.redirectCount || 0);
@@ -181,7 +169,7 @@ const COMBINATION_RULES = [
   {
     id: "integrityLinkInjectionCombo",
     category: "post_integrity",
-    deduction: 10,
+    deduction: 6,
     label: "A newly introduced link matches the post-integrity link-injection threat model.",
     when(features) {
       return Boolean(features.integrityHashMismatch && features.linkInsertedAfterBaseline);
@@ -190,7 +178,7 @@ const COMBINATION_RULES = [
   {
     id: "weakProviderStructuralHidingCombo",
     category: "provider_reputation",
-    deduction: 8,
+    deduction: 4,
     label: "A weak reputation signal is combined with structural destination hiding.",
     when(features) {
       return Boolean(
@@ -207,7 +195,7 @@ const COMBINATION_RULES = [
   },
   {
     id: "shortenerRedirectCombo",
-    deduction: 8,
+    deduction: 4,
     label: "A shortened URL is combined with stronger warning signs.",
     when(features) {
       const redirectCount = Number(features.redirectCount || 0);
@@ -230,7 +218,7 @@ const COMBINATION_RULES = [
   },
   {
     id: "wrapperMismatchCombo",
-    deduction: 10,
+    deduction: 4,
     label: "A wrapped link concealed a destination that does not match the visible text.",
     when(features) {
       return Boolean(features.wrapperToExternalDestination && features.textMismatch);
@@ -239,7 +227,7 @@ const COMBINATION_RULES = [
   {
     id: "providerRedirectCombo",
     category: "provider_reputation",
-    deduction: 10,
+    deduction: 4,
     label: "Threat-intelligence flags are reinforced by suspicious redirect behavior.",
     when(features) {
       return Boolean(
@@ -257,7 +245,7 @@ const COMBINATION_RULES = [
   },
   {
     id: "integrityRedirectCombo",
-    deduction: 15,
+    deduction: 6,
     label: "The link changed and now uses suspicious redirect behavior.",
     when(features) {
       return Boolean(features.integrityHashMismatch && (features.suspiciousRedirectPattern || features.wrapperToExternalDestination));
@@ -266,7 +254,7 @@ const COMBINATION_RULES = [
   {
     id: "obfuscationRedirectCombo",
     category: "obfuscation",
-    deduction: 14,
+    deduction: 6,
     label: "Obfuscation indicators are combined with redirect-based concealment.",
     when(features) {
       const redirectCount = Number(features.redirectCount || 0);
@@ -339,10 +327,10 @@ export function calculateSafetyScore(features = {}) {
   } else if (redirectCount >= 2 && redirectCount <= 3) {
     redirectLabel = "The URL uses a short redirect chain, which is common in marketing and analytics links.";
   } else if (redirectCount >= 4 && redirectCount <= 5) {
-    redirectDeduction = 6;
+    redirectDeduction = 4;
     redirectLabel = "The URL uses a longer redirect chain than usual.";
   } else if (redirectCount > 5) {
-    redirectDeduction = 12;
+    redirectDeduction = 6;
     redirectLabel = "The URL uses an unusually long redirect chain.";
   }
 
