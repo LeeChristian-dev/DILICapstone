@@ -4203,8 +4203,11 @@ async function clearPostAnalysisState(message = {}) {
 
   const storedAnalysis = await getBaseline(postId);
   const relatedUrls = collectAnalysisCacheUrls(storedAnalysis);
+  const clearStoredRecord = isClearablePostAnalysis(storedAnalysis);
 
-  await removePostAnalysis(postId);
+  if (clearStoredRecord) {
+    await removePostAnalysis(postId);
+  }
 
   for (const url of relatedUrls) {
     const cacheKey = normalizeCacheKey(url);
@@ -4217,14 +4220,40 @@ async function clearPostAnalysisState(message = {}) {
     providerResultCache.delete(`virustotal::${cacheKey}`);
   }
 
-  logDebug(`Cleared stale analysis state for post ${postId}. Reason: ${reason}. URL cache entries considered: ${relatedUrls.length}.`);
+  logDebug(`Cleared stale analysis state for post ${postId}. Reason: ${reason}. Stored record cleared: ${clearStoredRecord}. URL cache entries considered: ${relatedUrls.length}.`);
 
   return {
     type: MESSAGE_TYPES.CLEAR_POST_ANALYSIS_STATE,
     cleared: true,
     postId,
-    reason
+    reason,
+    storedRecordCleared: clearStoredRecord
   };
+}
+
+function isClearablePostAnalysis(analysis = {}) {
+  if (!analysis || typeof analysis !== "object") {
+    return true;
+  }
+
+  if (analysis.providerOverride === true) {
+    return false;
+  }
+
+  const state = String(analysis.state || "").toLowerCase();
+  const classification = String(analysis.classification || "").toLowerCase();
+
+  return Boolean(
+    analysis.scanFinalized === false ||
+    analysis.providerPending === true ||
+    state === "pending-provider" ||
+    state === "verification-incomplete" ||
+    state === "completed-limited" ||
+    state === "failed-local" ||
+    classification === "scan pending" ||
+    classification === "unverified" ||
+    classification === "verification incomplete"
+  );
 }
 
 function collectAnalysisCacheUrls(analysis = {}) {

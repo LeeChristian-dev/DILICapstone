@@ -171,8 +171,10 @@ const UNSAFE_PANEL_ANCESTOR_SELECTOR =
   const pendingVirusTotalRefreshByPostId = new Map();
   const pendingVirusTotalRefreshAttemptsByPostId = new Map();
   const pendingCountdownTimerByPostId = new Map();
+  const analyzingTimeoutByPostId = new Map();
   const manualRestartPostIds = new Set();
   const VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS = [30000, 60000, 120000];
+  const ANALYZING_TIMEOUT_MS = 20 * 1000;
   const COMPLETED_PANEL_RENDER_COOLDOWN_MS = 30 * 1000;
   let manualRescanBypassUntil = 0;
 const NO_LINK_PANEL_REMOVAL_CONFIRMATION_COUNT = 3;
@@ -2124,6 +2126,7 @@ async function processPost(post) {
     detailsSummary: "Scan details",
     details: [`Checking ${linkInfo.links.length} link${linkInfo.links.length === 1 ? "" : "s"}.`]
   });
+  startAnalyzingTimeout(postId, owningPost, requestId);
 
   const backgroundStartedAt = nowMs();
 
@@ -2146,10 +2149,11 @@ async function processPost(post) {
         postSignature: signature,
         linkFingerprint
       }),
-      20000,
+      ANALYZING_TIMEOUT_MS + 3000,
       "DILI background analysis"
     );
   } catch (error) {
+    clearAnalyzingTimeout(postId);
     renderBadge(owningPost, {
       label: "Verification Incomplete",
       safetyScore: null,
@@ -2178,10 +2182,12 @@ async function processPost(post) {
     return;
   }
   if (shouldAbortForRuntimeInvalidation(response)) {
+    clearAnalyzingTimeout(postId);
     analysisInFlightByPostId.delete(postId);
     manualRestartPostIds.delete(postId);
     return;
   }
+  clearAnalyzingTimeout(postId);
 
   const backgroundRoundTripMs = elapsedMs(backgroundStartedAt);
   scanStatus.perfLastBackgroundRoundTripMs = backgroundRoundTripMs;
@@ -2309,6 +2315,72 @@ function isManualRescanCooldownBypassActive() {
   return Date.now() < Number(manualRescanBypassUntil || 0);
 }
 
+function startAnalyzingTimeout(postId, post, requestId) {
+  if (!postId || !(post instanceof Element)) {
+    return;
+  }
+
+  clearAnalyzingTimeout(postId);
+  analyzingTimeoutByPostId.set(postId, window.setTimeout(() => {
+    const inFlight = analysisInFlightByPostId.get(postId);
+    if (!inFlight || inFlight.requestId !== requestId) {
+      return;
+    }
+
+    console.debug("[DILI][scan-lifecycle] Full scan timed out.", {
+      postId,
+      requestId
+    });
+
+    latestRequestByPostId.delete(postId);
+    analysisInFlightByPostId.delete(postId);
+    analyzingTimeoutByPostId.delete(postId);
+    renderBadge(post, buildVerificationIncompleteViewModel({
+      summaryLine: "DILI could not complete this scan in time. You may restart the scan.",
+      reason: "Background analysis timed out.",
+      technicalDetail: "Content-side analyzing timeout fired before the background response returned."
+    }));
+  }, ANALYZING_TIMEOUT_MS));
+}
+
+function clearAnalyzingTimeout(postId) {
+  const timer = analyzingTimeoutByPostId.get(postId);
+  if (timer) {
+    window.clearTimeout(timer);
+  }
+
+  analyzingTimeoutByPostId.delete(postId);
+}
+
+function buildVerificationIncompleteViewModel({
+  summaryLine = "DILI could not complete this scan. You may restart the scan.",
+  reason = "Scan did not complete.",
+  technicalDetail = ""
+} = {}) {
+  return {
+    label: "Verification Incomplete",
+    safetyScore: null,
+    state: "verification-incomplete",
+    severityLevel: "unverified",
+    summaryLine,
+    detailsSummary: "Scan details",
+    actionHint: "Try again for this post.",
+    restartAvailable: true,
+    details: [
+      reason,
+      "This incomplete result is terminal for the current scan attempt."
+    ],
+    reportSections: {
+      resultLine: "Verification Incomplete. DILI could not complete this scan.",
+      checkedLine: "DILI could not finish all checks for this post.",
+      reasons: [reason],
+      recommendation: "Restart the scan for this post if you want DILI to try again.",
+      verificationNotes: ["No final safety score is available for this incomplete scan."],
+      technicalDetails: [technicalDetail || reason]
+    }
+  };
+}
+
 function shouldSkipFullAnalysisForExistingLifecycle({
   postId,
   post,
@@ -2385,11 +2457,7 @@ function shouldReuseCompletedUnchangedPostAnalysis({
   const sessionCacheEntry = completedAnalysisSessionCache.get(postId);
   const analysis = normalizeProviderDisplayAnalysis(cachedPanel?.analysis || sessionCacheEntry?.analysis || {});
 
-  if (!analysis || typeof analysis !== "object") {
-    return false;
-  }
-
-  if (analysis.scanFinalized !== true || hasActualPendingProvider(analysis)) {
+  if (!isReusableCompletedAnalysis(analysis)) {
     return false;
   }
 
@@ -2414,6 +2482,25 @@ function shouldReuseCompletedUnchangedPostAnalysis({
   }
 
   return true;
+}
+
+function isReusableCompletedAnalysis(analysis = {}) {
+  if (!analysis || typeof analysis !== "object") {
+    return false;
+  }
+
+  const state = String(analysis.state || "").toLowerCase();
+  const classification = String(analysis.classification || "").toLowerCase();
+
+  return Boolean(
+    analysis.scanFinalized === true &&
+    state !== "pending-provider" &&
+    state !== "verification-incomplete" &&
+    state !== "completed-limited" &&
+    state !== "failed-local" &&
+    !hasActualPendingProvider(analysis) &&
+    ["safe", "suspicious", "high risk"].includes(classification)
+  );
 }
 
 function isVirusTotalRefreshDueForBaseline(baseline = {}, postId = "") {
@@ -4424,6 +4511,14 @@ function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
     pendingCountdownTimerByPostId.clear();
   }
 
+  function clearAllAnalyzingTimeouts() {
+    for (const timer of analyzingTimeoutByPostId.values()) {
+      window.clearTimeout(timer);
+    }
+
+    analyzingTimeoutByPostId.clear();
+  }
+
     function resetOwnedUiArtifacts() {
     removeAllOwnedPanels();
     closeWarningModal({ restoreFocus: false });
@@ -4434,6 +4529,7 @@ function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
     manualRestartPostIds.clear();
     clearAllPendingVirusTotalPanelRefreshes();
     clearAllPendingCountdownTimers();
+    clearAllAnalyzingTimeouts();
     postSignatureCache = new WeakMap(); 
 }
 
@@ -4447,6 +4543,7 @@ analysisInFlightByPostId.clear();
 manualRestartPostIds.clear();
 recentlyRenderedPanelByPostId.clear();
 clearAllPendingVirusTotalPanelRefreshes();
+clearAllAnalyzingTimeouts();
 noLinkRescanCountsByPostId.clear();
 
     if (flushTimer !== null) {
@@ -4707,6 +4804,10 @@ function rememberRecentlyRenderedPanel(postId, post, viewModel = {}) {
     return;
   }
 
+  if (!isReusableCompletedAnalysis(analysis)) {
+    return;
+  }
+
   completedAnalysisSessionCache.set(postId, {
     postSignature: latestRequest.signature || "",
     linkFingerprint: latestRequest.linkFingerprint || "",
@@ -4783,6 +4884,7 @@ async function restartScanForPost(post, reason = "manual-post-restart") {
 
   clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
   clearPendingCountdownTimer(postId);
+  clearAnalyzingTimeout(postId);
   analysisInFlightByPostId.delete(postId);
   latestRequestByPostId.delete(postId);
   cachedPanelByPostId.delete(postId);
@@ -5271,46 +5373,46 @@ async function refreshPendingVirusTotalPanel(entry = {}) {
     clearPendingCountdownTimer(postId);
     return;
   }
+if (refreshedPending) {
+  console.debug("[DILI][scan-lifecycle] Provider refresh still pending; scheduling next provider refresh.", {
+    postId,
+    attempt: pendingVirusTotalRefreshAttemptsByPostId.get(postId)
+  });
 
-  if (refreshedPending) {
-    renderBadge(post, {
-      ...updatedViewModel,
-      suppressPendingRefreshSchedule: true
-    });
-    console.debug("[DILI][scan-lifecycle] Provider refresh still pending; next retry will be scheduled.", {
-      postId,
-      providerCheckedUrl: refreshedTarget.providerCheckedUrl || entry.providerCheckedUrl,
-      attempt: pendingVirusTotalRefreshAttemptsByPostId.get(postId),
-      maxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
-      providerRefreshStatus: response.providerRefreshStatus || "",
-      reason: response.reason || ""
-    });
-    const attempts = Number(pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0);
-    if (attempts >= VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length) {
-      markPendingProviderRefreshStatus(post, "exhausted", {
-        lastAttemptStatus: response.providerRefreshReason || response.providerRefreshStatus || "retry budget exhausted"
-      });
-      await finalizePendingProviderState(postId, post, {
-        ...entry,
-        retryAttempt: attempts,
-        retryMaxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
-        nextRetryAt: 0,
-        lastAttemptAt: Date.now(),
-        lastAttemptStatus: "retry budget exhausted"
-      });
-      return;
-    }
+  const attempts = Number(pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0);
 
-    schedulePendingVirusTotalPanelRefresh(post, updatedViewModel);
-    const scheduledPanel = cachedPanelByPostId.get(postId);
-    if (scheduledPanel) {
-      renderBadge(post, {
-        ...scheduledPanel,
-        suppressPendingRefreshSchedule: true
-      });
-    }
+  if (attempts >= VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length) {
+    markPendingProviderRefreshStatus(post, "exhausted", {
+      lastAttemptStatus: response.providerRefreshReason || response.providerRefreshStatus || "retry budget exhausted"
+    });
+
+    await finalizePendingProviderState(postId, post, {
+      ...entry,
+      retryAttempt: attempts,
+      retryMaxAttempts: VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length,
+      nextRetryAt: 0,
+      lastAttemptAt: Date.now(),
+      lastAttemptStatus: "retry budget exhausted"
+    });
+
     return;
   }
+
+  schedulePendingVirusTotalPanelRefresh(post, {
+    ...viewModel,
+    analysis: response.analysis
+  });
+
+  const scheduledPanel = cachedPanelByPostId.get(postId);
+  if (scheduledPanel) {
+    renderBadge(post, {
+      ...scheduledPanel,
+      suppressPendingRefreshSchedule: true
+    });
+  }
+
+  return;
+}
 
   if (!refreshedPending) {
     renderBadge(post, {
@@ -5364,31 +5466,11 @@ async function finalizePendingProviderState(postId, post, entry = {}) {
   clearPendingCountdownTimer(postId);
 
   if (!response?.analysis || response.finalized === false) {
-    renderBadge(post, {
-      label: "Verification Incomplete",
-      safetyScore: null,
-      state: "verification-incomplete",
-      severityLevel: "unverified",
+    renderBadge(post, buildVerificationIncompleteViewModel({
       summaryLine: "VirusTotal did not complete before the retry limit.",
-      detailsSummary: "Scan details",
-      actionHint: "Use Rescan Now from the extension popup to try again.",
-      details: [
-        response?.reason || "Pending provider finalization did not return an analysis.",
-        "DILI stopped retrying this provider check to avoid an endless Scan Pending state."
-      ],
-      reportSections: {
-        resultLine: "Verification Incomplete. VirusTotal did not complete before the retry limit.",
-        checkedLine: "DILI used available completed providers and heuristic indicators.",
-        reasons: ["VirusTotal did not return a completed URL-specific result within the retry window."],
-        recommendation: "Use Rescan Now from the extension popup to try again.",
-        verificationNotes: ["No final safety score is available for this timed-out provider check."],
-        technicalDetails: [
-          `VirusTotal checked URL: ${entry.providerCheckedUrl || "Unavailable"}.`,
-          `VirusTotal retry attempt: ${entry.retryAttempt || entry.attempt || pendingVirusTotalRefreshAttemptsByPostId.get(postId) || 0}/${entry.retryMaxAttempts || VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS.length}.`,
-          `VirusTotal last refresh result: ${response?.reason || "missing finalized analysis"}.`
-        ]
-      }
-    });
+      reason: response?.reason || "Pending provider finalization did not return an analysis.",
+      technicalDetail: `VirusTotal checked URL: ${entry.providerCheckedUrl || "Unavailable"}.`
+    }));
     return;
   }
 
