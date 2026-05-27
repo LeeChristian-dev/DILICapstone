@@ -13,6 +13,7 @@ const popupState = {
   activeTab: null,
   summary: {},
   scanEnabled: true,
+  bootstrapWarningVisible: false,
   refreshIntervalId: null
 };
 
@@ -42,7 +43,7 @@ const recentActivityList = document.getElementById("recent-activity-list");
 const recentEmptyEl = document.getElementById("recent-empty");
 
 init().catch((error) => {
-  setMessage(`Failed to initialize popup: ${error.message || "unknown error"}`);
+  renderPopupBootstrapWarning(null, error);
 });
 
 async function init() {
@@ -190,28 +191,59 @@ function bindActions() {
 }
 
 async function refreshPopupData() {
-  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  let activeTab = null;
+  let summaryResponse = null;
+  let scanStateResponse = null;
+  let bootstrapError = null;
+
+  try {
+    [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  } catch (error) {
+    bootstrapError = error;
+  }
+
   const tabUrl = activeTab?.url || "";
-  const [summaryResponse, scanStateResponse] = await Promise.all([
-    sendMessage({
-      type: MESSAGE_TYPES.GET_POPUP_SUMMARY,
-      tabUrl
-    }),
-    sendMessage({
-      type: MESSAGE_TYPES.GET_SCAN_STATE
-    })
-  ]);
+
+  if (!bootstrapError) {
+    try {
+      summaryResponse = await sendMessage({
+        type: MESSAGE_TYPES.GET_POPUP_SUMMARY,
+        tabUrl
+      });
+    } catch (error) {
+      bootstrapError = bootstrapError || error;
+    }
+
+    try {
+      scanStateResponse = await sendMessage({
+        type: MESSAGE_TYPES.GET_SCAN_STATE
+      });
+    } catch (error) {
+      bootstrapError = bootstrapError || error;
+    }
+  }
 
   popupState.activeTab = activeTab || null;
-  popupState.summary = summaryResponse?.summary || {};
+  popupState.summary = summaryResponse?.summary || buildPopupFallbackSummary(activeTab);
   popupState.summary.scanStatus = await getContentScanStatus(activeTab, popupState.summary);
-  popupState.scanEnabled = scanStateResponse?.scanEnabled !== false;
-renderProtectionState();
-renderTabContext(popupState.activeTab, popupState.summary);
-renderStats(popupState.summary);
-renderSessionSince(popupState.summary);
-renderProviderChips(popupState.summary.providerSummary);
-renderRecentActivity(popupState.summary.recentActivity);
+
+  if (scanStateResponse?.scanEnabled !== undefined) {
+    popupState.scanEnabled = scanStateResponse.scanEnabled !== false;
+  }
+
+  renderProtectionState();
+  renderTabContext(popupState.activeTab, popupState.summary);
+  renderStats(popupState.summary);
+  renderSessionSince(popupState.summary);
+  renderProviderChips(popupState.summary.providerSummary);
+  renderRecentActivity(popupState.summary.recentActivity);
+
+  if (bootstrapError) {
+    renderPopupBootstrapWarning(activeTab, bootstrapError);
+  } else if (popupState.bootstrapWarningVisible) {
+    popupState.bootstrapWarningVisible = false;
+    setMessage("");
+  }
 }
 
 function renderProtectionState() {
@@ -290,6 +322,38 @@ function renderTabContext(activeTab, summary) {
   tabContext.classList.add("context-warn");
 }
 
+function buildPopupFallbackSummary(activeTab) {
+  const url = String(activeTab?.url || "").trim();
+  const tabSupported = Boolean(url && url.includes("facebook.com") && !url.startsWith("chrome://") && !url.startsWith("edge://") && !url.startsWith("about:") && !url.startsWith("chrome-extension://") && !url.startsWith("devtools://"));
+
+  return {
+    tabSupported,
+    postsScannedInSession: 0,
+    scannedPostsInSession: 0,
+    postsAnalyzedInSession: 0,
+    analyzedPostsInSession: 0,
+    analyzedLinksInSession: 0,
+    flaggedPostsInSession: 0,
+    totalStoredAnalyses: 0,
+    sessionStartedAt: 0,
+    providerSummary: null,
+    recentActivity: [],
+    scanStatus: null
+  };
+}
+
+function renderPopupBootstrapWarning(activeTab, error) {
+  const isFacebookTab = String(activeTab?.url || "").includes("facebook.com");
+  tabContext.classList.remove("context-ok", "context-warn", "context-bad");
+  tabContext.classList.add("context-warn");
+  popupState.bootstrapWarningVisible = true;
+  tabContextText.textContent = isFacebookTab
+    ? "Facebook tab detected, but DILI background service worker did not respond. Reload the extension and check the service worker console."
+    : "DILI background service worker did not respond. Reload the extension and check the service worker console.";
+  setMessage("DILI background service worker did not respond. Reload the extension and check the service worker console.");
+  console.warn("[DILI] Popup bootstrap failed", error);
+}
+
 function renderSessionSince(summary) {
   const started = Number(summary.sessionStartedAt || 0);
   if (!Number.isFinite(started) || started <= 0) {
@@ -361,12 +425,30 @@ function renderRecentActivity(recentActivity) {
     const li = document.createElement("li");
     const title = document.createElement("span");
     const domain = item.domain || "—";
-    const classification = item.classification || "—";
-    const score =
-      item.safetyScore === null || item.safetyScore === undefined || item.safetyScore === ""
-        ? "—"
-        : String(item.safetyScore);
-    title.textContent = `${domain} · ${classification} · score ${score}`;
+const classification = String(item.classification || "").trim() || "Unverified";
+const state = String(item.state || "").toLowerCase();
+const scanFinalized = item.scanFinalized === true;
+const pending = !scanFinalized || state === "pending-provider";
+const terminalIncomplete =
+  state === "verification-incomplete" ||
+  state === "completed-limited" ||
+  classification.toLowerCase().includes("unverified");
+
+const scoreValue = Number(item.safetyScore);
+const scoreText =
+  pending
+    ? "not final"
+    : terminalIncomplete || !Number.isFinite(scoreValue)
+      ? "no score"
+      : `score ${scoreValue}`;
+
+const statusLabel = pending
+  ? "Scan Pending"
+  : terminalIncomplete
+    ? "Unverified"
+    : classification;
+
+title.textContent = `${domain} · ${statusLabel} · ${scoreText}`;
 
     const meta = document.createElement("span");
     meta.className = "recent-meta";

@@ -114,6 +114,16 @@ DILI computes a **Safety Score** using a subtractive model:
 
 **Provider-flagged results:** URLs flagged by Google Safe Browsing, URLhaus, or optional VirusTotal are classified as High Risk. Provider errors and rate limits do not directly deduct score points.
 
+DILI does not display a final Safety Score while a configured or active provider check is still pending. In that state, the inline panel shows a pending scan result with provider status details instead of Safe, Suspicious, High Risk, or a numeric score. The computed score is retained internally for audit/debug, but it is withheld from the UI until provider verification reaches a terminal state.
+
+Pending VirusTotal checks use controlled delayed follow-ups to update the same in-page panel when the provider result completes. DILI does not use continuous interval polling. Terminal limited provider states such as rate-limited, timeout, not-configured, skipped, and error do not block forever; DILI reports them as verification limitations and then allows the scan display to finalize.
+
+Pending-provider panels use a dedicated caution theme and show a visible countdown for the next scheduled provider follow-up. VirusTotal pending follow-ups use a fixed delayed retry budget; if VirusTotal does not return a terminal result within that retry window, DILI finalizes the panel using available provider results and records VirusTotal as a provider limitation.
+
+Completed, unchanged post scans are reused during the same browsing session. If the stable post ID, post signature, link fingerprint, visible text hash, and terminal provider state are unchanged, DILI restores the existing panel instead of sending another analysis request. Manual rescans and actual link/text changes still bypass this reuse.
+
+For multi-link posts, hidden computed scores from pending child links are retained only as internal audit data. They do not drive the visible post-level classification. The post remains **Scan Pending** until every participating provider check for every analyzed link reaches a terminal state, unless a completed provider check already flags one link.
+
 DILI uses score bands for display and navigation decisions. Suspicious results, High Risk results, provider-flagged results, and final scores below 80 trigger a navigation pause before opening the destination.
 
 ### Local domain memory
@@ -129,6 +139,14 @@ Shortened links are treated as caution signals, not automatic malicious signals.
 Single weak indicators, such as an ordinary shortener, are treated mildly to reduce false positives. Combined indicators, such as a shortener plus cross-domain redirect, mismatch, obfuscation, or link-injection evidence, receive stronger deductions.
 
 Visible-domain fallback is not treated as proof of danger by itself. It is a limited verification mode used when Facebook does not expose the full endpoint during passive scanning.
+
+DILI unwraps Facebook outbound wrappers before resolving common shorteners when the destination is available. Provider checks prefer the resolved final endpoint. If the shortener cannot be resolved with enough confidence, DILI reports that limitation instead of claiming the shortener service itself is the final website.
+
+Clean provider results with a high-confidence resolved HTTPS endpoint can mitigate false positives from normal marketing mechanics such as Facebook wrappers, UTM/fbclid tracking parameters, branded shortlinks, and campaign redirects. Configured branded alias relationships, such as a known short brand domain resolving to its official destination, reduce mismatch penalties but never suppress provider flags or clearly malicious URL features.
+
+Post-integrity deductions are limited to verified, stable post baselines. When post identity is unstable, collapsed, provisional, too recent, or endpoint-equivalent after normalization, DILI still scans the URL but skips post-baseline integrity scoring.
+
+Advanced audit output separates active deductions, mitigations, provider overrides, and incomplete category-level audit details so a scan does not claim that no warning signs were triggered when a category deduction was actually applied.
 
 ### Redirect trace visibility
 

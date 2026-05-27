@@ -8,7 +8,7 @@ import { calculateSafetyScore, classifySafetyScore } from "./riskEngine.js";
 import { sha256Hex } from "./utils/hash.js";
 import { resolveEndpoint } from "./utils/endpointResolver.js";
 import { analyzeRedirects } from "./utils/redirectAnalyzer.js";
-import { analyzeUrlFeatures, detectDomainMismatch, getRegistrableDomain, normalizeUrl } from "./utils/urlAnalyzer.js";
+import { analyzeUrlFeatures, detectDomainMismatch, getRegistrableDomain, isShortenerHost, normalizeUrl } from "./utils/urlAnalyzer.js";
 import {
   appendAnalysisRecord,
   checkDomainPreviouslyFlagged,
@@ -30,6 +30,7 @@ const MESSAGE_TYPES = {
   ANALYZE_LINK: "DILI_ANALYZE_LINK",
   REANALYZE_LINK: "DILI_REANALYZE_LINK",
   REFRESH_VIRUSTOTAL_RESULT: "DILI_REFRESH_VIRUSTOTAL_RESULT",
+  FINALIZE_PENDING_PROVIDER_STATE: "DILI_FINALIZE_PENDING_PROVIDER_STATE",
   GET_POST_STATE: "DILI_GET_POST_STATE",
   SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
   GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
@@ -56,83 +57,34 @@ const performanceStats = {
   lastCacheHit: false,
   lastAnalyzedDomain: "",
   providerCacheHits: 0,
-  providerCacheMisses: 0,
-  providerInFlightJoins: 0,
-  providerRequestsStarted: 0,
-  providerRequestsCompleted: 0,
-  providerRequestsFailed: 0,
-  providerTimeouts: 0,
-  providerErrorCacheHits: 0,
-  lastProviderCacheStatus: ""
+  providerCacheMisses: 0
 };
-const providerHealth = createInitialProviderHealth();
-const runtimeConfig = createRuntimeConfig();
+
 const CURRENT_ANALYSIS_SCHEMA_VERSION = 4;
-const SESSION_TTL_MS = 60 * 60 * 1000;
+const SESSION_TTL_MS = 30 * 60 * 1000;
+
 const URL_ANALYSIS_CACHE_TTL_MS = 10 * 60 * 1000;
 const PROVIDER_RESULT_CACHE_TTL_MS = 10 * 60 * 1000;
 const PROVIDER_ERROR_CACHE_TTL_MS = 60 * 1000;
 const PROVIDER_PENDING_CACHE_TTL_MS = 15 * 1000;
 const PROVIDER_CACHE_MAX_ENTRIES = 300;
-const POST_INTEGRITY_MIN_NO_LINK_BASELINE_AGE_MS = 15000;
+
 const VIRUSTOTAL_MIN_REQUEST_INTERVAL_MS = 20 * 1000;
 const VIRUSTOTAL_SOFT_DEADLINE_MS = 2800;
 const VIRUSTOTAL_PENDING_FOLLOWUP_INTERVAL_MS = 20 * 1000;
 const VIRUSTOTAL_PENDING_TTL_MS = 30 * 60 * 1000;
+
+let runtimeConfig = createRuntimeConfig();
+let providerHealth = createInitialProviderHealth();
+let sessionInfo = createSessionState();
+
 const urlAnalysisCache = new Map();
 const providerResultCache = new Map();
 const providerRequestInFlight = new Map();
 const virusTotalPendingAnalysisCache = new Map();
+
 let providerCacheGeneration = 0;
 let lastVirusTotalRequestAt = 0;
-const sessionInfo = createSessionState();
-
-applyConfigDiagnostics(runtimeConfig);
-bindSessionLifecycleObservers();
-
-chrome.runtime.onInstalled.addListener(() => {
-  logDebug("Background service worker installed.");
-});
-
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  handleMessage(message, sender)
-    .then((result) => sendResponse({ ok: true, ...result }))
-    .catch((error) => {
-      console.warn("[DILI] Background message error", error);
-      sendResponse({
-        ok: false,
-        error: error.message || "Unknown background error."
-      });
-    });
-
-  return true;
-});
-
-if (chrome.storage?.onChanged) {
-  chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== "local") {
-      return;
-    }
-
-    const providerConfigKeys = [
-    "dili:config:gsbApiKey",
-    "dili:config:urlhausAuthKey",
-    "dili:config:urlhausApiKey",
-    "dili:config:virustotalApiKey",
-    DEMO_SCORE_BIAS_STORAGE_KEY,
-    DEMO_SCORE_BIAS_AMOUNT_STORAGE_KEY
-  ];
-
-    if (!providerConfigKeys.some((key) => Object.prototype.hasOwnProperty.call(changes, key))) {
-      return;
-    }
-
-    clearProviderCaches({ clearUrlAnalysis: true, clearPendingVirusTotal: true });
-    getRuntimeConfig().catch((error) => {
-      logDebug(`Provider config refresh after storage change failed: ${safeErrorMessage(error, "unknown error")}`);
-    });
-  });
-}
 
 async function handleMessage(message) {
   switch (message?.type) {
@@ -197,6 +149,9 @@ async function handleMessage(message) {
     case MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT:
       return refreshVirusTotalResultForPost(message);
 
+    case MESSAGE_TYPES.FINALIZE_PENDING_PROVIDER_STATE:
+      return finalizePendingProviderStateForPost(message);
+
     case MESSAGE_TYPES.GET_POPUP_SUMMARY:
       return {
         type: MESSAGE_TYPES.GET_POPUP_SUMMARY,
@@ -248,6 +203,27 @@ case MESSAGE_TYPES.CLEAR_ANALYSIS_RECORDS:
       throw new Error(`Unsupported message type: ${message?.type || "unknown"}`);
   }
 }
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  Promise.resolve()
+    .then(() => handleMessage(message, sender))
+    .then((response) => {
+      sendResponse({
+        ok: true,
+        ...response
+      });
+    })
+    .catch((error) => {
+      const errorMessage = safeErrorMessage(error, "Unknown background error.");
+      console.warn("[DILI] Background message failed", error);
+      sendResponse({
+        ok: false,
+        error: errorMessage
+      });
+    });
+
+  return true;
+});
 
 async function setNoLinkState(message) {
   const baseline = await getBaseline(message.postId);
@@ -305,6 +281,26 @@ async function setNoLinkState(message) {
     postId: message.postId
   });
 }
+function isAnalysisPendingLike(analysis = {}) {
+  const classification = String(analysis.classification || "").toLowerCase();
+  const pendingProviders = Array.isArray(analysis.pendingProviders)
+    ? analysis.pendingProviders
+    : [];
+
+  return (
+    classification === "pending" ||
+    classification === "scan pending" ||
+    analysis.scanFinalized === false ||
+    analysis.state === "pending-provider" ||
+    analysis.providerPending === true ||
+    pendingProviders.length > 0 ||
+    analysis.providerCompletion?.hasPendingProvider === true
+  );
+}
+
+
+
+
 async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candidateContext, postTextHash, normalizedVisiblePostText, isReanalysis }) {
   const linkInputs = Array.isArray(links) && links.length > 0
     ? links.slice(0, 8)
@@ -339,26 +335,43 @@ async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candi
     throw new Error(limitations[0] || "No links could be analyzed.");
   }
 
+  function getAnalysisSortScore(item) {
+  if (
+    isPendingClassificationLabel(item?.classification) ||
+    item?.scanFinalized === false ||
+    item?.providerCompletion?.hasPendingProvider === true ||
+    (Array.isArray(item?.pendingProviders) && item.pendingProviders.length > 0)
+  ) {
+    return 101;
+  }
+
+  const displayedScore = toFiniteScoreOrNull(item?.safetyScore);
+  if (displayedScore !== null) {
+    return displayedScore;
+  }
+
+  const computedScore = toFiniteScoreOrNull(item?.computedSafetyScore);
+  if (computedScore !== null) {
+    return computedScore;
+  }
+
+  return 101;
+}
+
   // The post-level result intentionally follows the lowest-scoring successful link
   // so one risky link cannot be hidden by several safe links.
   const worst = analyses
     .slice()
     .sort((left, right) => {
-      const leftScore = Number.isFinite(left.safetyScore) ? left.safetyScore : 101;
-      const rightScore = Number.isFinite(right.safetyScore) ? right.safetyScore : 101;
+      const leftScore = getAnalysisSortScore(left);
+      const rightScore = getAnalysisSortScore(right);
       return leftScore - rightScore;
     })[0];
-  const linkScoreSummary = analyses.map((item, index) => ({
-    index: index + 1,
-    url: item.analysisUrl || item.normalizedUrl || "",
-    domain:
-      item.endpointResult?.effectiveDomain ||
-      item.urlFeatureAnalysis?.finalDomain ||
-      item.domain ||
-      "",
-    safetyScore: item.safetyScore,
-    classification: item.classification
-  })).slice(0, 8);
+  const linkAnalysisSnapshots = analyses.map((item, index) => buildStoredLinkAnalysisSnapshot(item, index + 1));
+  const pendingLinkRefreshTargets = buildPendingLinkRefreshTargets(linkAnalysisSnapshots);
+  const providerOverrideChild = linkAnalysisSnapshots.find((snapshot) => snapshot.providerOverride);
+  const hasPendingChild = pendingLinkRefreshTargets.length > 0;
+  const linkScoreSummary = buildLinkScoreSummaryFromSnapshots(linkAnalysisSnapshots);
   const enrichedWorst = {
     ...worst,
     analyzedLinkCount: analyses.length,
@@ -370,8 +383,51 @@ async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candi
       worst.urlFeatureAnalysis?.finalDomain ||
       worst.domain ||
       "",
-    linkScoreSummary
+    linkScoreSummary,
+    linkAnalysisSnapshots,
+    pendingLinkRefreshTargets,
+    pendingProviderRefreshTarget: pendingLinkRefreshTargets[0] || null
   };
+
+  if (providerOverrideChild) {
+    enrichedWorst.classification = providerOverrideChild.classification || "High Risk";
+    enrichedWorst.safetyScore = providerOverrideChild.safetyScore;
+    enrichedWorst.computedClassification = providerOverrideChild.computedClassification || providerOverrideChild.classification || "High Risk";
+    enrichedWorst.computedSafetyScore = providerOverrideChild.computedSafetyScore ?? providerOverrideChild.safetyScore;
+    enrichedWorst.scanFinalized = true;
+    enrichedWorst.state = "completed";
+    enrichedWorst.providerPending = false;
+    enrichedWorst.providerOverride = true;
+    enrichedWorst.interceptionRecommended = true;
+    enrichedWorst.pendingProviders = [];
+    enrichedWorst.providerCompletion = {
+      ...(providerOverrideChild.providerCompletion || {}),
+      hasPendingProvider: false,
+      allRequiredProvidersTerminal: true,
+      pendingProviders: []
+    };
+  } else if (hasPendingChild) {
+    enrichedWorst.classification = "Scan Pending";
+    enrichedWorst.safetyScore = null;
+    enrichedWorst.scanFinalized = false;
+    enrichedWorst.state = "pending-provider";
+    enrichedWorst.providerPending = true;
+    enrichedWorst.interceptionRecommended = false;
+    enrichedWorst.pendingProviders = [
+      ...new Set(
+        pendingLinkRefreshTargets.flatMap((target) => target.pendingProviders || [])
+      )
+    ];
+    enrichedWorst.providerCompletion = {
+      ...(enrichedWorst.providerCompletion || {}),
+      hasPendingProvider: true,
+      allRequiredProvidersTerminal: false,
+      pendingProviders: enrichedWorst.pendingProviders
+    };
+    enrichedWorst.pendingLinkRefreshTargets = pendingLinkRefreshTargets;
+    enrichedWorst.pendingProviderRefreshTarget = pendingLinkRefreshTargets[0] || null;
+  }
+
   const persistedWorst = await persistPostLevelAnalysis(postId, enrichedWorst);
 
   return {
@@ -383,10 +439,69 @@ async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candi
     lowestScoringLinkUrl: enrichedWorst.lowestScoringLinkUrl,
     lowestScoringLinkDomain: enrichedWorst.lowestScoringLinkDomain,
     linkScoreSummary,
+    linkAnalysisSnapshots,
+    pendingLinkRefreshTargets: enrichedWorst.pendingLinkRefreshTargets || [],
+    pendingProviderRefreshTarget: enrichedWorst.pendingProviderRefreshTarget || null,
     failedLinkLimitations: limitations,
     limitations: [...(worst.limitations || []), ...limitations].slice(0, 8)
   };
 }
+
+function buildStoredLinkAnalysisSnapshot(analysis = {}, index = 0) {
+  const providerResults = normalizeProviderResults(analysis.providerResults || []);
+  const providerCompletion = analysis.providerCompletion || buildProviderCompletionState(providerResults);
+
+  return {
+    index,
+    url: analysis.url || analysis.displayUrl || analysis.analysisUrl || "",
+    displayUrl: analysis.displayUrl || analysis.url || "",
+    analysisUrl: analysis.analysisUrl || analysis.url || "",
+    normalizedUrl: analysis.normalizedUrl || "",
+    providerCheckedUrl: analysis.providerCheckedUrl || analysis.analysisUrl || analysis.url || "",
+    domain:
+      analysis.endpointResult?.effectiveDomain ||
+      analysis.urlFeatureAnalysis?.finalDomain ||
+      analysis.domain ||
+      "",
+    safetyScore: analysis.safetyScore,
+    computedSafetyScore: analysis.computedSafetyScore,
+    classification: analysis.classification,
+    computedClassification: analysis.computedClassification,
+    scanFinalized: analysis.scanFinalized,
+    providerOverride: analysis.providerOverride === true,
+    providerResults,
+    providerCompletion,
+    pendingProviders: Array.isArray(analysis.pendingProviders)
+      ? analysis.pendingProviders
+      : Array.isArray(providerCompletion.pendingProviders)
+        ? providerCompletion.pendingProviders
+        : [],
+    features: cloneValue(analysis.features || {}),
+    endpointResult: cloneValue(analysis.endpointResult || {}),
+    redirectAnalysis: cloneValue(analysis.redirectAnalysis || {}),
+    urlFeatureAnalysis: cloneValue(analysis.urlFeatureAnalysis || {}),
+    scoreAudit: cloneValue(analysis.scoreAudit || {}),
+    verificationState: analysis.verificationState || "",
+    verificationOnlyUnknown: analysis.verificationOnlyUnknown === true,
+    concreteRiskSignals: analysis.concreteRiskSignals === true,
+    limitations: Array.isArray(analysis.limitations) ? analysis.limitations.slice(0, 8) : []
+  };
+}
+
+function isStoredLinkAnalysisPending(analysis = {}) {
+  const vt = getNormalizedProviderResult(analysis.providerResults || [], "virustotal");
+  const vtStatus = getProviderStatus(vt);
+
+  return Boolean(
+    isAnalysisPendingLike(analysis) ||
+    ["pending", "timeout", "rate-limited"].includes(vtStatus)
+  );
+}
+
+function buildPendingLinkRefreshTargets(linkAnalyses = []) {
+  return (Array.isArray(linkAnalyses) ? linkAnalyses : []).filter(isAnalysisPendingLike);
+}
+
 async function performSingleLinkAnalysis({ postId, rawUrl, displayedText, candidateContext, postTextHash, normalizedVisiblePostText, isReanalysis, persist = true }) {
   const totalStartedAt = nowMs();
 
@@ -540,9 +655,19 @@ const canUseNoLinkInjectionBaseline = Boolean(
 );
 
   const linkInsertedAfterBaseline = Boolean(canUseNoLinkInjectionBaseline);
-  const existingLinkIntegrityMismatch = Boolean(
+  const canUseExistingLinkIntegrityBaseline = Boolean(
     isReanalysis &&
+    stableIdentityMatch &&
     compatibleBaseline?.urlHash &&
+    !provisionalNoLinkBaseline &&
+    baselineAgeMs >= POST_INTEGRITY_MIN_NO_LINK_BASELINE_AGE_MS &&
+    currentHasUsableLinkCandidate &&
+    normalizedCandidateContext.candidateMode === "single" &&
+    normalizedCandidateContext.candidateIsDomainOnlyFallback !== true &&
+    normalizedCandidateContext.candidateUrlCompleteness !== "domain-only-fallback"
+  );
+  const existingLinkIntegrityMismatch = Boolean(
+    canUseExistingLinkIntegrityBaseline &&
     !linkInsertedAfterBaseline &&
     hasCompatibleIntegrityMismatch(compatibleBaseline, {
       currentHash,
@@ -596,6 +721,8 @@ const canUseNoLinkInjectionBaseline = Boolean(
   urlLevelFeatures = applySameDomainMarketingEncodingMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
   urlLevelFeatures = applyKnownBrandedCampaignRedirectMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
   urlLevelFeatures = applyKnownGoogleFormsRedirectMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult);
+  urlLevelFeatures = applyKnownBrandAliasRedirectMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult, providerResults);
+  urlLevelFeatures = applyCleanResolvedMarketingLinkMitigation(urlLevelFeatures, reusableUrlAnalysis, endpointResult, providerResults);
   const combinedFeaturesBase = {
     ...urlLevelFeatures,
     ...postContextFeatures
@@ -609,6 +736,8 @@ const canUseNoLinkInjectionBaseline = Boolean(
   features = applySameDomainMarketingEncodingMitigation(features, reusableUrlAnalysis, endpointResult);
   features = applyKnownBrandedCampaignRedirectMitigation(features, reusableUrlAnalysis, endpointResult);
   features = applyKnownGoogleFormsRedirectMitigation(features, reusableUrlAnalysis, endpointResult);
+  features = applyKnownBrandAliasRedirectMitigation(features, reusableUrlAnalysis, endpointResult, providerResults);
+  features = applyCleanResolvedMarketingLinkMitigation(features, reusableUrlAnalysis, endpointResult, providerResults);
   const urlLevelScoring = calculateSafetyScore(urlLevelFeatures);
   const providerOverride = Boolean(gsbResult.flagged || urlhausResult.flagged || virusTotalResult.flagged);
   const urlLevelClassification = providerOverride ? "High Risk" : classifySafetyScore(urlLevelScoring.score);
@@ -714,6 +843,18 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     : verificationOnlyUnknown
       ? "Unverified"
       : classifySafetyScore(finalScore);
+  const providerCompletion = buildProviderCompletionState(providerResults);
+  const scanFinalized = providerCompletion.allRequiredProvidersTerminal && !providerCompletion.hasPendingProvider;
+
+  let displayedScore = finalScore;
+  let displayedClassification = finalClassification;
+  let displayedState = finalFeatures.integrityHashMismatch ? "changed" : "monitored";
+
+  if (!scanFinalized && !providerOverride) {
+    displayedScore = null;
+    displayedClassification = "Scan Pending";
+    displayedState = "pending-provider";
+  }
 
   const scoreAudit = buildScoreAudit({
     scoring,
@@ -733,6 +874,11 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     finalScore,
     finalClassification
   });
+  scoreAudit.scanFinalized = scanFinalized;
+  scoreAudit.displayedScoreWithheld = !scanFinalized && !providerOverride;
+  scoreAudit.computedSafetyScore = finalScore;
+  scoreAudit.computedClassification = finalClassification;
+  scoreAudit.pendingProviders = providerCompletion.pendingProviders;
   const finalInterceptionRecommended =
     providerOverride === true ||
     finalClassification === "High Risk" ||
@@ -783,15 +929,20 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     candidateDomainCount: normalizedCandidateContext.candidateDomainCount,
     selectedNormalizedTarget: normalizedCandidateContext.selectedNormalizedTarget,
     candidateContext: normalizedCandidateContext,
-    classification: finalClassification,
-    safetyScore: finalScore,
+    classification: displayedClassification,
+    safetyScore: displayedScore,
+    computedClassification: finalClassification,
+    computedSafetyScore: finalScore,
+    scanFinalized,
+    providerCompletion,
+    pendingProviders: providerCompletion.pendingProviders,
     ruleScore: scoring.score,
     totalDeduction: scoring.totalDeduction,
     categoryDeductions: scoring.categoryDeductions,
     verificationState,
     verificationOnlyUnknown,
     concreteRiskSignals,
-    interceptionRecommended: finalInterceptionRecommended,
+    interceptionRecommended: providerOverride === true ? true : (scanFinalized ? finalInterceptionRecommended : false),
     features: finalFeatures,
     deductions: scoring.deductions,
     scoreAudit,
@@ -820,13 +971,18 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         currentPostTextHash,
         candidateContext: normalizedCandidateContext,
         features: finalFeatures,
-        classification: finalClassification,
-        safetyScore: finalScore,
+        classification: displayedClassification,
+        safetyScore: displayedScore,
+        computedClassification: finalClassification,
+        computedSafetyScore: finalScore,
+        scanFinalized,
+        providerCompletion,
+        pendingProviders: providerCompletion.pendingProviders,
         scoreAudit,
         providerOverride,
         nonWebProtocolDetected: Boolean(endpointResult.nonWebProtocolDetected),
         nonWebProtocol: endpointResult.nonWebProtocol || "",
-        interceptionRecommended: finalInterceptionRecommended,
+        interceptionRecommended: providerOverride === true ? true : (scanFinalized ? finalInterceptionRecommended : false),
         deductions: scoring.deductions
       },
       providerResults
@@ -841,7 +997,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     candidateUrlCompleteness: normalizedCandidateContext.candidateUrlCompleteness || "",
     candidateIsDomainOnlyFallback: normalizedCandidateContext.candidateIsDomainOnlyFallback === true,
     lastChecked: Date.now(),
-    state: nextState
+    state: displayedState
   };
 
   if (!record.postIdentityStable) {
@@ -881,16 +1037,21 @@ if (providerFlaggedDomain) {
       originalUrl: normalizedUrl,
       domain,
       urlHash: currentHash,
-      safetyScore: finalScore,
+      safetyScore: displayedScore,
       ruleScore: scoring.score,
       totalDeduction: scoring.totalDeduction,
       categoryDeductions: scoring.categoryDeductions,
       scoreAudit,
-      classification: finalClassification,
+      classification: displayedClassification,
+      computedClassification: finalClassification,
+      computedSafetyScore: finalScore,
+      scanFinalized,
+      providerCompletion,
+      pendingProviders: providerCompletion.pendingProviders,
       verificationState,
       verificationOnlyUnknown,
       concreteRiskSignals,
-      interceptionRecommended: finalInterceptionRecommended,
+      interceptionRecommended: providerOverride === true ? true : (scanFinalized ? finalInterceptionRecommended : false),
       features: finalFeatures,
       providerResults,
       endpointResult,
@@ -898,7 +1059,7 @@ if (providerFlaggedDomain) {
       providerCheckedUrl: reusableUrlAnalysis.providerCheckedUrl || "",
       limitations: record.limitations,
       providerOverride,
-      state: nextState
+      state: displayedState
     });
   }
 
@@ -1424,6 +1585,81 @@ function normalizeProviderResults(providerResults) {
   return [gsb, urlhaus, virustotal];
 }
 
+function getProviderStatus(provider = {}) {
+  return String(provider?.details?.status || "").toLowerCase();
+}
+
+function isProviderConfiguredOrActive(provider = {}) {
+  const status = getProviderStatus(provider);
+
+  return Boolean(
+    provider?.configured === true ||
+    provider?.checked === true ||
+    provider?.flagged === true ||
+    [
+      "pending",
+      "checked",
+      "completed",
+      "not-configured",
+      "skipped",
+      "unsupported_protocol",
+      "rate-limited",
+      "timeout",
+      "error",
+      "parse-error"
+    ].includes(status)
+  );
+}
+
+function isProviderPending(provider = {}) {
+  return getProviderStatus(provider) === "pending";
+}
+
+function isProviderTerminal(provider = {}) {
+  const status = getProviderStatus(provider);
+
+  return Boolean(
+    provider?.flagged === true ||
+    provider?.checked === true ||
+    status === "checked" ||
+    status === "completed" ||
+    status === "not-configured" ||
+    status === "skipped" ||
+    status === "unsupported_protocol" ||
+    status === "rate-limited" ||
+    status === "timeout" ||
+    status === "error" ||
+    status === "parse-error"
+  );
+}
+
+function buildProviderCompletionState(providerResults = []) {
+  const providers = normalizeProviderResults(providerResults);
+  const activeProviders = providers.filter(isProviderConfiguredOrActive);
+  const pendingProviders = activeProviders.filter(isProviderPending);
+  const incompleteProviders = activeProviders.filter((provider) => !isProviderTerminal(provider));
+
+  return {
+    providerStates: activeProviders.map((provider) => ({
+      provider: provider.provider || "unknown",
+      status: getProviderStatus(provider) || (provider.checked ? "checked" : "unknown"),
+      checked: provider.checked === true,
+      flagged: provider.flagged === true,
+      checkedUrl: provider.checkedUrl || "",
+      checkedAt: provider.checkedAt || "",
+      terminal: isProviderTerminal(provider),
+      pending: isProviderPending(provider)
+    })),
+    pendingProviders: pendingProviders.map((provider) => provider.provider || "unknown"),
+    incompleteProviders: incompleteProviders.map((provider) => provider.provider || "unknown"),
+    hasPendingProvider: pendingProviders.length > 0,
+    allRequiredProvidersTerminal: incompleteProviders.length === 0 && pendingProviders.length === 0,
+    activeProviderCount: activeProviders.length,
+    checkedProviderCount: activeProviders.filter((provider) => provider.checked || provider.flagged).length,
+    pendingProviderCount: pendingProviders.length
+  };
+}
+
 function getNormalizedProviderResult(providerResults, providerName) {
   return normalizeProviderResults(providerResults).find((item) => item.provider === providerName) || createDefaultProviderResult(providerName, "");
 }
@@ -1540,6 +1776,7 @@ const KNOWN_CAMPAIGN_REDIRECT_SOURCE_DOMAINS = new Set([
 
   // Telecom / commerce campaign domains
   "dito.ph",
+  "smrt.ph",
   "coca-cola.com",
 
   // Google-owned redirect/share shortener
@@ -1588,7 +1825,31 @@ const TRUSTED_REDIRECT_DESTINATION_DOMAINS = new Set([
   // Major commerce/payment platforms, still only trusted if providers are clean
   "shopee.ph",
   "lazada.com.ph",
-  "amazon.com"
+  "amazon.com",
+  "securitybank.com",
+  "smart.com.ph"
+]);
+
+const KNOWN_BRANDED_ALIAS_REDIRECTS = [
+  {
+    sourceDomain: "smrt.ph",
+    allowedFinalDomains: ["smart.com.ph"],
+    label: "Smart branded shortlink"
+  }
+];
+
+const CLEAN_MARKETING_FINAL_DOMAINS = new Set([
+  "securitybank.com",
+  "smart.com.ph",
+  "bsp.gov.ph",
+  "dito.ph",
+  "globe.com.ph",
+  "pldt.com",
+  "bpi.com.ph",
+  "bdo.com.ph",
+  "unionbankph.com",
+  "gcash.com",
+  "maya.ph"
 ]);
 
 function applyTrustedRedirectDestinationMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}) {
@@ -1993,6 +2254,109 @@ function applyKnownGoogleFormsRedirectMitigation(features = {}, reusableUrlAnaly
   };
 }
 
+function applyKnownBrandAliasRedirectMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}, providerResults = []) {
+  const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
+  const finalUrl = endpointResult?.effectiveEndpoint || reusableUrlAnalysis.analysisUrl || "";
+  const alias = getKnownBrandAliasRedirect({
+    endpointResult,
+    redirectAnalysis: reusableUrlAnalysis.redirectAnalysis,
+    finalDomain
+  });
+  const eligible = Boolean(
+    alias &&
+    isCleanHighConfidenceResolvedEndpoint({
+      features,
+      endpointResult,
+      providerResults,
+      finalUrl,
+      finalDomain
+    }) &&
+    !features.suspiciousTld &&
+    !features.usernamePasswordTrick &&
+    !features.integrityHashMismatch &&
+    !features.rawIpHost &&
+    !features.suspiciousFileExtension
+  );
+
+  if (!eligible) {
+    return features;
+  }
+
+  return {
+    ...features,
+    suspiciousRedirectPattern: false,
+    shortenerToUnrelatedDomain: false,
+    trackingHopToUnrelatedDomain: false,
+    crossDomainRedirectChain: false,
+    redirectChainToDifferentRegistrantLikeTarget: false,
+    wrapperToExternalDestination: false,
+    textMismatch: false,
+    obfuscatedUrl: false,
+    excessiveQueryComplexity: false,
+    suspiciousPath: false,
+    trustedEndpoint: true,
+    trustedEndpointMitigationEligible: true,
+    knownBrandAliasRedirect: true,
+    knownBrandAliasSourceDomain: alias.sourceDomain,
+    knownBrandAliasFinalDomain: finalDomain,
+    knownBrandAliasLabel: alias.label || "configured branded alias relationship"
+  };
+}
+
+function applyCleanResolvedMarketingLinkMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}, providerResults = []) {
+  const finalUrl = endpointResult?.effectiveEndpoint || reusableUrlAnalysis.analysisUrl || "";
+  const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || safeHostname(finalUrl) || reusableUrlAnalysis.domain || "");
+  const redirectLike = Boolean(
+    features.shortenedUrl ||
+    features.wrapperToExternalDestination ||
+    features.facebookWrapperUnwrapped ||
+    features.crossDomainRedirectChain ||
+    features.shortenerToUnrelatedDomain ||
+    features.trackingHopToUnrelatedDomain ||
+    features.suspiciousRedirectPattern ||
+    Number(features.redirectCount || 0) > 0
+  );
+  const eligible = Boolean(
+    redirectLike &&
+    CLEAN_MARKETING_FINAL_DOMAINS.has(finalDomain) &&
+    isCleanHighConfidenceResolvedEndpoint({
+      features,
+      endpointResult,
+      providerResults,
+      finalUrl,
+      finalDomain
+    }) &&
+    !features.suspiciousTld &&
+    !features.usernamePasswordTrick &&
+    !features.integrityHashMismatch &&
+    !features.rawIpHost &&
+    !features.suspiciousFileExtension &&
+    !hasSevereObfuscationSignal(features)
+  );
+
+  if (!eligible) {
+    return features;
+  }
+
+  return {
+    ...features,
+    suspiciousRedirectPattern: false,
+    shortenerToUnrelatedDomain: false,
+    trackingHopToUnrelatedDomain: false,
+    crossDomainRedirectChain: false,
+    redirectChainToDifferentRegistrantLikeTarget: false,
+    wrapperToExternalDestination: false,
+    textMismatch: false,
+    obfuscatedUrl: false,
+    excessiveQueryComplexity: false,
+    suspiciousPath: false,
+    trustedEndpoint: true,
+    trustedEndpointMitigationEligible: true,
+    cleanResolvedMarketingLink: true,
+    cleanResolvedMarketingFinalDomain: finalDomain
+  };
+}
+
 function isKnownGoogleFormsFinalEndpoint(finalUrl = "", finalDomain = "") {
   const domain = getRegistrableDomain(finalDomain || safeHostname(finalUrl));
   const text = String(finalUrl || "").toLowerCase();
@@ -2076,6 +2440,67 @@ function sumTriggeredMitigationCredits(deductions = []) {
 
 function formatScoreAuditClassification(classification) {
   return String(classification || "Unknown").trim() || "Unknown";
+}
+
+function toFiniteScoreOrNull(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function isFinalClassificationLabel(label = "") {
+  const value = String(label || "").trim().toLowerCase();
+  return value === "safe" || value === "suspicious" || value === "high risk" || value === "unverified";
+}
+
+function isPendingClassificationLabel(label = "") {
+  const value = String(label || "").trim().toLowerCase();
+  return value === "pending" || value === "scan pending";
+}
+
+function getBestStoredComputedScore(analysis = {}) {
+  const scoreWasWithheld = Boolean(
+    isPendingClassificationLabel(analysis.classification) ||
+    analysis.scanFinalized === false ||
+    analysis.scoreAudit?.displayedScoreWithheld === true
+  );
+  const candidates = [
+    analysis.computedSafetyScore,
+    analysis.scoreAudit?.computedSafetyScore,
+    scoreWasWithheld ? null : analysis.scoreAudit?.finalScore,
+    analysis.scoreAudit?.ruleScore,
+    scoreWasWithheld ? null : analysis.safetyScore
+  ];
+
+  for (const candidate of candidates) {
+    const value = toFiniteScoreOrNull(candidate);
+    if (value !== null) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function getBestStoredComputedClassification(analysis = {}, score = null) {
+  const candidates = [
+    analysis.computedClassification,
+    analysis.scoreAudit?.computedClassification,
+    analysis.scoreAudit?.classification,
+    analysis.classification
+  ];
+
+  for (const candidate of candidates) {
+    if (isFinalClassificationLabel(candidate)) {
+      return String(candidate);
+    }
+  }
+
+  const numericScore = toFiniteScoreOrNull(score);
+  return numericScore !== null ? classifySafetyScore(numericScore) : "Unverified";
 }
 
 function buildScoreAudit({
@@ -2176,8 +2601,12 @@ function refreshScoreAuditForProviderResult(analysis = {}, {
   const previousAudit = analysis.scoreAudit && typeof analysis.scoreAudit === "object"
     ? analysis.scoreAudit
     : {};
-  const previousScore = Number(analysis.safetyScore);
-  const refreshedScore = Number(safetyScore);
+  const previousScore = toFiniteScoreOrNull(
+    analysis.safetyScore ??
+    analysis.computedSafetyScore ??
+    analysis.scoreAudit?.finalScore
+  );
+  const refreshedScore = toFiniteScoreOrNull(safetyScore);
 
   return {
     ...previousAudit,
@@ -2185,18 +2614,134 @@ function refreshScoreAuditForProviderResult(analysis = {}, {
       ...(previousAudit.providerOverrideCap || {}),
       applied: Boolean(
         providerOverride &&
-        Number.isFinite(previousScore) &&
-        Number.isFinite(refreshedScore) &&
+        previousScore !== null &&
+        refreshedScore !== null &&
         refreshedScore < previousScore
       ),
       providerOverride: providerOverride === true,
       cap: 20,
-      beforeScore: Number.isFinite(previousScore) ? previousScore : (previousAudit.providerOverrideCap?.beforeScore ?? null),
-      afterScore: Number.isFinite(refreshedScore) ? refreshedScore : (previousAudit.providerOverrideCap?.afterScore ?? null)
+      beforeScore: previousScore !== null ? previousScore : (previousAudit.providerOverrideCap?.beforeScore ?? null),
+      afterScore: refreshedScore !== null ? refreshedScore : (previousAudit.providerOverrideCap?.afterScore ?? null)
     },
-    finalScore: Number.isFinite(refreshedScore) ? refreshedScore : (previousAudit.finalScore ?? null),
-    classification: formatScoreAuditClassification(classification)
+    finalScore: refreshedScore !== null ? refreshedScore : (previousAudit.finalScore ?? null),
+    classification: formatScoreAuditClassification(
+      isFinalClassificationLabel(classification)
+        ? classification
+        : getBestStoredComputedClassification(analysis, refreshedScore)
+    )
   };
+}
+
+function recomputeStoredFinalScoreFromFeatures(analysis = {}, features = {}, providerOverride = false) {
+  if (!features || typeof features !== "object" || Object.keys(features).length === 0) {
+    return null;
+  }
+
+  const scoring = calculateSafetyScore(features);
+  const providerCapBeforeScore = scoring.score;
+  const providerCapAfterScore = providerOverride
+    ? Math.min(providerCapBeforeScore, 20)
+    : providerCapBeforeScore;
+  let finalScore = providerCapAfterScore;
+  const verificationState = String(analysis.verificationState || "").toLowerCase();
+  const concreteRiskSignals = Boolean(
+    providerOverride ||
+    features.googleSafeBrowsingFlagged ||
+    features.urlhausFlagged ||
+    features.virusTotalFlagged ||
+    features.integrityHashMismatch ||
+    features.usernamePasswordTrick ||
+    features.suspiciousRedirectPattern ||
+    features.shortenerToUnrelatedDomain ||
+    features.trackingHopToUnrelatedDomain ||
+    features.crossDomainRedirectChain ||
+    features.textMismatch ||
+    features.suspiciousTld ||
+    features.suspiciousPath ||
+    features.obfuscatedUrl
+  );
+  let verificationCapReason = "";
+  const verificationCapBeforeScore = finalScore;
+
+  if (!providerOverride && concreteRiskSignals && verificationState === "unverified") {
+    finalScore = Math.min(finalScore, 74);
+    if (finalScore < verificationCapBeforeScore) {
+      verificationCapReason = "unverified endpoint with concrete risk signals";
+    }
+  } else if (!providerOverride && concreteRiskSignals && verificationState === "low-confidence") {
+    finalScore = Math.min(finalScore, 79);
+    if (finalScore < verificationCapBeforeScore) {
+      verificationCapReason = "low-confidence endpoint with concrete risk signals";
+    }
+  }
+
+  const verificationCapAfterScore = finalScore;
+  const softCapBeforeScore = finalScore;
+  const softCapAfterScore = applySoftUncertaintyCap(finalScore, {
+    features,
+    endpointResult: analysis.endpointResult || {},
+    domain: analysis.domain || analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
+    providerOverride
+  });
+  const softUncertaintyCapApplied = Number(softCapAfterScore) !== Number(finalScore);
+  finalScore = softCapAfterScore;
+  const finalFeatures = softUncertaintyCapApplied
+    ? {
+        ...features,
+        softUncertaintyCapApplied: true
+      }
+    : features;
+  const finalClassification = providerOverride
+    ? "High Risk"
+    : analysis.verificationOnlyUnknown === true
+      ? "Unverified"
+      : classifySafetyScore(finalScore);
+  const scoreAudit = buildScoreAudit({
+    scoring,
+    providerOverride,
+    providerCapBeforeScore,
+    providerCapAfterScore,
+    verificationState,
+    verificationCapReason,
+    verificationCapBeforeScore,
+    verificationCapAfterScore,
+    softUncertaintyCapApplied,
+    softCapBeforeScore,
+    softCapAfterScore,
+    demoScoreBias: analysis.scoreAudit?.demoScoreBias || {},
+    demoBiasBeforeScore: analysis.scoreAudit?.demoScoreBias?.beforeScore,
+    demoBiasAfterScore: analysis.scoreAudit?.demoScoreBias?.afterScore,
+    finalScore,
+    finalClassification
+  });
+
+  return {
+    scoring,
+    features: finalFeatures,
+    finalScore,
+    finalClassification,
+    scoreAudit,
+    concreteRiskSignals
+  };
+}
+
+function deriveConcreteRiskSignalsFromFeatures(features = {}, providerOverride = false) {
+  return Boolean(
+    providerOverride ||
+    features.googleSafeBrowsingFlagged ||
+    features.urlhausFlagged ||
+    features.virusTotalFlagged ||
+    features.integrityHashMismatch ||
+    features.usernamePasswordTrick ||
+    features.suspiciousRedirectPattern ||
+    features.shortenerToUnrelatedDomain ||
+    features.trackingHopToUnrelatedDomain ||
+    features.crossDomainRedirectChain ||
+    features.textMismatch ||
+    features.suspiciousTld ||
+    features.suspiciousPath ||
+    features.obfuscatedUrl
+  );
 }
 
 function isKnownBrandedCampaignRedirect({ endpointResult = {}, redirectAnalysis = {}, finalDomain = "", finalUrl = "" } = {}) {
@@ -2231,6 +2776,85 @@ function isKnownBrandedCampaignRedirect({ endpointResult = {}, redirectAnalysis 
   }
 
   return false;
+}
+
+function getKnownBrandAliasRedirect({ endpointResult = {}, redirectAnalysis = {}, finalDomain = "" } = {}) {
+  const rawChain =
+    Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
+      ? endpointResult.resolutionChain
+      : Array.isArray(redirectAnalysis?.redirectChain)
+        ? redirectAnalysis.redirectChain
+        : [];
+  const sourceDomain = getRedirectSourceDomain(rawChain);
+  const normalizedFinalDomain = getRegistrableDomain(finalDomain);
+
+  return KNOWN_BRANDED_ALIAS_REDIRECTS.find((rule) => (
+    sourceDomain === rule.sourceDomain &&
+    rule.allowedFinalDomains.includes(normalizedFinalDomain)
+  )) || null;
+}
+
+function isCleanHighConfidenceResolvedEndpoint({
+  features = {},
+  endpointResult = {},
+  providerResults = [],
+  finalUrl = "",
+  finalDomain = ""
+} = {}) {
+  const confidence = String(endpointResult?.endpointConfidence || "").toLowerCase();
+  const providerCheckedUrl = getPrimaryProviderCheckedUrl(providerResults);
+  const providerCheckedDomain = getRegistrableDomain(safeHostname(providerCheckedUrl));
+  const finalHost = safeHostname(finalUrl || endpointResult?.effectiveEndpoint || "");
+  const normalizedFinalDomain = getRegistrableDomain(finalDomain || finalHost);
+
+  return Boolean(
+    confidence === "high" &&
+    isHttpsUrl(finalUrl || endpointResult?.effectiveEndpoint) &&
+    normalizedFinalDomain &&
+    !isShortenerHost(finalHost) &&
+    providerCheckedDomain === normalizedFinalDomain &&
+    !features.googleSafeBrowsingFlagged &&
+    !features.urlhausFlagged &&
+    !features.virusTotalFlagged &&
+    areProvidersCleanForMarketingMitigation(providerResults)
+  );
+}
+
+function isHttpsUrl(rawUrl = "") {
+  try {
+    return new URL(String(rawUrl || "")).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function areProvidersCleanForMarketingMitigation(providerResults = []) {
+  const providers = normalizeProviderResults(providerResults);
+  const gsb = providers.find((item) => item.provider === "gsb");
+  const urlhaus = providers.find((item) => item.provider === "urlhaus");
+  const vt = providers.find((item) => item.provider === "virustotal");
+  const vtStatus = getProviderStatus(vt);
+  const vtMalicious = Number(vt?.details?.maliciousCount || 0);
+  const vtSuspicious = Number(vt?.details?.suspiciousCount || 0);
+
+  return Boolean(
+    gsb?.checked === true &&
+    gsb?.flagged !== true &&
+    urlhaus?.checked === true &&
+    urlhaus?.flagged !== true &&
+    (
+      vtStatus === "not-configured" ||
+      vtStatus === "skipped" ||
+      (
+        vt?.checked === true &&
+        vt?.flagged !== true &&
+        Number.isFinite(vtMalicious) &&
+        Number.isFinite(vtSuspicious) &&
+        vtMalicious === 0 &&
+        vtSuspicious === 0
+      )
+    )
+  );
 }
 
 function getKnownShortenerOwnerDomain(shortenerDomain) {
@@ -2628,6 +3252,14 @@ if (riskRelevantDisplayChain.length > 0) {
     details.push(`Endpoint confidence: ${endpointResult.endpointConfidence}.`);
   }
 
+  if (
+    endpointResult.isShortener &&
+    String(endpointResult.endpointConfidence || "").toLowerCase() === "low" &&
+    isShortenerHost(safeHostname(endpointResult.effectiveEndpoint || endpointResult.resolvedUrl || ""))
+  ) {
+    details.push("Shortener resolution was limited; DILI checked the available shortener URL but did not confirm it as the final website.");
+  }
+
   const nonWebProtocol =
     endpointResult.nonWebProtocol ||
     analysis.nonWebProtocol ||
@@ -2666,6 +3298,14 @@ if (riskRelevantDisplayChain.length > 0) {
     details.push("Known campaign redirect resolved to trusted destination.");
   }
 
+  if (finalFeatures.knownBrandAliasRedirect) {
+    details.push("The visible domain and final domain were treated as a configured branded alias relationship for mismatch scoring.");
+  }
+
+  if (finalFeatures.cleanResolvedMarketingLink) {
+    details.push("Clean provider results and a high-confidence resolved endpoint mitigated normal shortener, wrapper, and marketing tracking signals.");
+  }
+
   if (finalFeatures.trustedDestinationUnknownShortenerRedirect) {
     details.push("Redirect trust tier B: unknown shortener resolved to a trusted destination with clean providers.");
   }
@@ -2676,14 +3316,14 @@ if (riskRelevantDisplayChain.length > 0) {
 
   const providerFlagged = normalizeProviderResults(providerResults).some((provider) => provider?.flagged === true);
   if (analysis.interceptionRecommended === true) {
-    const score = Number(analysis.safetyScore);
+    const score = toFiniteScoreOrNull(analysis.safetyScore);
     if (providerFlagged || analysis.providerOverride === true) {
       details.push("Navigation pause reason: provider flagged this URL.");
     } else if (analysis.classification === "High Risk") {
       details.push("Navigation pause reason: High Risk classification.");
     } else if (analysis.classification === "Suspicious") {
       details.push("Navigation pause reason: Suspicious classification.");
-    } else if (Number.isFinite(score) && score < 80) {
+    } else if (score !== null && score < 80) {
       details.push("Navigation pause reason: final score below 80.");
     }
   }
@@ -2779,6 +3419,10 @@ for (const provider of normalizeProviderResults(providerResults)) {
   details.push(`${label} result: ${outcomeSummary}`);
   details.push(`${label} status: ${auditStatus}.`);
 
+  if (provider.provider === "virustotal" && provider.details?.reason === "retry_budget_exhausted") {
+    details.push("VirusTotal did not complete within the retry window.");
+  }
+
   if (provider.checkedAt) {
     details.push(`${label} checked at: ${provider.checkedAt}.`);
   }
@@ -2857,7 +3501,7 @@ function isVirusTotalResultDisplayRelevant(provider = {}) {
 }
 
 function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
-  const score = Number(analysis.safetyScore);
+  const score = toFiniteScoreOrNull(analysis.safetyScore);
   const classification = String(analysis.classification || "").toLowerCase();
   const providerResults = normalizeProviderResults(analysis.providerResults || []);
   const gsb = providerResults.find((item) => item.provider === "gsb");
@@ -2871,10 +3515,9 @@ function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
     return true;
   }
 
-  if (Number.isFinite(score) && score < 80) {
-    return true;
-  }
-
+if (score !== null && score < 80) {
+  return true;
+}
   return false;
 }
 
@@ -2924,6 +3567,11 @@ async function persistPostLevelAnalysis(postId, analysis) {
       baselineState: analysis.baselineState,
       normalizedVisiblePostText: analysis.normalizedVisiblePostText,
       safetyScore: analysis.safetyScore,
+      computedSafetyScore: analysis.computedSafetyScore,
+      computedClassification: analysis.computedClassification,
+      scanFinalized: analysis.scanFinalized,
+      providerCompletion: analysis.providerCompletion,
+      pendingProviders: analysis.pendingProviders,
       scoreAudit: analysis.scoreAudit,
       classification: analysis.classification,
       analyzedLinkCount: analysis.analyzedLinkCount,
@@ -2932,6 +3580,9 @@ async function persistPostLevelAnalysis(postId, analysis) {
       lowestScoringLinkDomain: analysis.lowestScoringLinkDomain,
       lowestScoringLinkUrl: analysis.lowestScoringLinkUrl,
       linkScoreSummary: analysis.linkScoreSummary,
+      linkAnalysisSnapshots: analysis.linkAnalysisSnapshots,
+      pendingLinkRefreshTargets: analysis.pendingLinkRefreshTargets,
+      pendingProviderRefreshTarget: analysis.pendingProviderRefreshTarget,
       features: analysis.features,
       providerResults: analysis.providerResults,
       endpointResult: analysis.endpointResult,
@@ -4147,6 +4798,211 @@ async function requestUrlhausLookup(normalizedUrl, { authKey = "", timeoutMs = 4
   }
 }
 
+function selectPendingProviderRefreshTarget(storedAnalysis = {}, message = {}) {
+  const candidates = [
+    storedAnalysis.pendingProviderRefreshTarget,
+    ...(Array.isArray(storedAnalysis.pendingLinkRefreshTargets) ? storedAnalysis.pendingLinkRefreshTargets : []),
+    ...(Array.isArray(storedAnalysis.linkAnalysisSnapshots) ? storedAnalysis.linkAnalysisSnapshots : [])
+  ].filter(Boolean);
+
+  const messageIndex = Number.isInteger(message.pendingLinkIndex)
+    ? message.pendingLinkIndex
+    : null;
+
+  if (messageIndex !== null) {
+    const byIndex = candidates.find((candidate) => candidate.index === messageIndex);
+    if (byIndex) {
+      return byIndex;
+    }
+  }
+
+  if (message.providerCheckedUrl) {
+    const byCheckedUrl = candidates.find((candidate) => candidate.providerCheckedUrl === message.providerCheckedUrl);
+    if (byCheckedUrl) {
+      return byCheckedUrl;
+    }
+  }
+
+  return candidates.find((candidate) => {
+    const vt = getNormalizedProviderResult(candidate.providerResults || [], "virustotal");
+    const status = String(vt?.details?.status || candidate.status || "").toLowerCase();
+
+    return (
+      isAnalysisPendingLike(candidate) ||
+      status === "pending" ||
+      status === "timeout" ||
+      status === "rate-limited"
+    );
+  }) || null;
+}
+
+function hasLegacyPendingChildWithoutRefreshMetadata(storedAnalysis = {}) {
+  const hasSnapshots = Array.isArray(storedAnalysis.linkAnalysisSnapshots) && storedAnalysis.linkAnalysisSnapshots.length > 0;
+  const summary = Array.isArray(storedAnalysis.linkScoreSummary) ? storedAnalysis.linkScoreSummary : [];
+
+  return Boolean(
+    !hasSnapshots &&
+    summary.some((item) => (
+      isPendingClassificationLabel(item?.classification) ||
+      item?.scanFinalized === false ||
+      item?.providerCompletion?.hasPendingProvider === true ||
+      (Array.isArray(item?.pendingProviders) && item.pendingProviders.length > 0)
+    ))
+  );
+}
+
+function replaceStoredLinkAnalysisSnapshot(linkAnalyses = [], updatedChild = {}) {
+  const updatedIndex = Number(updatedChild.index);
+  const updatedUrl = normalizeCacheKey(updatedChild.analysisUrl || updatedChild.normalizedUrl);
+
+  return (Array.isArray(linkAnalyses) ? linkAnalyses : []).map((item) => {
+    const itemIndex = Number(item.index);
+    const itemUrl = normalizeCacheKey(item.analysisUrl || item.normalizedUrl);
+    if (
+      (Number.isFinite(updatedIndex) && updatedIndex > 0 && itemIndex === updatedIndex) ||
+      (updatedUrl && itemUrl === updatedUrl)
+    ) {
+      return updatedChild;
+    }
+
+    return item;
+  });
+}
+
+function buildLinkScoreSummaryFromSnapshots(linkAnalyses = []) {
+  return (Array.isArray(linkAnalyses) ? linkAnalyses : []).map((item, index) => ({
+    index: item.index || index + 1,
+    url: item.analysisUrl || item.normalizedUrl || item.url || "",
+    domain: item.domain || item.endpointResult?.effectiveDomain || item.urlFeatureAnalysis?.finalDomain || "",
+    safetyScore: item.safetyScore,
+    computedSafetyScore: item.computedSafetyScore,
+    classification: item.classification,
+    computedClassification: item.computedClassification,
+    scanFinalized: item.scanFinalized,
+    providerOverride: item.providerOverride,
+    providerCompletion: item.providerCompletion,
+    pendingProviders: item.pendingProviders
+  })).slice(0, 8);
+}
+
+function aggregatePostAnalysisFromLinkSnapshots(storedAnalysis = {}, linkAnalyses = []) {
+  const snapshots = (Array.isArray(linkAnalyses) ? linkAnalyses : []).map((item, index) => ({
+    ...item,
+    index: item.index || index + 1
+  }));
+  const linkScoreSummary = buildLinkScoreSummaryFromSnapshots(snapshots);
+  const pendingChildren = snapshots.filter(isStoredLinkAnalysisPending);
+  const providerOverrideChildren = snapshots.filter((item) => item.providerOverride === true);
+  const pendingLinkRefreshTargets = buildPendingLinkRefreshTargets(snapshots);
+  const selectable = providerOverrideChildren.length > 0
+    ? providerOverrideChildren
+    : snapshots.filter((item) => !isStoredLinkAnalysisPending(item));
+  const selected = selectable
+    .map((item) => ({
+      item,
+      score: toFiniteScoreOrNull(item.safetyScore) ?? toFiniteScoreOrNull(item.computedSafetyScore) ?? 101
+    }))
+    .sort((left, right) => left.score - right.score)[0]?.item || snapshots[0] || {};
+  const aggregated = {
+    ...storedAnalysis,
+    ...selected,
+    analyzedLinkCount: snapshots.length || storedAnalysis.analyzedLinkCount,
+    multiLinkPost: snapshots.length > 1 || storedAnalysis.multiLinkPost === true,
+    linkAnalysisSnapshots: snapshots,
+    linkScoreSummary,
+    pendingLinkRefreshTargets,
+    pendingProviderRefreshTarget: pendingLinkRefreshTargets[0] || null,
+    lowestScoringLinkUrl: selected.analysisUrl || selected.normalizedUrl || "",
+    lowestScoringLinkDomain: selected.domain || selected.endpointResult?.effectiveDomain || selected.urlFeatureAnalysis?.finalDomain || ""
+  };
+
+  if (providerOverrideChildren.length > 0) {
+    aggregated.classification = selected.classification || "High Risk";
+    aggregated.safetyScore = selected.safetyScore;
+    aggregated.computedClassification = selected.computedClassification || selected.classification || "High Risk";
+    aggregated.computedSafetyScore = selected.computedSafetyScore;
+    aggregated.providerOverride = true;
+    aggregated.scanFinalized = true;
+    aggregated.providerPending = false;
+    aggregated.state = selected.state === "pending-provider" ? "monitored" : (selected.state || "monitored");
+    aggregated.interceptionRecommended = true;
+    aggregated.pendingProviders = [];
+    aggregated.providerCompletion = {
+      ...(selected.providerCompletion || {}),
+      hasPendingProvider: false,
+      allRequiredProvidersTerminal: true,
+      pendingProviders: []
+    };
+    return aggregated;
+  }
+
+  if (pendingChildren.length > 0) {
+    const pendingProviders = [
+      ...new Set(pendingChildren.flatMap((item) => (
+        Array.isArray(item.pendingProviders)
+          ? item.pendingProviders
+          : Array.isArray(item.providerCompletion?.pendingProviders)
+            ? item.providerCompletion.pendingProviders
+            : []
+      )))
+    ];
+
+    aggregated.classification = "Scan Pending";
+    aggregated.safetyScore = null;
+    aggregated.scanFinalized = false;
+    aggregated.providerPending = true;
+    aggregated.state = "pending-provider";
+    aggregated.interceptionRecommended = false;
+    aggregated.pendingProviders = pendingProviders;
+    aggregated.providerCompletion = {
+      ...(aggregated.providerCompletion || {}),
+      hasPendingProvider: true,
+      allRequiredProvidersTerminal: false,
+      pendingProviders
+    };
+    return aggregated;
+  }
+
+  aggregated.scanFinalized = true;
+  aggregated.state = aggregated.state === "pending-provider" ? "monitored" : (aggregated.state || "monitored");
+  aggregated.pendingProviders = [];
+  aggregated.providerCompletion = {
+    ...(aggregated.providerCompletion || {}),
+    hasPendingProvider: false,
+    allRequiredProvidersTerminal: true,
+    pendingProviders: []
+  };
+
+  return aggregated;
+}
+
+function reAggregateStoredMultiLinkAnalysis(storedAnalysis = {}, updatedChild = {}) {
+  const snapshots = Array.isArray(storedAnalysis.linkAnalysisSnapshots)
+    ? storedAnalysis.linkAnalysisSnapshots.slice()
+    : [];
+
+  if (snapshots.length === 0) {
+    return {
+      ...storedAnalysis,
+      ...updatedChild
+    };
+  }
+
+  const childIndex = Number.isInteger(updatedChild.index) ? updatedChild.index : null;
+  const updatedSnapshots = snapshots.map((snapshot) => {
+    if (childIndex !== null && snapshot.index === childIndex) {
+      return {
+        ...snapshot,
+        ...updatedChild
+      };
+    }
+
+    return snapshot;
+  });
+
+  return aggregatePostAnalysisFromLinkSnapshots(storedAnalysis, updatedSnapshots);
+}
+
 async function refreshVirusTotalResultForPost(message = {}) {
   const postId = String(message.postId || "").trim();
   if (!postId) {
@@ -4166,7 +5022,30 @@ async function refreshVirusTotalResultForPost(message = {}) {
     };
   }
 
-  const providerResults = normalizeProviderResults(storedAnalysis.providerResults || []);
+  if (hasLegacyPendingChildWithoutRefreshMetadata(storedAnalysis)) {
+    const legacyAnalysis = {
+      ...storedAnalysis,
+      classification: "Scan Pending",
+      safetyScore: null,
+      scanFinalized: false,
+      state: "pending-provider",
+      interceptionRecommended: false,
+      limitations: [
+        ...(storedAnalysis.limitations || []),
+        "Pending child-link refresh metadata was unavailable for this older analysis record; a manual rescan may be needed."
+      ].slice(0, 8)
+    };
+    const persistedLegacyAnalysis = await persistPostLevelAnalysis(postId, legacyAnalysis);
+    return {
+      type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
+      analysis: persistedLegacyAnalysis,
+      refreshed: false,
+      reason: "missing-pending-child-refresh-metadata"
+    };
+  }
+
+  const refreshTarget = selectPendingProviderRefreshTarget(storedAnalysis, message) || storedAnalysis;
+  const providerResults = normalizeProviderResults(refreshTarget.providerResults || []);
   const existingVt = providerResults.find((item) => item.provider === "virustotal");
   const vtStatus = String(existingVt?.details?.status || "").toLowerCase();
 
@@ -4179,12 +5058,16 @@ async function refreshVirusTotalResultForPost(message = {}) {
   }
 
   const providerCheckedUrl =
-    existingVt?.checkedUrl ||
     message.providerCheckedUrl ||
+    refreshTarget.providerCheckedUrl ||
+    refreshTarget.analysisUrl ||
+    refreshTarget.url ||
+    storedAnalysis.providerCheckedUrl ||
     storedAnalysis.analysisUrl ||
     storedAnalysis.normalizedUrl ||
     message.analysisUrl ||
     message.normalizedUrl ||
+    existingVt?.checkedUrl ||
     "";
 
   if (!providerCheckedUrl) {
@@ -4203,9 +5086,17 @@ async function refreshVirusTotalResultForPost(message = {}) {
   const updatedProviderResults = providerResults.map((provider) => (
     provider.provider === "virustotal" ? refreshedVt : provider
   ));
-  const updatedAnalysis = buildVirusTotalRefreshedAnalysis(storedAnalysis, updatedProviderResults);
+  const refreshedTargetAnalysis = buildVirusTotalRefreshedAnalysis(refreshTarget, updatedProviderResults);
+  const refreshedChild = {
+    ...refreshTarget,
+    ...refreshedTargetAnalysis,
+    index: refreshTarget.index
+  };
+  const updatedAnalysis = Array.isArray(storedAnalysis.linkAnalysisSnapshots) && storedAnalysis.linkAnalysisSnapshots.length > 0 && refreshTarget !== storedAnalysis
+    ? reAggregateStoredMultiLinkAnalysis(storedAnalysis, refreshedChild)
+    : buildVirusTotalRefreshedAnalysis(storedAnalysis, updatedProviderResults);
   replaceVirusTotalInUrlAnalysisCache({
-    analysis: updatedAnalysis,
+    analysis: refreshTarget !== storedAnalysis ? refreshedTargetAnalysis : updatedAnalysis,
     providerResult: refreshedVt,
     checkedUrl: providerCheckedUrl
   });
@@ -4226,7 +5117,137 @@ async function refreshVirusTotalResultForPost(message = {}) {
     type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
     analysis: persistedAnalysis,
     refreshed: true,
-    reason: refreshedVt.flagged ? "virustotal-flagged" : String(refreshedVt.details?.status || "virustotal-refreshed")
+    reason: refreshedVt.flagged ? "virustotal-flagged" : String(refreshedVt.details?.status || "virustotal-refreshed"),
+    providerRefreshStatus: String(refreshedVt.details?.status || ""),
+    providerRefreshCheckedAt: refreshedVt.checkedAt || "",
+    providerRefreshReason: refreshedVt.details?.reason || ""
+  };
+}
+
+async function finalizePendingProviderStateForPost(message = {}) {
+  const postId = String(message.postId || "").trim();
+  if (!postId) {
+    return {
+      type: MESSAGE_TYPES.FINALIZE_PENDING_PROVIDER_STATE,
+      finalized: false,
+      reason: "missing-post-id"
+    };
+  }
+
+  const storedAnalysis = await getBaseline(postId);
+  if (!storedAnalysis) {
+    return {
+      type: MESSAGE_TYPES.FINALIZE_PENDING_PROVIDER_STATE,
+      finalized: false,
+      reason: "missing-stored-analysis"
+    };
+  }
+
+  if (hasLegacyPendingChildWithoutRefreshMetadata(storedAnalysis)) {
+    const legacyAnalysis = {
+      ...storedAnalysis,
+      classification: "Scan Pending",
+      safetyScore: null,
+      scanFinalized: false,
+      state: "pending-provider",
+      interceptionRecommended: false,
+      limitations: [
+        ...(storedAnalysis.limitations || []),
+        "Pending child-link refresh metadata was unavailable for this older analysis record; a manual rescan may be needed."
+      ].slice(0, 8)
+    };
+    const persistedLegacyAnalysis = await persistPostLevelAnalysis(postId, legacyAnalysis);
+    return {
+      type: MESSAGE_TYPES.FINALIZE_PENDING_PROVIDER_STATE,
+      analysis: persistedLegacyAnalysis,
+      finalized: false,
+      reason: "missing-pending-child-refresh-metadata"
+    };
+  }
+
+  const childTarget = selectPendingProviderRefreshTarget(storedAnalysis, message);
+  const finalizeSource = childTarget || storedAnalysis;
+  const providerResults = normalizeProviderResults(finalizeSource.providerResults || []);
+  const existingVt = providerResults.find((item) => item.provider === "virustotal");
+  const vtStatus = String(existingVt?.details?.status || "").toLowerCase();
+
+  if (vtStatus !== "pending") {
+    const alreadyFinalChildAnalysis = buildVirusTotalRefreshedAnalysis(finalizeSource, providerResults);
+    const alreadyFinalAnalysis = childTarget
+      ? aggregatePostAnalysisFromLinkSnapshots(
+          storedAnalysis,
+          replaceStoredLinkAnalysisSnapshot(
+            storedAnalysis.linkAnalysisSnapshots,
+          buildStoredLinkAnalysisSnapshot(alreadyFinalChildAnalysis, Number(childTarget.index || 1))
+          )
+        )
+      : buildVirusTotalRefreshedAnalysis(storedAnalysis, providerResults);
+    const persistedAlreadyFinalAnalysis = await persistPostLevelAnalysis(postId, alreadyFinalAnalysis);
+    return {
+      type: MESSAGE_TYPES.FINALIZE_PENDING_PROVIDER_STATE,
+      analysis: persistedAlreadyFinalAnalysis,
+      finalized: true,
+      reason: `virustotal-status-${vtStatus || "unavailable"}`,
+      providerRefreshStatus: vtStatus,
+      providerRefreshReason: existingVt?.details?.reason || ""
+    };
+  }
+
+  const providerCheckedUrl =
+    existingVt?.checkedUrl ||
+    finalizeSource.providerCheckedUrl ||
+    message.providerCheckedUrl ||
+    storedAnalysis.providerCheckedUrl ||
+    finalizeSource.analysisUrl ||
+    finalizeSource.normalizedUrl ||
+    message.analysisUrl ||
+    message.normalizedUrl ||
+    "";
+  const timedOutVt = withProviderOutcomeSummary({
+    ...(existingVt || {}),
+    provider: "virustotal",
+    configured: existingVt?.configured === true,
+    checked: false,
+    checkedUrl: providerCheckedUrl,
+    checkedAt: existingVt?.checkedAt || new Date().toISOString(),
+    durationMs: existingVt?.durationMs ?? null,
+    flagged: false,
+    category: null,
+    details: {
+      ...(existingVt?.details || {}),
+      status: "timeout",
+      reason: "retry_budget_exhausted",
+      message: "VirusTotal did not return a completed result within the retry window."
+    }
+  });
+  const updatedProviderResults = providerResults.map((provider) => (
+    provider.provider === "virustotal" ? timedOutVt : provider
+  ));
+  const updatedChildAnalysis = buildVirusTotalRefreshedAnalysis(finalizeSource, updatedProviderResults);
+  const updatedAnalysis = childTarget && Array.isArray(storedAnalysis.linkAnalysisSnapshots) && storedAnalysis.linkAnalysisSnapshots.length > 0
+    ? reAggregateStoredMultiLinkAnalysis(storedAnalysis, {
+        ...childTarget,
+        ...updatedChildAnalysis,
+        index: childTarget.index
+      })
+    : buildVirusTotalRefreshedAnalysis(storedAnalysis, updatedProviderResults);
+
+  replaceVirusTotalInUrlAnalysisCache({
+    analysis: childTarget ? updatedChildAnalysis : updatedAnalysis,
+    providerResult: timedOutVt,
+    checkedUrl: providerCheckedUrl
+  });
+
+  const persistedAnalysis = await persistPostLevelAnalysis(postId, updatedAnalysis);
+  sessionInfo.lastActivityAt = Date.now();
+
+  return {
+    type: MESSAGE_TYPES.FINALIZE_PENDING_PROVIDER_STATE,
+    analysis: persistedAnalysis,
+    finalized: true,
+    reason: "virustotal-timeout-retry-budget-exhausted",
+    providerRefreshStatus: "timeout",
+    providerRefreshReason: "retry_budget_exhausted"
   };
 }
 
@@ -4236,42 +5257,191 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
   const urlhausResult = getNormalizedProviderResult(safeProviderResults, "urlhaus");
   const virusTotalResult = getNormalizedProviderResult(safeProviderResults, "virustotal");
   const providerOverride = Boolean(gsbResult.flagged || urlhausResult.flagged || virusTotalResult.flagged);
-  const previousScore = Number(analysis.safetyScore);
-  const safetyScore = virusTotalResult.flagged
-    ? Math.min(Number.isFinite(previousScore) ? previousScore : 20, 20)
-    : analysis.safetyScore;
-  const classification = virusTotalResult.flagged
-    ? "High Risk"
-    : analysis.classification;
-  const features = {
+  const retryBudgetExhausted = String(virusTotalResult.details?.reason || "").toLowerCase() === "retry_budget_exhausted";
+  const providerCompletion = buildProviderCompletionState(safeProviderResults);
+  const scanFinalized = providerCompletion.allRequiredProvidersTerminal && !providerCompletion.hasPendingProvider;
+  let refreshedFeatures = {
     ...(analysis.features || {}),
+    googleSafeBrowsingFlagged: gsbResult.flagged === true,
+    urlhausFlagged: urlhausResult.flagged === true,
     virusTotalFlagged: virusTotalResult.flagged === true
   };
-  const scoreAudit = refreshScoreAuditForProviderResult(analysis, {
+  const reusableAnalysisContext = {
+    analysisUrl: analysis.analysisUrl || analysis.endpointResult?.effectiveEndpoint || "",
+    domain: analysis.domain || analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
+    redirectAnalysis: analysis.redirectAnalysis || analysis.endpointResult?.redirectAnalysis || {},
+    urlFeatureAnalysis: analysis.urlFeatureAnalysis || {}
+  };
+  refreshedFeatures = applyTrustedRedirectDestinationMitigation({
+    ...refreshedFeatures,
+    trustedEndpointMitigationEligible: isTrustedEndpointMitigationEligible(refreshedFeatures)
+  }, reusableAnalysisContext, analysis.endpointResult || {});
+  refreshedFeatures = applyMainstreamResolvedShortlinkMitigation(refreshedFeatures, reusableAnalysisContext, analysis.endpointResult || {});
+  refreshedFeatures = applyFacebookWrapperOnlyRedirectMitigation(refreshedFeatures, reusableAnalysisContext, analysis.endpointResult || {});
+  refreshedFeatures = applySameDomainMarketingEncodingMitigation(refreshedFeatures, reusableAnalysisContext, analysis.endpointResult || {});
+  refreshedFeatures = applyKnownBrandedCampaignRedirectMitigation(refreshedFeatures, reusableAnalysisContext, analysis.endpointResult || {});
+  refreshedFeatures = applyKnownGoogleFormsRedirectMitigation(refreshedFeatures, reusableAnalysisContext, analysis.endpointResult || {});
+  refreshedFeatures = applyKnownBrandAliasRedirectMitigation(refreshedFeatures, reusableAnalysisContext, analysis.endpointResult || {}, safeProviderResults);
+  refreshedFeatures = applyCleanResolvedMarketingLinkMitigation(refreshedFeatures, reusableAnalysisContext, analysis.endpointResult || {}, safeProviderResults);
+  const recomputed = recomputeStoredFinalScoreFromFeatures(analysis, refreshedFeatures, providerOverride);
+  const previousComputedScore = recomputed?.finalScore ?? getBestStoredComputedScore(analysis);
+  const safetyScore = virusTotalResult.flagged
+    ? Math.min(previousComputedScore !== null ? previousComputedScore : 20, 20)
+    : previousComputedScore;
+  const recoveredSafetyScore = safetyScore !== null
+    ? safetyScore
+    : toFiniteScoreOrNull(analysis.scoreAudit?.ruleScore);
+  const classification = virusTotalResult.flagged
+    ? "High Risk"
+    : (recomputed?.finalClassification || getBestStoredComputedClassification(analysis, recoveredSafetyScore));
+  let displayedScore = recoveredSafetyScore;
+  let displayedClassification = classification;
+  let displayedState = !scanFinalized && !providerOverride ? "pending-provider" : (analysis.state === "pending-provider" ? "monitored" : analysis.state);
+
+  if (retryBudgetExhausted && !providerOverride) {
+    displayedScore = null;
+    displayedClassification = "Unverified";
+    displayedState = "verification-incomplete";
+  }
+
+  if (!scanFinalized && !providerOverride) {
+    displayedScore = null;
+    displayedClassification = "Scan Pending";
+    displayedState = "pending-provider";
+  }
+
+  if (!retryBudgetExhausted && scanFinalized && !providerOverride && isPendingClassificationLabel(displayedClassification)) {
+    displayedClassification = getBestStoredComputedClassification(analysis, recoveredSafetyScore);
+  }
+
+  if (!retryBudgetExhausted && scanFinalized && !providerOverride && displayedScore === null) {
+    displayedScore = recoveredSafetyScore;
+  }
+
+  const features = recomputed?.features || refreshedFeatures;
+  const scoreAudit = recomputed?.scoreAudit || refreshScoreAuditForProviderResult(analysis, {
     providerOverride,
-    safetyScore,
+    safetyScore: recoveredSafetyScore,
     classification
   });
+  scoreAudit.scanFinalized = scanFinalized;
+  scoreAudit.displayedScoreWithheld = (!scanFinalized && !providerOverride) || (retryBudgetExhausted && !providerOverride);
+  scoreAudit.computedSafetyScore = recoveredSafetyScore;
+  scoreAudit.computedClassification = classification;
+  scoreAudit.retryBudgetExhausted = retryBudgetExhausted;
+  scoreAudit.pendingProviders = providerCompletion.pendingProviders;
   const refreshedAnalysis = {
     ...analysis,
     providerResults: safeProviderResults,
     features,
     providerOverride,
-    classification,
-    safetyScore,
+    classification: displayedClassification,
+    safetyScore: displayedScore,
+    computedSafetyScore: recoveredSafetyScore,
+    computedClassification: classification,
+    scanFinalized,
+    providerCompletion,
+    pendingProviders: providerCompletion.pendingProviders,
+    providerPending: displayedState === "pending-provider",
+    state: displayedState,
     scoreAudit,
-    concreteRiskSignals: Boolean(analysis.concreteRiskSignals || providerOverride),
-    interceptionRecommended: shouldRecommendInterceptionForStoredAnalysis({
-      ...analysis,
-      providerResults: safeProviderResults,
-      features,
-      providerOverride,
-      classification,
-      safetyScore,
-      scoreAudit
-    }),
+    concreteRiskSignals: Boolean(recomputed?.concreteRiskSignals || providerOverride),
+    interceptionRecommended: providerOverride === true
+      ? true
+      : (scanFinalized
+        ? shouldRecommendInterceptionForStoredAnalysis({
+            ...analysis,
+            providerResults: safeProviderResults,
+            features,
+            providerOverride,
+            classification,
+            safetyScore: recoveredSafetyScore,
+            scoreAudit
+          })
+        : false),
     lastChecked: Date.now()
   };
+
+  if (Array.isArray(analysis.linkScoreSummary) && analysis.linkScoreSummary.length > 0) {
+    const refreshedSummary = buildRefreshedLinkScoreSummary(analysis.linkScoreSummary, {
+      analysis,
+      virusTotalResult,
+      displayedScore,
+      displayedClassification,
+      recoveredSafetyScore,
+      classification,
+      scanFinalized,
+      providerCompletion
+    });
+    const pendingSummaryItems = refreshedSummary.filter(isLinkScoreSummaryPending);
+    refreshedAnalysis.linkScoreSummary = refreshedSummary;
+
+    if (retryBudgetExhausted && !providerOverride) {
+      refreshedAnalysis.linkScoreSummary = refreshedSummary.map((item) => {
+        if (!isLinkScoreSummaryPending(item)) {
+          return item;
+        }
+
+        return {
+          ...item,
+          safetyScore: null,
+          computedSafetyScore: recoveredSafetyScore,
+          classification: "Unverified",
+          computedClassification: classification,
+          scanFinalized: true,
+          providerCompletion: {
+            ...(providerCompletion || {}),
+            hasPendingProvider: false,
+            allRequiredProvidersTerminal: true,
+            pendingProviders: []
+          },
+          pendingProviders: []
+        };
+      });
+      refreshedAnalysis.classification = "Unverified";
+      refreshedAnalysis.safetyScore = null;
+      refreshedAnalysis.scanFinalized = true;
+      refreshedAnalysis.state = "verification-incomplete";
+      refreshedAnalysis.interceptionRecommended = false;
+      refreshedAnalysis.pendingProviders = [];
+      refreshedAnalysis.providerPending = false;
+      refreshedAnalysis.providerCompletion = {
+        ...(refreshedAnalysis.providerCompletion || {}),
+        hasPendingProvider: false,
+        allRequiredProvidersTerminal: true,
+        pendingProviders: []
+      };
+    } else if (pendingSummaryItems.length > 0 && !providerOverride) {
+      refreshedAnalysis.classification = "Scan Pending";
+      refreshedAnalysis.safetyScore = null;
+      refreshedAnalysis.scanFinalized = false;
+      refreshedAnalysis.state = "pending-provider";
+      refreshedAnalysis.interceptionRecommended = false;
+      refreshedAnalysis.pendingProviders = [
+        ...new Set(pendingSummaryItems.flatMap((item) => (
+          Array.isArray(item.pendingProviders)
+            ? item.pendingProviders
+            : Array.isArray(item.providerCompletion?.pendingProviders)
+              ? item.providerCompletion.pendingProviders
+              : []
+        )))
+      ];
+      refreshedAnalysis.providerCompletion = {
+        ...(refreshedAnalysis.providerCompletion || {}),
+        hasPendingProvider: true,
+        allRequiredProvidersTerminal: false,
+        pendingProviders: refreshedAnalysis.pendingProviders
+      };
+    } else if (!providerOverride) {
+      const lowest = pickLowestFinalLinkScoreSummary(refreshedSummary);
+      if (lowest) {
+        refreshedAnalysis.safetyScore = lowest.safetyScore;
+        refreshedAnalysis.classification = lowest.classification || classifySafetyScore(lowest.safetyScore);
+        refreshedAnalysis.scanFinalized = true;
+        refreshedAnalysis.state = refreshedAnalysis.state === "pending-provider" ? "monitored" : refreshedAnalysis.state;
+      }
+    }
+  }
 
   refreshedAnalysis.technicalDetails = buildTechnicalDetails({
     endpointResult: refreshedAnalysis.endpointResult,
@@ -4286,6 +5456,70 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
   });
 
   return refreshedAnalysis;
+}
+
+function buildRefreshedLinkScoreSummary(linkScoreSummary = [], {
+  analysis = {},
+  virusTotalResult = {},
+  displayedScore = null,
+  displayedClassification = "",
+  recoveredSafetyScore = null,
+  classification = "",
+  scanFinalized = false,
+  providerCompletion = {}
+} = {}) {
+  const pendingIndexes = linkScoreSummary
+    .map((item, index) => isLinkScoreSummaryPending(item) ? index : -1)
+    .filter((index) => index >= 0);
+  const checkedUrl = normalizeCacheKey(virusTotalResult.checkedUrl);
+  const analysisUrl = normalizeCacheKey(analysis.analysisUrl);
+  const normalizedUrl = normalizeCacheKey(analysis.normalizedUrl);
+
+  return linkScoreSummary.map((item, index) => {
+    const itemUrl = normalizeCacheKey(item?.url);
+    const shouldUpdate = Boolean(
+      isLinkScoreSummaryPending(item) &&
+      (
+        pendingIndexes.length === 1 ||
+        (itemUrl && (itemUrl === checkedUrl || itemUrl === analysisUrl || itemUrl === normalizedUrl))
+      )
+    );
+
+    if (!shouldUpdate) {
+      return item;
+    }
+
+    return {
+      ...item,
+      safetyScore: displayedScore,
+      computedSafetyScore: recoveredSafetyScore,
+      classification: displayedClassification,
+      computedClassification: classification,
+      scanFinalized,
+      providerCompletion,
+      pendingProviders: providerCompletion.pendingProviders || []
+    };
+  });
+}
+
+function isLinkScoreSummaryPending(item = {}) {
+  return Boolean(
+    isPendingClassificationLabel(item?.classification) ||
+    item?.scanFinalized === false ||
+    item?.providerCompletion?.hasPendingProvider === true ||
+    (Array.isArray(item?.pendingProviders) && item.pendingProviders.length > 0)
+  );
+}
+
+function pickLowestFinalLinkScoreSummary(linkScoreSummary = []) {
+  return (Array.isArray(linkScoreSummary) ? linkScoreSummary : [])
+    .filter((item) => !isLinkScoreSummaryPending(item))
+    .map((item) => ({
+      ...item,
+      safetyScore: toFiniteScoreOrNull(item.safetyScore) ?? toFiniteScoreOrNull(item.computedSafetyScore)
+    }))
+    .filter((item) => item.safetyScore !== null)
+    .sort((left, right) => left.safetyScore - right.safetyScore)[0] || null;
 }
 
 function replaceVirusTotalInUrlAnalysisCache({ analysis = {}, providerResult = {}, checkedUrl = "" } = {}) {
@@ -4449,7 +5683,18 @@ async function buildPopupSummary(tabUrl) {
         postId: record.postId,
         finalSite: record.finalSite,
         domain: record.domain || record.finalSite,
-        safetyScore: record.safetyScore ?? record.score,
+        safetyScore: (() => {
+          const state = String(record.state || "").toLowerCase();
+          const scanFinalized = record.scanFinalized === true || (record.scanFinalized !== false && state && state !== "pending-provider");
+
+          if (!scanFinalized || state === "pending-provider" || state === "verification-incomplete" || state === "completed-limited") {
+            return null;
+          }
+
+          const score = Number.isFinite(record.safetyScore) ? record.safetyScore : record.score;
+          return Number.isFinite(score) ? score : null;
+        })(),
+        scanFinalized: record.scanFinalized === true || (record.scanFinalized !== false && String(record.state || "").toLowerCase() && String(record.state || "").toLowerCase() !== "pending-provider"),
         classification: record.classification,
         state: record.state
       }))
@@ -4493,11 +5738,23 @@ async function triggerRescanForActiveTab() {
       message: "Re-scan command sent to the active Facebook tab."
     };
   } catch (error) {
-    await injectContentScript(activeTab.id);
-    return {
-      success: true,
-      message: "Content script was reconnected; scan will start shortly."
-    };
+    try {
+      await injectContentScript(activeTab.id);
+      await chrome.tabs.sendMessage(activeTab.id, {
+        type: MESSAGE_TYPES.RESCAN_NOW
+      });
+
+      return {
+        success: true,
+        message: "Content script was reconnected; scan command sent to the active Facebook tab."
+      };
+    } catch (retryError) {
+      logDebug(`Rescan reconnect failed: ${safeErrorMessage(retryError, safeErrorMessage(error, "unknown error"))}`);
+      return {
+        success: false,
+        message: "Unable to reconnect the content script on the active Facebook tab. Reload the page and try again."
+      };
+    }
   }
 }
 
@@ -4559,12 +5816,22 @@ async function ensureActiveSession(reason) {
 }
 async function resetSession(reason, options = {}) {
   const shouldClearRecords = options.clearRecords === true;
+  const now = Date.now();
+
+  sessionInfo = {
+    ...createSessionState(now),
+    lastResetAt: now,
+    lastResetReason: reason || "manual"
+  };
+
   clearProviderCaches({ clearUrlAnalysis: true, clearPendingVirusTotal: true });
 
   if (shouldClearRecords) {
     await clearAnalysisRecords();
     await clearDomainFlagRecords();
   }
+
+  return sessionInfo;
 }
 function createSessionState(now = Date.now()) {
   return {
@@ -5054,15 +6321,6 @@ function getProviderAuditStatus(result = {}) {
   const provider = String(result.provider || "").toLowerCase();
   const status = String(result.details?.status || "").toLowerCase();
 
-  if (
-    (provider !== "urlhaus" && !result.configured) ||
-    status === "not-configured" ||
-    status === "skipped" ||
-    !result.checked
-  ) {
-    return "skipped";
-  }
-
   if (status === "timeout") {
     return "timeout";
   }
@@ -5075,8 +6333,17 @@ function getProviderAuditStatus(result = {}) {
     return "rate-limited";
   }
 
-  if (status === "error" || status === "rate-limited" || status === "parse-error") {
+  if (status === "error" || status === "parse-error") {
     return "failed";
+  }
+
+  if (
+    (provider !== "urlhaus" && !result.configured) ||
+    status === "not-configured" ||
+    status === "skipped" ||
+    !result.checked
+  ) {
+    return "skipped";
   }
 
   return "completed";
@@ -5206,3 +6473,28 @@ function recordMaxPerformanceStat(key, value) {
   const numeric = Number(value || 0);
   performanceStats[key] = Math.max(Number(performanceStats[key] || 0), numeric);
 }
+
+bindSessionLifecycleObservers();
+getRuntimeConfig().catch((error) => {
+  console.warn("[DILI] Runtime config initialization failed", error);
+});
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  handleMessage(message, sender)
+    .then((payload) => {
+      sendResponse({
+        ok: true,
+        ...(payload || {})
+      });
+    })
+    .catch((error) => {
+      console.warn("[DILI] Background message failed", error);
+      sendResponse({
+        ok: false,
+        error: safeErrorMessage(error, "Background request failed.")
+      });
+    });
+
+  return true;
+});
+
+bindSessionLifecycleObservers();

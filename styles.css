@@ -83,6 +83,12 @@
   --dili-panel-accent: #d97706;
 }
 
+.dili-panel-pending {
+  --dili-panel-bg: #fffbeb;
+  --dili-panel-border: rgba(217, 119, 6, 0.34);
+  --dili-panel-accent: #f59e0b;
+}
+
 .dili-panel-high-risk {
   --dili-panel-bg: #fff1f2;
   --dili-panel-border: rgba(239, 68, 68, 0.3);
@@ -187,6 +193,12 @@
   color: #92400e;
 }
 
+.dili-pill-pending {
+  background: #fde68a;
+  border-color: rgba(180, 83, 9, 0.24);
+  color: #78350f;
+}
+
 .dili-pill-high-risk {
   background: #fee2e2;
   border-color: rgba(185, 28, 28, 0.2);
@@ -240,6 +252,12 @@
   color: #ffffff;
 }
 
+.dili-score-chip-pending {
+  background: #92400e;
+  border-color: #78350f;
+  color: #ffffff;
+}
+
 .dili-score-chip-high-risk {
   background: #b91c1c;
   border-color: #991b1b;
@@ -256,6 +274,17 @@
   background: #64748b;
   border-color: #475569;
   color: #ffffff;
+}
+
+.dili-pending-countdown {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(217, 119, 6, 0.28);
+  border-radius: 8px;
+  background: #fef3c7;
+  color: #78350f;
+  font-size: 12.5px;
+  font-weight: 900;
 }
 
 .dili-details {
