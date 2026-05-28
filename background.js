@@ -873,6 +873,14 @@ performanceStats.lastCacheHit = Boolean(reusableUrlAnalysis.cacheHit);
   const analysisUrl = reusableUrlAnalysis.analysisUrl;
   const redirectAnalysis = reusableUrlAnalysis.redirectAnalysis;
   const providerResults = normalizeProviderResults(reusableUrlAnalysis.providerResults);
+  const providerCheckedUrl =
+  reusableUrlAnalysis.providerCheckedUrl ||
+  reusableUrlAnalysis.urlFeatureAnalysis?.providerCheckedUrl ||
+  endpointResult?.effectiveEndpoint ||
+  analysisUrl ||
+  normalizedUrl ||
+  rawUrl ||
+  "";
   const domain = reusableUrlAnalysis.domain || safeHostname(analysisUrl || normalizedUrl);
   const normalizedCandidateContext = buildCandidateContext(candidateContext, {
     analysisUrl,
@@ -1122,6 +1130,8 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         features,
         endpointResult,
         providerResults,
+        visibleUrl: urlFeatures.rawComparableUrl || urlFeatures.unwrappedUrl || urlFeatures.normalizedUrl || analysisUrl,
+        providerCheckedUrl,
         finalUrl: endpointResult?.effectiveEndpoint || analysisUrl,
         finalDomain: domain,
         baseScore: finalScore
@@ -2223,13 +2233,61 @@ const TRUSTED_REDIRECT_DESTINATION_DOMAINS = new Set([
   "smart.com.ph"
 ]);
 
-const KNOWN_BRANDED_ALIAS_REDIRECTS = [
+const KNOWN_BRANDED_DOMAIN_ALIASES = [
   {
+    brandName: "Philippine National Bank",
+    sourceDomain: "pnbph.net",
+    allowedFinalDomains: ["pnb.com.ph"],
+    requiredPathHints: ["consumer-assistance-process"],
+    note: "PNB observed alias/campaign/help link.",
+    label: "PNB observed alias/campaign/help link."
+  },
+  {
+    brandName: "Smart Communications",
     sourceDomain: "smrt.ph",
     allowedFinalDomains: ["smart.com.ph"],
-    label: "Smart branded shortlink"
+    requiredPathHints: [],
+    note: "Observed Smart branded short domain.",
+    label: "Observed Smart branded short domain."
   }
+  // Add only after confirming the source domain is officially used by the brand.
 ];
+
+const KNOWN_BRANDED_ALIAS_REDIRECTS = KNOWN_BRANDED_DOMAIN_ALIASES;
+
+function stripWww(domain = "") {
+  return String(domain || "").trim().toLowerCase().replace(/^www\./, "");
+}
+
+function isKnownBrandedDomainAlias(sourceDomain = "", finalDomain = "", url = "") {
+  return Boolean(getKnownBrandedDomainAliasMatch(sourceDomain, finalDomain, url));
+}
+
+function getKnownBrandedDomainAliasMatch(sourceDomain = "", finalDomain = "", url = "") {
+  const source = stripWww(sourceDomain);
+  const final = stripWww(finalDomain);
+  const fullUrl = String(url || "").toLowerCase();
+
+  if (!source || !final) {
+    return null;
+  }
+
+  return KNOWN_BRANDED_DOMAIN_ALIASES.find((entry) => {
+    const entrySource = stripWww(entry.sourceDomain);
+    const allowedFinals = (entry.allowedFinalDomains || []).map(stripWww);
+
+    if (source !== entrySource || !allowedFinals.includes(final)) {
+      return false;
+    }
+
+    const hints = Array.isArray(entry.requiredPathHints) ? entry.requiredPathHints : [];
+    if (hints.length === 0) {
+      return true;
+    }
+
+    return hints.some((hint) => fullUrl.includes(String(hint || "").toLowerCase()));
+  }) || null;
+}
 
 const CLEAN_MARKETING_FINAL_DOMAINS = new Set([
   "securitybank.com",
@@ -2650,10 +2708,13 @@ function applyKnownGoogleFormsRedirectMitigation(features = {}, reusableUrlAnaly
 function applyKnownBrandAliasRedirectMitigation(features = {}, reusableUrlAnalysis = {}, endpointResult = {}, providerResults = []) {
   const finalDomain = getRegistrableDomain(endpointResult?.effectiveDomain || reusableUrlAnalysis.domain || "");
   const finalUrl = endpointResult?.effectiveEndpoint || reusableUrlAnalysis.analysisUrl || "";
-  const alias = getKnownBrandAliasRedirect({
+  const visibleUrl = reusableUrlAnalysis?.urlFeatureAnalysis?.displayUrl || reusableUrlAnalysis?.urlFeatureAnalysis?.sourceRawComparableUrl || reusableUrlAnalysis.analysisUrl || "";
+  const visibleDomain = getRegistrableDomain(safeHostname(visibleUrl || finalUrl || reusableUrlAnalysis.analysisUrl || ""));
+  const alias = getKnownBrandedDomainAliasMatch(visibleDomain, finalDomain, `${visibleUrl} ${finalUrl}`.trim()) || getKnownBrandAliasRedirect({
     endpointResult,
     redirectAnalysis: reusableUrlAnalysis.redirectAnalysis,
-    finalDomain
+    finalDomain,
+    url: finalUrl
   });
   const eligible = Boolean(
     alias &&
@@ -2690,9 +2751,14 @@ function applyKnownBrandAliasRedirectMitigation(features = {}, reusableUrlAnalys
     trustedEndpoint: true,
     trustedEndpointMitigationEligible: true,
     knownBrandAliasRedirect: true,
+    knownBrandedDomainAlias: true,
+    knownBrandedDomainAliasName: alias.brandName || alias.label || "configured branded alias relationship",
+    knownBrandedDomainAliasSourceDomain: alias.sourceDomain,
+    knownBrandedDomainAliasFinalDomain: finalDomain,
+    knownBrandedDomainAliasNote: alias.note || alias.label || "configured branded alias relationship",
     knownBrandAliasSourceDomain: alias.sourceDomain,
     knownBrandAliasFinalDomain: finalDomain,
-    knownBrandAliasLabel: alias.label || "configured branded alias relationship"
+    knownBrandAliasLabel: alias.label || alias.note || "configured branded alias relationship"
   };
 }
 
@@ -3093,6 +3159,8 @@ function recomputeStoredFinalScoreFromFeatures(analysis = {}, features = {}, pro
         features,
         endpointResult: analysis.endpointResult || {},
         providerResults,
+        visibleUrl: analysis.urlFeatureAnalysis?.displayUrl || analysis.urlFeatureAnalysis?.sourceRawComparableUrl || analysis.analysisUrl || "",
+        providerCheckedUrl: analysis.endpointResult?.effectiveEndpoint || analysis.analysisUrl || "",
         finalUrl: analysis.endpointResult?.effectiveEndpoint || analysis.analysisUrl || "",
         finalDomain: analysis.domain || analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
         baseScore: finalScore
@@ -3209,7 +3277,7 @@ function isKnownBrandedCampaignRedirect({ endpointResult = {}, redirectAnalysis 
   return false;
 }
 
-function getKnownBrandAliasRedirect({ endpointResult = {}, redirectAnalysis = {}, finalDomain = "" } = {}) {
+function getKnownBrandAliasRedirect({ endpointResult = {}, redirectAnalysis = {}, finalDomain = "", url = "" } = {}) {
   const rawChain =
     Array.isArray(endpointResult?.resolutionChain) && endpointResult.resolutionChain.length > 0
       ? endpointResult.resolutionChain
@@ -3219,10 +3287,7 @@ function getKnownBrandAliasRedirect({ endpointResult = {}, redirectAnalysis = {}
   const sourceDomain = getRedirectSourceDomain(rawChain);
   const normalizedFinalDomain = getRegistrableDomain(finalDomain);
 
-  return KNOWN_BRANDED_ALIAS_REDIRECTS.find((rule) => (
-    sourceDomain === rule.sourceDomain &&
-    rule.allowedFinalDomains.includes(normalizedFinalDomain)
-  )) || null;
+  return getKnownBrandedDomainAliasMatch(sourceDomain, normalizedFinalDomain, url) || null;
 }
 
 function isCleanHighConfidenceResolvedEndpoint({
@@ -3255,6 +3320,8 @@ function buildCleanProviderRecoveryState({
   features = {},
   endpointResult = {},
   providerResults = [],
+  visibleUrl = "",
+  providerCheckedUrl = "",
   finalUrl = "",
   finalDomain = "",
   baseScore = null
@@ -3262,6 +3329,12 @@ function buildCleanProviderRecoveryState({
   const recoveryBlockedReasons = [];
   const effectiveFinalUrl = finalUrl || endpointResult?.effectiveEndpoint || "";
   const effectiveFinalDomain = getRegistrableDomain(finalDomain || endpointResult?.effectiveDomain || safeHostname(effectiveFinalUrl) || "");
+  const effectiveVisibleUrl = visibleUrl || endpointResult?.displayUrl || endpointResult?.analysisUrl || endpointResult?.normalizedUrl || "";
+  const brandedAliasMatch = getKnownBrandedDomainAliasMatch(
+    getRegistrableDomain(safeHostname(effectiveVisibleUrl)),
+    effectiveFinalDomain,
+    providerCheckedUrl || effectiveFinalUrl || effectiveVisibleUrl
+  );
   const redirectLike = Boolean(
     features.shortenedUrl ||
     features.wrapperToExternalDestination ||
@@ -3309,7 +3382,7 @@ function buildCleanProviderRecoveryState({
     recoveryBlockedReasons.push("obfuscated URL structure");
   }
 
-  if (features.textMismatch && !features.knownBrandAliasRedirect && !features.knownBrandedCampaignRedirect && !features.cleanResolvedMarketingLink) {
+  if (features.textMismatch && !features.knownBrandAliasRedirect && !features.knownBrandedCampaignRedirect && !features.cleanResolvedMarketingLink && !brandedAliasMatch) {
     recoveryBlockedReasons.push("visible domain mismatch remains after normalization");
   }
 
@@ -3325,7 +3398,9 @@ function buildCleanProviderRecoveryState({
     recoveryApplied: Boolean(eligible && numericScore !== null && numericScore < 80),
     recoveryFloor: eligible ? 80 : null,
     recoveryReason: eligible
-      ? "Clean providers and a high-confidence resolved endpoint limited the remaining warnings to explainable redirect/tracking behavior."
+      ? brandedAliasMatch
+        ? "Clean providers and a high-confidence resolved endpoint limited the remaining warnings to explainable redirect/tracking behavior, including a configured branded alias relationship."
+        : "Clean providers and a high-confidence resolved endpoint limited the remaining warnings to explainable redirect/tracking behavior."
       : "",
     recoveryBlockedReasons,
     activeHeuristicGroups: getActiveHeuristicGroups(features),
@@ -3840,7 +3915,13 @@ if (riskRelevantDisplayChain.length > 0) {
     details.push("Known campaign redirect resolved to trusted destination.");
   }
 
-  if (finalFeatures.knownBrandAliasRedirect) {
+  if (finalFeatures.knownBrandedDomainAlias) {
+    const brandName = finalFeatures.knownBrandedDomainAliasName || finalFeatures.knownBrandAliasLabel || "configured branded alias relationship";
+    const sourceDomain = finalFeatures.knownBrandedDomainAliasSourceDomain || finalFeatures.knownBrandAliasSourceDomain || "";
+    const finalDomain = finalFeatures.knownBrandedDomainAliasFinalDomain || finalFeatures.knownBrandAliasFinalDomain || "";
+    details.push(`Configured branded alias matched: ${brandName}${sourceDomain && finalDomain ? ` (${sourceDomain} -> ${finalDomain})` : ""}.`);
+    details.push("Visible domain and final domain were treated as a configured branded alias relationship.");
+  } else if (finalFeatures.knownBrandAliasRedirect) {
     details.push("The visible domain and final domain were treated as a configured branded alias relationship for mismatch scoring.");
   }
 
