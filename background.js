@@ -326,9 +326,336 @@ function isStoredLinkAnalysisTerminalIncomplete(analysis = {}) {
   );
 }
 
+function normalizeTerminalIncompleteAnalysis(analysis = {}, reason = "Verification did not complete.") {
+  if (!analysis || typeof analysis !== "object" || analysis.providerOverride === true) {
+    return analysis;
+  }
+
+  const limitations = [
+    ...(Array.isArray(analysis.limitations) ? analysis.limitations : []),
+    reason
+  ].filter(Boolean);
+  const providerCompletion = {
+    ...((analysis.providerCompletion && typeof analysis.providerCompletion === "object") ? analysis.providerCompletion : {}),
+    hasPendingProvider: false,
+    allRequiredProvidersTerminal: true,
+    pendingProviders: []
+  };
+  const scoreAudit = {
+    ...((analysis.scoreAudit && typeof analysis.scoreAudit === "object") ? analysis.scoreAudit : {}),
+    scanFinalized: true,
+    displayedScoreWithheld: true,
+    verificationIncomplete: true,
+    pendingProviders: [],
+    terminalIncompleteReason: reason
+  };
+  const terminalizeChild = (item) => {
+    if (!item || typeof item !== "object" || item.providerOverride === true) {
+      return item;
+    }
+
+    if (!isAnalysisPendingLike(item) && !isStoredLinkAnalysisTerminalIncomplete(item)) {
+      return item;
+    }
+
+    return {
+      ...item,
+      classification: "Verification Incomplete",
+      safetyScore: null,
+      scanFinalized: true,
+      state: "verification-incomplete",
+      providerPending: false,
+      pendingProviders: [],
+      providerCompletion: {
+        ...((item.providerCompletion && typeof item.providerCompletion === "object") ? item.providerCompletion : {}),
+        hasPendingProvider: false,
+        allRequiredProvidersTerminal: true,
+        pendingProviders: []
+      },
+      restartable: true
+    };
+  };
+
+  return {
+    ...analysis,
+    classification: "Verification Incomplete",
+    safetyScore: null,
+    scanFinalized: true,
+    state: "verification-incomplete",
+    providerPending: false,
+    pendingProviders: [],
+    pendingLinkRefreshTargets: [],
+    pendingProviderRefreshTarget: null,
+    linkScoreSummary: Array.isArray(analysis.linkScoreSummary)
+      ? analysis.linkScoreSummary.map(terminalizeChild)
+      : analysis.linkScoreSummary,
+    linkAnalysisSnapshots: Array.isArray(analysis.linkAnalysisSnapshots)
+      ? analysis.linkAnalysisSnapshots.map(terminalizeChild)
+      : analysis.linkAnalysisSnapshots,
+    providerCompletion,
+    scoreAudit,
+    interceptionRecommended: false,
+    verificationState: "incomplete",
+    limitations: [...new Set(limitations)].slice(0, 8),
+    restartable: true
+  };
+}
+
+function hasRetryablePendingProvider(analysis = {}) {
+  if (!analysis || typeof analysis !== "object" || analysis.providerOverride === true) {
+    return false;
+  }
+
+  const retryPlan = analysis.providerRetryPlan || {};
+  const retryStatus = String(retryPlan.status || "").toLowerCase();
+  if (["exhausted", "failed", "completed", "finalized"].includes(retryStatus)) {
+    return false;
+  }
+
+  const providerResults = normalizeProviderResults(analysis.providerResults || []);
+  const retryableProvider = providerResults.some((provider) => {
+    const status = getProviderStatus(provider);
+    return (
+      status === "pending" &&
+      provider?.details?.terminal !== true &&
+      provider?.details?.retryable !== false
+    );
+  });
+
+  const providerCompletion = analysis.providerCompletion || buildProviderCompletionState(providerResults);
+  const pendingProviders = Array.isArray(analysis.pendingProviders)
+    ? analysis.pendingProviders
+    : Array.isArray(providerCompletion.pendingProviders)
+      ? providerCompletion.pendingProviders
+      : [];
+
+  return Boolean(
+    retryableProvider ||
+    (
+      providerCompletion.hasPendingProvider === true &&
+      pendingProviders.length > 0
+    )
+  );
+}
+
+function isDeadOrInvalidShortlinkAnalysis(analysis = {}) {
+  const endpointResult = analysis.endpointResult || {};
+  const features = analysis.features || {};
+  const isShortlink = Boolean(features.shortenedUrl || endpointResult.isShortener);
+  if (!isShortlink) {
+    return false;
+  }
+
+  const effectiveEndpoint =
+    normalizeProviderCandidateUrl(endpointResult.effectiveEndpoint) ||
+    normalizeProviderCandidateUrl(endpointResult.resolvedUrl) ||
+    normalizeProviderCandidateUrl(analysis.analysisUrl) ||
+    "";
+  const confidence = String(endpointResult.endpointConfidence || analysis.endpointConfidence || "").toLowerCase();
+  const evidenceText = [
+    endpointResult.resolutionMethod,
+    endpointResult.fetchStatus,
+    ...(Array.isArray(endpointResult.errors) ? endpointResult.errors : []),
+    ...(Array.isArray(endpointResult.warnings) ? endpointResult.warnings : []),
+    ...(Array.isArray(analysis.limitations) ? analysis.limitations : [])
+  ].join(" ").toLowerCase();
+
+  return Boolean(
+    !effectiveEndpoint ||
+    endpointResult.invalidDestination === true ||
+    endpointResult.unsupportedEndpoint === true ||
+    endpointResult.deadShortlink === true ||
+    (
+      confidence === "low" &&
+      /(dead|invalid|unavailable|unsupported|could not be resolved|no usable final|not found|failed)/i.test(evidenceText)
+    )
+  );
+}
+
+function normalizeBackgroundTerminalState(analysis = {}) {
+  if (!analysis || typeof analysis !== "object" || analysis.providerOverride === true) {
+    return analysis;
+  }
+
+  if (isDeadOrInvalidShortlinkAnalysis(analysis)) {
+    console.debug("[DILI][terminal-state] Dead shortlink detected.", {
+      postId: analysis.postId || "",
+      analysisUrl: analysis.analysisUrl || analysis.normalizedUrl || ""
+    });
+    return normalizeTerminalIncompleteAnalysis(
+      analysis,
+      "The shortened link appears unavailable or could not be resolved to a valid final destination."
+    );
+  }
+
+  const state = String(analysis.state || "").toLowerCase();
+  const classification = String(analysis.classification || "").toLowerCase();
+  const retryStatus = String(analysis.providerRetryPlan?.status || "").toLowerCase();
+  const providerResults = normalizeProviderResults(analysis.providerResults || []);
+  const providerCompletion = analysis.providerCompletion || buildProviderCompletionState(providerResults);
+  const pendingProviders = Array.isArray(analysis.pendingProviders)
+    ? analysis.pendingProviders
+    : Array.isArray(providerCompletion.pendingProviders)
+      ? providerCompletion.pendingProviders
+      : [];
+  const pendingLike = Boolean(
+    state === "pending-provider" ||
+    classification === "scan pending" ||
+    analysis.providerPending === true ||
+    analysis.scanFinalized === false ||
+    providerCompletion.hasPendingProvider === true ||
+    pendingProviders.length > 0
+  );
+
+  if (["exhausted", "failed"].includes(retryStatus)) {
+    console.debug("[DILI][terminal-state] Provider retry state exhausted; terminalizing analysis.", {
+      postId: analysis.postId || "",
+      retryStatus
+    });
+    return normalizeTerminalIncompleteAnalysis(analysis, "Provider verification retry budget was exhausted.");
+  }
+
+  if (
+    pendingLike &&
+    (
+      providerCompletion.hasPendingProvider !== true ||
+      pendingProviders.length === 0 ||
+      !hasRetryablePendingProvider({
+        ...analysis,
+        providerResults,
+        providerCompletion,
+        pendingProviders
+      })
+    )
+  ) {
+    console.debug("[DILI][terminal-state] Stale pending analysis terminalized.", {
+      postId: analysis.postId || "",
+      state,
+      classification
+    });
+    return normalizeTerminalIncompleteAnalysis(analysis, "Provider verification could not continue and was finalized as incomplete.");
+  }
+
+  if (classification === "unverified" && analysis.scanFinalized === false) {
+    return normalizeTerminalIncompleteAnalysis(analysis, "Unverified result was not finalized by provider verification.");
+  }
+
+  return {
+    ...analysis,
+    providerResults,
+    providerCompletion
+  };
+}
+
+function getFirstFiniteCount(...values) {
+  for (const value of values) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric >= 0) {
+      return numeric;
+    }
+  }
+
+  return 0;
+}
+
+function getVirusTotalStats(provider = {}) {
+  const details = provider?.details || {};
+  const stats =
+    details.last_analysis_stats ||
+    details.lastAnalysisStats ||
+    provider.last_analysis_stats ||
+    provider.lastAnalysisStats ||
+    provider.stats ||
+    {};
+
+  return {
+    maliciousCount: getFirstFiniteCount(
+      details.maliciousCount,
+      details.malicious,
+      provider.maliciousCount,
+      provider.malicious,
+      stats.malicious
+    ),
+    suspiciousCount: getFirstFiniteCount(
+      details.suspiciousCount,
+      details.suspicious,
+      provider.suspiciousCount,
+      provider.suspicious,
+      stats.suspicious
+    )
+  };
+}
+
+function getVirusTotalWarningState(providerResults = []) {
+  const vt = Array.isArray(providerResults)
+    ? getNormalizedProviderResult(providerResults, "virustotal")
+    : providerResults;
+  const { maliciousCount, suspiciousCount } = getVirusTotalStats(vt || {});
+  const status = getProviderStatus(vt);
+
+  if (maliciousCount >= 2 || (maliciousCount >= 1 && suspiciousCount >= 2)) {
+    return {
+      maliciousCount,
+      suspiciousCount,
+      hasStrongConsensus: true,
+      hasSuspiciousLevelWarning: false,
+      hasCautionOnlyWarning: false,
+      warningSeverity: "high",
+      warningLabel: "VirusTotal reported strong malicious consensus.",
+      recoveryCap: 30,
+      classificationFloor: "High Risk",
+      status
+    };
+  }
+
+  if (maliciousCount === 1 || (maliciousCount === 0 && suspiciousCount >= 2)) {
+    return {
+      maliciousCount,
+      suspiciousCount,
+      hasStrongConsensus: false,
+      hasSuspiciousLevelWarning: true,
+      hasCautionOnlyWarning: false,
+      warningSeverity: "suspicious",
+      warningLabel: maliciousCount === 1
+        ? "VirusTotal reported one malicious detection. DILI treated this as a suspicious provider warning, but not as a provider-confirmed High Risk result."
+        : "VirusTotal reported multiple suspicious detections. DILI treated this as a suspicious provider warning.",
+      recoveryCap: 79,
+      classificationFloor: "Suspicious",
+      status
+    };
+  }
+
+  if (maliciousCount === 0 && suspiciousCount === 1) {
+    return {
+      maliciousCount,
+      suspiciousCount,
+      hasStrongConsensus: false,
+      hasSuspiciousLevelWarning: false,
+      hasCautionOnlyWarning: true,
+      warningSeverity: "caution",
+      warningLabel: "VirusTotal reported one suspicious detection. DILI recorded this as a caution note.",
+      recoveryCap: 94,
+      classificationFloor: null,
+      status
+    };
+  }
+
+  return {
+    maliciousCount,
+    suspiciousCount,
+    hasStrongConsensus: false,
+    hasSuspiciousLevelWarning: false,
+    hasCautionOnlyWarning: false,
+    warningSeverity: "none",
+    warningLabel: "",
+    recoveryCap: null,
+    classificationFloor: null,
+    status
+  };
+}
+
 function getVirusTotalSignalLevel(provider = {}) {
-  const malicious = Number(provider?.details?.maliciousCount || 0);
-  const suspicious = Number(provider?.details?.suspiciousCount || 0);
+  const { maliciousCount: malicious, suspiciousCount: suspicious } = getVirusTotalWarningState(provider);
 
   if (malicious >= 2 || (malicious >= 1 && suspicious >= 2)) {
     return "strong";
@@ -349,8 +676,12 @@ function buildProviderOverridePolicy(providerResults = []) {
   const providers = normalizeProviderResults(providerResults);
   const gsb = getNormalizedProviderResult(providers, "gsb");
   const urlhaus = getNormalizedProviderResult(providers, "urlhaus");
-  const vt = getNormalizedProviderResult(providers, "virustotal");
-  const vtSignalLevel = getVirusTotalSignalLevel(vt);
+  const vtWarningState = getVirusTotalWarningState(providers);
+  const vtSignalLevel = vtWarningState.warningSeverity === "high"
+    ? "strong"
+    : vtWarningState.warningSeverity === "suspicious"
+      ? "warning"
+      : vtWarningState.warningSeverity;
 
   if (gsb.flagged === true) {
     return {
@@ -358,7 +689,8 @@ function buildProviderOverridePolicy(providerResults = []) {
       providerOverrideCap: 25,
       providerOverrideSource: "gsb",
       providerOverrideReason: "Google Safe Browsing flagged this link.",
-      virusTotalSignalLevel: vtSignalLevel
+      virusTotalSignalLevel: vtSignalLevel,
+      virusTotalWarningState: vtWarningState
     };
   }
 
@@ -368,17 +700,19 @@ function buildProviderOverridePolicy(providerResults = []) {
       providerOverrideCap: 25,
       providerOverrideSource: "urlhaus",
       providerOverrideReason: "URLhaus flagged this link.",
-      virusTotalSignalLevel: vtSignalLevel
+      virusTotalSignalLevel: vtSignalLevel,
+      virusTotalWarningState: vtWarningState
     };
   }
 
-  if (vtSignalLevel === "strong") {
+  if (vtWarningState.hasStrongConsensus) {
     return {
       providerOverride: true,
       providerOverrideCap: 30,
       providerOverrideSource: "virustotal",
       providerOverrideReason: "VirusTotal reported strong malicious consensus.",
-      virusTotalSignalLevel: vtSignalLevel
+      virusTotalSignalLevel: vtSignalLevel,
+      virusTotalWarningState: vtWarningState
     };
   }
 
@@ -387,7 +721,87 @@ function buildProviderOverridePolicy(providerResults = []) {
     providerOverrideCap: null,
     providerOverrideSource: "",
     providerOverrideReason: "",
-    virusTotalSignalLevel: vtSignalLevel
+    virusTotalSignalLevel: vtSignalLevel,
+    virusTotalWarningState: vtWarningState
+  };
+}
+
+function applyVirusTotalWarningScorePolicy(finalScore, finalClassification, vtWarning = {}) {
+  const numericScore = toFiniteScoreOrNull(finalScore);
+  if (numericScore === null) {
+    return {
+      finalScore,
+      finalClassification,
+      providerWarningApplied: false,
+      providerCautionApplied: false,
+      providerWarningReason: vtWarning.warningLabel || "",
+      providerWarningScoreCap: null
+    };
+  }
+
+  if (vtWarning.hasStrongConsensus) {
+    const cappedScore = Math.min(numericScore, vtWarning.recoveryCap || 30);
+    return {
+      finalScore: cappedScore,
+      finalClassification: "High Risk",
+      providerWarningApplied: true,
+      providerCautionApplied: false,
+      providerWarningReason: vtWarning.warningLabel || "VirusTotal reported strong malicious consensus.",
+      providerWarningScoreCap: vtWarning.recoveryCap || 30
+    };
+  }
+
+  if (vtWarning.hasSuspiciousLevelWarning) {
+    const cappedScore = Math.min(numericScore, vtWarning.recoveryCap || 79);
+    const classification = classifySafetyScore(cappedScore) === "Safe"
+      ? "Suspicious"
+      : classifySafetyScore(cappedScore);
+    return {
+      finalScore: cappedScore,
+      finalClassification: classification,
+      providerWarningApplied: true,
+      providerCautionApplied: false,
+      providerWarningReason: "VirusTotal reported a provider warning signal.",
+      providerWarningScoreCap: vtWarning.recoveryCap || 79
+    };
+  }
+
+  if (vtWarning.hasCautionOnlyWarning) {
+    const cappedScore = Math.min(numericScore, vtWarning.recoveryCap || 94);
+    return {
+      finalScore: cappedScore,
+      finalClassification: classifySafetyScore(cappedScore),
+      providerWarningApplied: false,
+      providerCautionApplied: true,
+      providerWarningReason: "VirusTotal reported one suspicious detection.",
+      providerWarningScoreCap: vtWarning.recoveryCap || 94
+    };
+  }
+
+  return {
+    finalScore: numericScore,
+    finalClassification,
+    providerWarningApplied: false,
+    providerCautionApplied: false,
+    providerWarningReason: "",
+    providerWarningScoreCap: null
+  };
+}
+
+function applyVirusTotalWarningAuditFields(scoreAudit = {}, vtWarning = {}, warningPolicy = {}) {
+  return {
+    ...scoreAudit,
+    providerWarningApplied: warningPolicy.providerWarningApplied === true,
+    providerCautionApplied: warningPolicy.providerCautionApplied === true,
+    providerWarningReason: warningPolicy.providerWarningReason || "",
+    virusTotalMaliciousDetections: vtWarning.maliciousCount || 0,
+    virusTotalSuspiciousDetections: vtWarning.suspiciousCount || 0,
+    providerWarningScoreCap: warningPolicy.providerWarningScoreCap ?? null,
+    cleanProviderRecoveryBlockedByProviderWarning: Boolean(
+      (vtWarning.hasSuspiciousLevelWarning || vtWarning.hasCautionOnlyWarning || vtWarning.hasStrongConsensus) &&
+      Array.isArray(scoreAudit.recoveryBlockedReasons) &&
+      scoreAudit.recoveryBlockedReasons.includes("VirusTotal reported provider warning detections.")
+    )
   };
 }
 
@@ -689,8 +1103,13 @@ function buildStoredLinkAnalysisSnapshot(analysis = {}, index = 0) {
 }
 
 function isStoredLinkAnalysisPending(analysis = {}) {
+  if (isStoredLinkAnalysisTerminalIncomplete(analysis)) {
+    return false;
+  }
+
   const vt = getNormalizedProviderResult(analysis.providerResults || [], "virustotal");
   const vtStatus = getProviderStatus(vt);
+  const vtRetryable = vt?.details?.retryable !== false && vt?.details?.terminal !== true;
   const providerCompletion = buildProviderCompletionState(analysis.providerResults || []);
 
   if (providerCompletion.allRequiredProvidersTerminal && !providerCompletion.hasPendingProvider) {
@@ -699,7 +1118,7 @@ function isStoredLinkAnalysisPending(analysis = {}) {
 
   return Boolean(
     isAnalysisPendingLike(analysis) ||
-    ["pending", "timeout", "rate-limited"].includes(vtStatus)
+    (vtRetryable && vtStatus === "pending")
   );
 }
 
@@ -707,6 +1126,15 @@ function normalizeStoredLinkAnalysisSnapshot(analysis = {}) {
   if (!analysis || typeof analysis !== "object") {
     return analysis;
   }
+
+  const terminalNormalized = normalizeBackgroundTerminalState(analysis);
+  if (
+    terminalNormalized !== analysis &&
+    String(terminalNormalized?.state || "").toLowerCase() === "verification-incomplete"
+  ) {
+    return terminalNormalized;
+  }
+  analysis = terminalNormalized;
 
   const providerResults = normalizeProviderResults(analysis.providerResults || []);
   const providerCompletion = buildProviderCompletionState(providerResults);
@@ -788,14 +1216,20 @@ function isPendingProviderRefreshTarget(candidate = {}) {
     return false;
   }
 
+  if (isStoredLinkAnalysisTerminalIncomplete(candidate)) {
+    return false;
+  }
+
   const vt = getNormalizedProviderResult(candidate.providerResults || [], "virustotal");
   const status = String(vt?.details?.status || candidate.status || "").toLowerCase();
+  const retryable = vt?.details?.retryable !== false && vt?.details?.terminal !== true;
 
   return Boolean(
-    isAnalysisPendingLike(candidate) ||
-    status === "pending" ||
-    status === "timeout" ||
-    status === "rate-limited"
+    retryable &&
+    (
+      isAnalysisPendingLike(candidate) ||
+      status === "pending"
+    )
   );
 }
 
@@ -1177,11 +1611,32 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
 
   const demoBiasAfterScore = finalScore;
 
-  const finalClassification = providerOverride
+  let finalClassification = providerOverride
     ? "High Risk"
     : verificationOnlyUnknown
       ? "Unverified"
       : classifySafetyScore(finalScore);
+  const virusTotalWarningState = providerPolicy.virusTotalWarningState || getVirusTotalWarningState(providerResults);
+  const virusTotalWarningPolicy = applyVirusTotalWarningScorePolicy(finalScore, finalClassification, virusTotalWarningState);
+  if (!verificationOnlyUnknown || providerOverride) {
+    finalScore = virusTotalWarningPolicy.finalScore;
+    finalClassification = providerOverride
+      ? "High Risk"
+      : virusTotalWarningPolicy.finalClassification;
+  }
+  if (!providerOverride && virusTotalWarningState.warningSeverity === "suspicious") {
+    finalFeatures = {
+      ...finalFeatures,
+      virusTotalProviderWarning: true,
+      virusTotalWarningScoreCap: virusTotalWarningPolicy.providerWarningScoreCap || 79
+    };
+  } else if (!providerOverride && virusTotalWarningState.warningSeverity === "caution") {
+    finalFeatures = {
+      ...finalFeatures,
+      virusTotalProviderCaution: true,
+      virusTotalWarningScoreCap: virusTotalWarningPolicy.providerWarningScoreCap || 94
+    };
+  }
   const rawProviderCompletion = buildProviderCompletionState(providerResults);
   const scanFinalized = providerOverride === true
     ? true
@@ -1215,7 +1670,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     displayedState = "pending-provider";
   }
 
-  const scoreAudit = buildScoreAudit({
+  let scoreAudit = buildScoreAudit({
     scoring,
     providerOverride,
     providerOverrideCap: providerCap,
@@ -1235,6 +1690,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     finalScore,
     finalClassification
   });
+  scoreAudit = applyVirusTotalWarningAuditFields(scoreAudit, virusTotalWarningState, virusTotalWarningPolicy);
   scoreAudit.scanFinalized = scanFinalized;
   scoreAudit.displayedScoreWithheld = (!scanFinalized && !providerOverride) || terminalProviderLimitation;
   scoreAudit.computedSafetyScore = finalScore;
@@ -1275,7 +1731,7 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
       ""
   };
   const nextState = finalFeatures.integrityHashMismatch ? "changed" : "monitored";
-  const record = {
+  let record = {
     postId,
     analysisSchemaVersion: CURRENT_ANALYSIS_SCHEMA_VERSION,
     normalizedUrl,
@@ -1384,6 +1840,8 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
       "Post integrity comparison skipped because no stable Facebook post identity was available."
     ].slice(0, 8);
   }
+
+record = normalizeBackgroundTerminalState(record);
 const storageStartedAt = nowMs();
 
 const storedRecord = persist
@@ -1415,30 +1873,30 @@ if (providerFlaggedDomain) {
       originalUrl: normalizedUrl,
       domain,
       urlHash: currentHash,
-      safetyScore: displayedScore,
+      safetyScore: record.safetyScore,
       ruleScore: scoring.score,
       totalDeduction: scoring.totalDeduction,
       categoryDeductions: scoring.categoryDeductions,
-      scoreAudit,
-      classification: displayedClassification,
-      computedClassification: finalClassification,
-      computedSafetyScore: finalScore,
-      scanFinalized,
-      providerCompletion,
-      pendingProviders: providerCompletion.pendingProviders,
-      providerRetryPlan: initialProviderRetryPlan,
-      verificationState,
+      scoreAudit: record.scoreAudit,
+      classification: record.classification,
+      computedClassification: record.computedClassification,
+      computedSafetyScore: record.computedSafetyScore,
+      scanFinalized: record.scanFinalized,
+      providerCompletion: record.providerCompletion,
+      pendingProviders: record.pendingProviders,
+      providerRetryPlan: record.providerRetryPlan,
+      verificationState: record.verificationState,
       verificationOnlyUnknown,
       concreteRiskSignals,
-      interceptionRecommended: providerOverride === true ? true : (scanFinalized && !terminalProviderLimitation ? finalInterceptionRecommended : false),
-      features: finalFeatures,
-      providerResults,
-      endpointResult,
-      endpointConfidence: endpointResult.endpointConfidence,
+      interceptionRecommended: record.interceptionRecommended,
+      features: record.features,
+      providerResults: record.providerResults,
+      endpointResult: record.endpointResult,
+      endpointConfidence: record.endpointConfidence,
       providerCheckedUrl: reusableUrlAnalysis.providerCheckedUrl || "",
       limitations: record.limitations,
       providerOverride,
-      state: displayedState
+      state: record.state
     });
   }
 
@@ -3178,7 +3636,7 @@ function recomputeStoredFinalScoreFromFeatures(analysis = {}, features = {}, pro
     finalScore = Math.max(finalScore, recovery.recoveryFloor || 80);
   }
 
-  const finalFeatures = softUncertaintyCapApplied
+  let finalFeatures = softUncertaintyCapApplied
     ? {
         ...features,
         softUncertaintyCapApplied: true,
@@ -3188,12 +3646,33 @@ function recomputeStoredFinalScoreFromFeatures(analysis = {}, features = {}, pro
         ...features,
         cleanProviderRecoveryApplied: recovery.recoveryApplied === true
       };
-  const finalClassification = providerOverride
+  let finalClassification = providerOverride
     ? "High Risk"
     : analysis.verificationOnlyUnknown === true
       ? "Unverified"
       : classifySafetyScore(finalScore);
-  const scoreAudit = buildScoreAudit({
+  const virusTotalWarningState = getVirusTotalWarningState(providerResults);
+  const virusTotalWarningPolicy = applyVirusTotalWarningScorePolicy(finalScore, finalClassification, virusTotalWarningState);
+  if (analysis.verificationOnlyUnknown !== true || providerOverride) {
+    finalScore = virusTotalWarningPolicy.finalScore;
+    finalClassification = providerOverride
+      ? "High Risk"
+      : virusTotalWarningPolicy.finalClassification;
+  }
+  if (!providerOverride && virusTotalWarningState.warningSeverity === "suspicious") {
+    finalFeatures = {
+      ...finalFeatures,
+      virusTotalProviderWarning: true,
+      virusTotalWarningScoreCap: virusTotalWarningPolicy.providerWarningScoreCap || 79
+    };
+  } else if (!providerOverride && virusTotalWarningState.warningSeverity === "caution") {
+    finalFeatures = {
+      ...finalFeatures,
+      virusTotalProviderCaution: true,
+      virusTotalWarningScoreCap: virusTotalWarningPolicy.providerWarningScoreCap || 94
+    };
+  }
+  let scoreAudit = buildScoreAudit({
     scoring,
     providerOverride,
     providerOverrideCap,
@@ -3213,6 +3692,7 @@ function recomputeStoredFinalScoreFromFeatures(analysis = {}, features = {}, pro
     finalScore,
     finalClassification
   });
+  scoreAudit = applyVirusTotalWarningAuditFields(scoreAudit, virusTotalWarningState, virusTotalWarningPolicy);
 
   return {
     scoring,
@@ -3351,9 +3831,14 @@ function buildCleanProviderRecoveryState({
     features.trustedRedirectDestination ||
     Number(features.redirectCount || 0) > 0
   );
+  const vtWarning = getVirusTotalWarningState(providerResults);
 
   if (!areProvidersCleanForMarketingMitigation(providerResults)) {
     recoveryBlockedReasons.push("provider checks were not all completed clean");
+  }
+
+  if (vtWarning.hasStrongConsensus || vtWarning.hasSuspiciousLevelWarning || vtWarning.hasCautionOnlyWarning) {
+    recoveryBlockedReasons.push("VirusTotal reported provider warning detections.");
   }
 
   if (!isCleanHighConfidenceResolvedEndpoint({
@@ -3451,8 +3936,7 @@ function areProvidersCleanForMarketingMitigation(providerResults = []) {
   const urlhaus = providers.find((item) => item.provider === "urlhaus");
   const vt = providers.find((item) => item.provider === "virustotal");
   const vtStatus = getProviderStatus(vt);
-  const vtMalicious = Number(vt?.details?.maliciousCount || 0);
-  const vtSuspicious = Number(vt?.details?.suspiciousCount || 0);
+  const vtWarning = getVirusTotalWarningState(providers);
 
   return Boolean(
     gsb?.checked === true &&
@@ -3465,10 +3949,9 @@ function areProvidersCleanForMarketingMitigation(providerResults = []) {
       (
         vt?.checked === true &&
         vt?.flagged !== true &&
-        Number.isFinite(vtMalicious) &&
-        Number.isFinite(vtSuspicious) &&
-        vtMalicious === 0 &&
-        vtSuspicious === 0
+        ["checked", "completed"].includes(vtStatus) &&
+        vtWarning.maliciousCount === 0 &&
+        vtWarning.suspiciousCount === 0
       )
     )
   );
@@ -4074,12 +4557,9 @@ for (const provider of normalizeProviderResults(providerResults)) {
   }
 
   if (provider.provider === "virustotal" && auditStatus === "completed") {
-    if (Number.isFinite(Number(provider.details?.maliciousCount))) {
-      details.push(`${label} malicious detections: ${Number(provider.details.maliciousCount)}.`);
-    }
-    if (Number.isFinite(Number(provider.details?.suspiciousCount))) {
-      details.push(`${label} suspicious detections: ${Number(provider.details.suspiciousCount)}.`);
-    }
+    const vtWarning = getVirusTotalWarningState(provider);
+    details.push(`${label} malicious detections: ${vtWarning.maliciousCount}.`);
+    details.push(`${label} suspicious detections: ${vtWarning.suspiciousCount}.`);
   }
 }
   const retryPlan = analysis.providerRetryPlan || {};
@@ -4197,6 +4677,11 @@ async function persistPostLevelAnalysis(postId, analysis) {
   if (!analysis || analysis.analysisMode === "internal-facebook-ignored") {
     return analysis;
   }
+
+  analysis = normalizeBackgroundTerminalState({
+    ...analysis,
+    postId: analysis.postId || postId
+  });
 
   try {
     const existingBaseline = await getBaseline(postId);
@@ -5467,12 +5952,20 @@ function buildVirusTotalCheckedResult({
   const harmlessCount = Number(stats.harmless || 0);
   const undetectedCount = Number(stats.undetected || 0);
   const timeoutCount = Number(stats.timeout || 0);
-  const signalLevel = getVirusTotalSignalLevel({
+  const vtWarning = getVirusTotalWarningState({
     details: {
       maliciousCount,
-      suspiciousCount
+      malicious: maliciousCount,
+      suspiciousCount,
+      suspicious: suspiciousCount,
+      last_analysis_stats: stats
     }
   });
+  const signalLevel = vtWarning.warningSeverity === "high"
+    ? "strong"
+    : vtWarning.warningSeverity === "suspicious"
+      ? "warning"
+      : vtWarning.warningSeverity;
   const flagged = signalLevel === "strong";
 
   updateVirusTotalHealth({
@@ -5498,16 +5991,19 @@ function buildVirusTotalCheckedResult({
       message: flagged
         ? "VirusTotal reported strong malicious consensus."
         : signalLevel === "warning"
-          ? "VirusTotal reported a weak warning signal."
+          ? vtWarning.warningLabel
           : signalLevel === "caution"
-            ? "VirusTotal reported a single suspicious detection."
-            : "VirusTotal reported no malicious detections.",
+            ? vtWarning.warningLabel
+            : "VirusTotal reported no malicious or suspicious detections.",
       analysisId,
       terminal: true,
       retryable: false,
       signalLevel,
       maliciousCount,
+      malicious: maliciousCount,
       suspiciousCount,
+      suspicious: suspiciousCount,
+      last_analysis_stats: stats,
       harmlessCount,
       undetectedCount,
       timeoutCount
@@ -6165,23 +6661,15 @@ async function finalizePendingProviderStateForPost(message = {}) {
   }
 
   if (hasLegacyPendingChildWithoutRefreshMetadata(storedAnalysis)) {
-    const legacyAnalysis = {
-      ...storedAnalysis,
-      classification: "Scan Pending",
-      safetyScore: null,
-      scanFinalized: false,
-      state: "pending-provider",
-      interceptionRecommended: false,
-      limitations: [
-        ...(storedAnalysis.limitations || []),
-        "Pending child-link refresh metadata was unavailable for this older analysis record; a manual rescan may be needed."
-      ].slice(0, 8)
-    };
+    const legacyAnalysis = normalizeTerminalIncompleteAnalysis(
+      storedAnalysis,
+      "Pending child-link refresh metadata was unavailable for this older analysis record; restart the scan to try again."
+    );
     const persistedLegacyAnalysis = await persistPostLevelAnalysis(postId, legacyAnalysis);
     return {
       type: MESSAGE_TYPES.FINALIZE_PENDING_PROVIDER_STATE,
       analysis: persistedLegacyAnalysis,
-      finalized: false,
+      finalized: true,
       reason: "missing-pending-child-refresh-metadata"
     };
   }
@@ -6332,15 +6820,22 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
     safeProviderResults
   );
   const previousComputedScore = recomputed?.finalScore ?? getBestStoredComputedScore(analysis);
-  const safetyScore = providerOverride
+  let safetyScore = providerOverride
     ? Math.min(previousComputedScore !== null ? previousComputedScore : (providerPolicy.providerOverrideCap || 30), providerPolicy.providerOverrideCap || 30)
     : previousComputedScore;
-  const recoveredSafetyScore = safetyScore !== null
+  let recoveredSafetyScore = safetyScore !== null
     ? safetyScore
     : toFiniteScoreOrNull(analysis.scoreAudit?.ruleScore);
-  const classification = providerOverride
+  let classification = providerOverride
     ? "High Risk"
     : (recomputed?.finalClassification || getBestStoredComputedClassification(analysis, recoveredSafetyScore));
+  const virusTotalWarningState = providerPolicy.virusTotalWarningState || getVirusTotalWarningState(safeProviderResults);
+  const virusTotalWarningPolicy = applyVirusTotalWarningScorePolicy(safetyScore, classification, virusTotalWarningState);
+  if (!providerOverride && safetyScore !== null) {
+    safetyScore = virusTotalWarningPolicy.finalScore;
+    recoveredSafetyScore = safetyScore;
+    classification = virusTotalWarningPolicy.finalClassification;
+  }
   let displayedScore = recoveredSafetyScore;
   let displayedClassification = classification;
   let displayedState = providerOverride === true
@@ -6369,12 +6864,13 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
   }
 
   const features = recomputed?.features || refreshedFeatures;
-  const scoreAudit = recomputed?.scoreAudit || refreshScoreAuditForProviderResult(analysis, {
+  let scoreAudit = recomputed?.scoreAudit || refreshScoreAuditForProviderResult(analysis, {
     providerOverride,
     providerOverrideCap: providerPolicy.providerOverrideCap || 30,
     safetyScore: recoveredSafetyScore,
     classification
   });
+  scoreAudit = applyVirusTotalWarningAuditFields(scoreAudit, virusTotalWarningState, virusTotalWarningPolicy);
   scoreAudit.scanFinalized = scanFinalized;
   scoreAudit.displayedScoreWithheld = (!scanFinalized && !providerOverride) || ((retryBudgetExhausted || terminalProviderLimitation) && !providerOverride);
   scoreAudit.computedSafetyScore = recoveredSafetyScore;
@@ -6510,7 +7006,7 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
     providerResults: safeProviderResults
   });
 
-  return refreshedAnalysis;
+  return normalizeBackgroundTerminalState(refreshedAnalysis);
 }
 
 function buildRefreshedLinkScoreSummary(linkScoreSummary = [], {
@@ -7321,6 +7817,7 @@ function getProviderOutcomeSummary(result = {}) {
   }
 
   if (provider === "virustotal") {
+    const vtWarning = getVirusTotalWarningState(result);
     if (!result.configured || status === "not-configured") {
       return "VirusTotal not configured.";
     }
@@ -7336,9 +7833,15 @@ function getProviderOutcomeSummary(result = {}) {
     if (status === "error" || status === "parse-error") {
       return "VirusTotal request failed.";
     }
+    if (vtWarning.maliciousCount > 0) {
+      return `VirusTotal reported ${vtWarning.maliciousCount} malicious detection${vtWarning.maliciousCount === 1 ? "" : "s"}.`;
+    }
+    if (vtWarning.suspiciousCount > 0) {
+      return `VirusTotal reported ${vtWarning.suspiciousCount} suspicious detection${vtWarning.suspiciousCount === 1 ? "" : "s"}.`;
+    }
     return result.flagged
       ? "VirusTotal reported malicious/suspicious detections."
-      : "VirusTotal reported no malicious detections.";
+      : "VirusTotal reported no malicious or suspicious detections.";
   }
 
   if (provider === "urlhaus" && status === "error") {

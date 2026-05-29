@@ -669,6 +669,45 @@ function csvEscape(value) {
   return `"${text.replace(/"/g, '""')}"`;
 }
 
+function getFirstFiniteProviderCount(...values) {
+  for (const value of values) {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && numeric >= 0) {
+      return numeric;
+    }
+  }
+
+  return 0;
+}
+
+function getVirusTotalProviderStats(provider = {}) {
+  const details = provider?.details || {};
+  const stats =
+    details.last_analysis_stats ||
+    details.lastAnalysisStats ||
+    provider.last_analysis_stats ||
+    provider.lastAnalysisStats ||
+    provider.stats ||
+    {};
+
+  return {
+    maliciousCount: getFirstFiniteProviderCount(
+      details.maliciousCount,
+      details.malicious,
+      provider.maliciousCount,
+      provider.malicious,
+      stats.malicious
+    ),
+    suspiciousCount: getFirstFiniteProviderCount(
+      details.suspiciousCount,
+      details.suspicious,
+      provider.suspiciousCount,
+      provider.suspicious,
+      stats.suspicious
+    )
+  };
+}
+
 function getProviderOutcomeSummary(provider = {}) {
   if (!provider || typeof provider !== "object") {
     return "";
@@ -678,6 +717,7 @@ function getProviderOutcomeSummary(provider = {}) {
   const status = String(provider.details?.status || "").toLowerCase();
 
   if (providerName === "virustotal") {
+    const vtStats = getVirusTotalProviderStats(provider);
     if (!provider.configured || status === "not-configured") {
       return "VirusTotal not configured.";
     }
@@ -693,9 +733,15 @@ function getProviderOutcomeSummary(provider = {}) {
     if (status === "error" || status === "parse-error") {
       return "VirusTotal request failed.";
     }
+    if (vtStats.maliciousCount > 0) {
+      return `VirusTotal reported ${vtStats.maliciousCount} malicious detection${vtStats.maliciousCount === 1 ? "" : "s"}.`;
+    }
+    if (vtStats.suspiciousCount > 0) {
+      return `VirusTotal reported ${vtStats.suspiciousCount} suspicious detection${vtStats.suspiciousCount === 1 ? "" : "s"}.`;
+    }
     return provider.flagged
       ? "VirusTotal reported malicious/suspicious detections."
-      : "VirusTotal reported no malicious detections.";
+      : "VirusTotal reported no malicious or suspicious detections.";
   }
 
   if (providerName === "urlhaus" && status === "error") {
