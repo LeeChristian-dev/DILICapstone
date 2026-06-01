@@ -601,7 +601,7 @@ function getVirusTotalWarningState(providerResults = []) {
       hasSuspiciousLevelWarning: false,
       hasCautionOnlyWarning: false,
       warningSeverity: "high",
-      warningLabel: "VirusTotal reported strong malicious consensus.",
+      warningLabel: "VirusTotal reported multiple malicious or suspicious detections.",
       recoveryCap: 30,
       classificationFloor: "High Risk",
       status
@@ -686,7 +686,6 @@ function buildProviderOverridePolicy(providerResults = []) {
   if (gsb.flagged === true) {
     return {
       providerOverride: true,
-      providerOverrideCap: 25,
       providerOverrideSource: "gsb",
       providerOverrideReason: "Google Safe Browsing flagged this link.",
       virusTotalSignalLevel: vtSignalLevel,
@@ -697,7 +696,6 @@ function buildProviderOverridePolicy(providerResults = []) {
   if (urlhaus.flagged === true) {
     return {
       providerOverride: true,
-      providerOverrideCap: 25,
       providerOverrideSource: "urlhaus",
       providerOverrideReason: "URLhaus flagged this link.",
       virusTotalSignalLevel: vtSignalLevel,
@@ -708,9 +706,8 @@ function buildProviderOverridePolicy(providerResults = []) {
   if (vtWarningState.hasStrongConsensus) {
     return {
       providerOverride: true,
-      providerOverrideCap: 30,
       providerOverrideSource: "virustotal",
-      providerOverrideReason: "VirusTotal reported strong malicious consensus.",
+      providerOverrideReason: "VirusTotal reported multiple malicious or suspicious detections.",
       virusTotalSignalLevel: vtSignalLevel,
       virusTotalWarningState: vtWarningState
     };
@@ -718,7 +715,6 @@ function buildProviderOverridePolicy(providerResults = []) {
 
   return {
     providerOverride: false,
-    providerOverrideCap: null,
     providerOverrideSource: "",
     providerOverrideReason: "",
     virusTotalSignalLevel: vtSignalLevel,
@@ -739,42 +735,39 @@ function applyVirusTotalWarningScorePolicy(finalScore, finalClassification, vtWa
     };
   }
 
+  // VirusTotal now contributes through the weighted provider deduction in
+  // riskEngine.js. This helper only preserves display/audit wording for older
+  // call sites and must not cap or force a classification.
   if (vtWarning.hasStrongConsensus) {
-    const cappedScore = Math.min(numericScore, vtWarning.recoveryCap || 30);
     return {
-      finalScore: cappedScore,
-      finalClassification: "High Risk",
-      providerWarningApplied: true,
+      finalScore: numericScore,
+      finalClassification,
+      providerWarningApplied: false,
       providerCautionApplied: false,
-      providerWarningReason: vtWarning.warningLabel || "VirusTotal reported strong malicious consensus.",
-      providerWarningScoreCap: vtWarning.recoveryCap || 30
+      providerWarningReason: vtWarning.warningLabel || "VirusTotal reported multiple malicious or suspicious detections.",
+      providerWarningScoreCap: null
     };
   }
 
   if (vtWarning.hasSuspiciousLevelWarning) {
-    const cappedScore = Math.min(numericScore, vtWarning.recoveryCap || 79);
-    const classification = classifySafetyScore(cappedScore) === "Safe"
-      ? "Suspicious"
-      : classifySafetyScore(cappedScore);
     return {
-      finalScore: cappedScore,
-      finalClassification: classification,
-      providerWarningApplied: true,
+      finalScore: numericScore,
+      finalClassification,
+      providerWarningApplied: false,
       providerCautionApplied: false,
       providerWarningReason: "VirusTotal reported a provider warning signal.",
-      providerWarningScoreCap: vtWarning.recoveryCap || 79
+      providerWarningScoreCap: null
     };
   }
 
   if (vtWarning.hasCautionOnlyWarning) {
-    const cappedScore = Math.min(numericScore, vtWarning.recoveryCap || 94);
     return {
-      finalScore: cappedScore,
-      finalClassification: classifySafetyScore(cappedScore),
+      finalScore: numericScore,
+      finalClassification,
       providerWarningApplied: false,
       providerCautionApplied: true,
       providerWarningReason: "VirusTotal reported one suspicious detection.",
-      providerWarningScoreCap: vtWarning.recoveryCap || 94
+      providerWarningScoreCap: null
     };
   }
 
@@ -788,12 +781,61 @@ function applyVirusTotalWarningScorePolicy(finalScore, finalClassification, vtWa
   };
 }
 
-function applyVirusTotalWarningAuditFields(scoreAudit = {}, vtWarning = {}, warningPolicy = {}) {
+function buildVirusTotalProviderWarningReviewRecommendation({
+  finalScore,
+  finalClassification,
+  scoreAudit = {},
+  providerOverride = false,
+  providerOverrideSource = "",
+  virusTotalWarningState = {},
+  providerResults = []
+} = {}) {
+  const score = toFiniteScoreOrNull(finalScore ?? scoreAudit.finalScore ?? scoreAudit.computedSafetyScore);
+  const classification = String(finalClassification || scoreAudit.finalClassification || scoreAudit.computedClassification || scoreAudit.classification || "").toLowerCase();
+  const providerDeductions = scoreAudit.providerDeductions || {};
+  const vtDeduction = toFiniteScoreOrNull(providerDeductions.virustotal);
+  const vtHits = Number(virusTotalWarningState.maliciousCount || 0) + Number(virusTotalWarningState.suspiciousCount || 0);
+  const normalizedProviders = normalizeProviderResults(providerResults);
+  const gsb = normalizedProviders.find((item) => item.provider === "gsb");
+  const urlhaus = normalizedProviders.find((item) => item.provider === "urlhaus");
+  const strongerProviderWarning = Boolean(
+    providerOverride === true && (providerOverrideSource === "gsb" || providerOverrideSource === "urlhaus")
+  ) || Boolean(gsb?.flagged === true || urlhaus?.flagged === true) || Boolean((toFiniteScoreOrNull(providerDeductions.gsb) || 0) > 0 || (toFiniteScoreOrNull(providerDeductions.urlhaus) || 0) > 0);
+
+  if (
+    providerOverride === true ||
+    strongerProviderWarning ||
+    score === null ||
+    score < 80 ||
+    classification !== "safe"
+  ) {
+    return {
+      providerWarningReviewRecommended: false,
+      reviewRecommendedReason: ""
+    };
+  }
+
+  if (vtDeduction > 0 || vtHits > 0) {
+    return {
+      providerWarningReviewRecommended: true,
+      reviewRecommendedReason: "VirusTotal reported low-count malicious/suspicious detections. The score remains Safe, but DILI recommends reviewing the link before opening it."
+    };
+  }
+
+  return {
+    providerWarningReviewRecommended: false,
+    reviewRecommendedReason: ""
+  };
+}
+
+function applyVirusTotalWarningAuditFields(scoreAudit = {}, vtWarning = {}, warningPolicy = {}, reviewRecommendation = {}) {
   return {
     ...scoreAudit,
     providerWarningApplied: warningPolicy.providerWarningApplied === true,
     providerCautionApplied: warningPolicy.providerCautionApplied === true,
-    providerWarningReason: warningPolicy.providerWarningReason || "",
+    providerWarningReviewRecommended: reviewRecommendation.providerWarningReviewRecommended === true,
+    reviewRecommendedReason: reviewRecommendation.reviewRecommendedReason || "",
+    providerWarningReason: warningPolicy.providerWarningReason || reviewRecommendation.reviewRecommendedReason || "",
     virusTotalMaliciousDetections: vtWarning.maliciousCount || 0,
     virusTotalSuspiciousDetections: vtWarning.suspiciousCount || 0,
     providerWarningScoreCap: warningPolicy.providerWarningScoreCap ?? null,
@@ -1085,6 +1127,12 @@ function buildStoredLinkAnalysisSnapshot(analysis = {}, index = 0) {
     providerResults,
     providerCompletion,
     providerRetryPlan: cloneValue(analysis.providerRetryPlan || {}),
+    providerDeductions: cloneValue(analysis.providerDeductions || analysis.scoreAudit?.providerDeductions || {}),
+    heuristicRawCategoryTotals: cloneValue(analysis.heuristicRawCategoryTotals || analysis.scoreAudit?.heuristicRawCategoryTotals || {}),
+    heuristicCategoryDeductions: cloneValue(analysis.heuristicCategoryDeductions || analysis.scoreAudit?.heuristicCategoryDeductions || {}),
+    heuristicRawTotal: analysis.heuristicRawTotal ?? analysis.scoreAudit?.heuristicRawTotal ?? null,
+    heuristicScaledDeduction: analysis.heuristicScaledDeduction ?? analysis.scoreAudit?.heuristicScaledDeduction ?? null,
+    totalDeduction: analysis.totalDeduction ?? analysis.scoreAudit?.ruleDeductionTotal ?? null,
     pendingProviders: Array.isArray(analysis.pendingProviders)
       ? analysis.pendingProviders
       : Array.isArray(providerCompletion.pendingProviders)
@@ -1143,13 +1191,17 @@ function normalizeStoredLinkAnalysisSnapshot(analysis = {}) {
   if (providerPolicy.providerOverride) {
     const score = toFiniteScoreOrNull(analysis.safetyScore) ??
       toFiniteScoreOrNull(analysis.computedSafetyScore) ??
-      providerPolicy.providerOverrideCap;
+      toFiniteScoreOrNull(analysis.scoreAudit?.finalScore) ??
+      null;
+    const classification = score !== null
+      ? classifySafetyScore(score)
+      : (analysis.computedClassification || analysis.classification || "Unverified");
 
     return {
       ...analysis,
-      classification: "High Risk",
+      classification,
       safetyScore: score,
-      computedClassification: "High Risk",
+      computedClassification: classification,
       computedSafetyScore: score,
       scanFinalized: true,
       state: "completed",
@@ -1481,12 +1533,12 @@ const canUseNoLinkInjectionBaseline = Boolean(
   features = applyKnownGoogleFormsRedirectMitigation(features, reusableUrlAnalysis, endpointResult);
   features = applyKnownBrandAliasRedirectMitigation(features, reusableUrlAnalysis, endpointResult, providerResults);
   features = applyCleanResolvedMarketingLinkMitigation(features, reusableUrlAnalysis, endpointResult, providerResults);
-  const urlLevelScoring = calculateSafetyScore(urlLevelFeatures);
+  const urlLevelScoring = calculateSafetyScore(urlLevelFeatures, providerResults);
   const providerPolicy = buildProviderOverridePolicy(providerResults);
   const providerOverride = providerPolicy.providerOverride;
-  const urlLevelClassification = providerOverride ? "High Risk" : classifySafetyScore(urlLevelScoring.score);
+  const urlLevelClassification = classifySafetyScore(urlLevelScoring.score);
 const scoringStartedAt = nowMs();
-const scoring = calculateSafetyScore(features);
+const scoring = calculateSafetyScore(features, providerResults);
 performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
   const endpointResolutionFailed = Boolean(
     !endpointResult?.effectiveEndpoint ||
@@ -1524,64 +1576,41 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     !concreteRiskSignals
   );
   const providerCapBeforeScore = scoring.score;
-  const providerCap = providerPolicy.providerOverrideCap || 30;
-  const providerCapAfterScore = providerOverride
-    ? Math.min(providerCapBeforeScore, providerCap)
-    : providerCapBeforeScore;
+  const providerCap = null;
+  const providerCapAfterScore = scoring.score;
 
-  let finalScore = providerCapAfterScore;
+  let finalScore = scoring.score;
 
   let verificationCapReason = "";
   const verificationCapBeforeScore = finalScore;
 
-  if (!providerOverride && concreteRiskSignals && verificationState === "unverified") {
-    finalScore = Math.min(finalScore, 74);
-    if (finalScore < verificationCapBeforeScore) {
-      verificationCapReason = "unverified endpoint with concrete risk signals";
-    }
-  } else if (!providerOverride && concreteRiskSignals && verificationState === "low-confidence") {
-    finalScore = Math.min(finalScore, 79);
-    if (finalScore < verificationCapBeforeScore) {
-      verificationCapReason = "low-confidence endpoint with concrete risk signals";
-    }
-  }
-
   const verificationCapAfterScore = finalScore;
 
   const softCapBeforeScore = finalScore;
-  const cappedScore = applySoftUncertaintyCap(finalScore, {
-    features,
-    endpointResult,
-    domain,
-    providerOverride
-  });
+  const cappedScore = finalScore;
   const softUncertaintyCapApplied = Number(cappedScore) !== Number(finalScore);
   finalScore = cappedScore;
   const softCapAfterScore = finalScore;
 
-  const recovery = !providerOverride
-    ? buildCleanProviderRecoveryState({
-        features,
-        endpointResult,
-        providerResults,
-        visibleUrl: urlFeatures.rawComparableUrl || urlFeatures.unwrappedUrl || urlFeatures.normalizedUrl || analysisUrl,
-        providerCheckedUrl,
-        finalUrl: endpointResult?.effectiveEndpoint || analysisUrl,
-        finalDomain: domain,
-        baseScore: finalScore
-      })
-    : {
-        recoveryApplied: false,
-        recoveryFloor: null,
-        recoveryReason: "",
-        recoveryBlockedReasons: ["provider override applied"],
-        activeHeuristicGroups: getActiveHeuristicGroups(features),
-        mitigatedHeuristicGroups: getMitigatedHeuristicGroups(features)
-      };
-
-  if (recovery.recoveryApplied === true) {
-    finalScore = Math.max(finalScore, recovery.recoveryFloor || 80);
-  }
+  const recoveryBase = buildCleanProviderRecoveryState({
+    features,
+    endpointResult,
+    providerResults,
+    visibleUrl: urlFeatures.rawComparableUrl || urlFeatures.unwrappedUrl || urlFeatures.normalizedUrl || analysisUrl,
+    providerCheckedUrl,
+    finalUrl: endpointResult?.effectiveEndpoint || analysisUrl,
+    finalDomain: domain,
+    baseScore: finalScore
+  });
+  const recovery = {
+    ...recoveryBase,
+    recoveryApplied: false,
+    recoveryFloor: null,
+    recoveryReason: recoveryBase.recoveryEligible
+      ? "Clean-provider mitigation was applied inside weighted heuristic scoring."
+      : "",
+    recoveryBlockedReasons: recoveryBase.recoveryEligible ? [] : recoveryBase.recoveryBlockedReasons
+  };
 
   let finalFeatures = softUncertaintyCapApplied
     ? {
@@ -1594,8 +1623,8 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
         cleanProviderRecoveryApplied: recovery.recoveryApplied === true
       };
 
+  const demoScoreBias = { enabled: false, amount: 0 };
   const originalFinalScore = finalScore;
-  const demoScoreBias = await getDemoScoreBiasConfig();
   const demoBiasBeforeScore = finalScore;
 
   if (demoScoreBias.enabled) {
@@ -1611,30 +1640,26 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
 
   const demoBiasAfterScore = finalScore;
 
-  let finalClassification = providerOverride
-    ? "High Risk"
-    : verificationOnlyUnknown
+  let finalClassification = verificationOnlyUnknown
       ? "Unverified"
       : classifySafetyScore(finalScore);
   const virusTotalWarningState = providerPolicy.virusTotalWarningState || getVirusTotalWarningState(providerResults);
   const virusTotalWarningPolicy = applyVirusTotalWarningScorePolicy(finalScore, finalClassification, virusTotalWarningState);
-  if (!verificationOnlyUnknown || providerOverride) {
+  if (!verificationOnlyUnknown) {
     finalScore = virusTotalWarningPolicy.finalScore;
-    finalClassification = providerOverride
-      ? "High Risk"
-      : virusTotalWarningPolicy.finalClassification;
+    finalClassification = virusTotalWarningPolicy.finalClassification;
   }
-  if (!providerOverride && virusTotalWarningState.warningSeverity === "suspicious") {
+  if (virusTotalWarningState.warningSeverity === "suspicious") {
     finalFeatures = {
       ...finalFeatures,
       virusTotalProviderWarning: true,
-      virusTotalWarningScoreCap: virusTotalWarningPolicy.providerWarningScoreCap || 79
+      virusTotalWarningScoreCap: null
     };
-  } else if (!providerOverride && virusTotalWarningState.warningSeverity === "caution") {
+  } else if (virusTotalWarningState.warningSeverity === "caution") {
     finalFeatures = {
       ...finalFeatures,
       virusTotalProviderCaution: true,
-      virusTotalWarningScoreCap: virusTotalWarningPolicy.providerWarningScoreCap || 94
+      virusTotalWarningScoreCap: null
     };
   }
   const rawProviderCompletion = buildProviderCompletionState(providerResults);
@@ -1673,7 +1698,6 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
   let scoreAudit = buildScoreAudit({
     scoring,
     providerOverride,
-    providerOverrideCap: providerCap,
     providerCapBeforeScore,
     providerCapAfterScore,
     verificationState,
@@ -1691,6 +1715,16 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     finalClassification
   });
   scoreAudit = applyVirusTotalWarningAuditFields(scoreAudit, virusTotalWarningState, virusTotalWarningPolicy);
+  const virusTotalReviewRecommendation = buildVirusTotalProviderWarningReviewRecommendation({
+    finalScore,
+    finalClassification,
+    scoreAudit,
+    providerOverride,
+    providerOverrideSource: providerPolicy.providerOverrideSource,
+    virusTotalWarningState,
+    providerResults
+  });
+  scoreAudit = applyVirusTotalWarningAuditFields(scoreAudit, virusTotalWarningState, virusTotalWarningPolicy, virusTotalReviewRecommendation);
   scoreAudit.scanFinalized = scanFinalized;
   scoreAudit.displayedScoreWithheld = (!scanFinalized && !providerOverride) || terminalProviderLimitation;
   scoreAudit.computedSafetyScore = finalScore;
@@ -1714,7 +1748,8 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     providerOverride === true ||
     finalClassification === "High Risk" ||
     finalClassification === "Suspicious" ||
-    Number(finalScore) < 80;
+    Number(finalScore) < 80 ||
+    virusTotalReviewRecommendation.providerWarningReviewRecommended === true;
   const finalUrlFeatureAnalysis = {
     ...enrichedUrlFeatures,
     providerCheckedUrl: reusableUrlAnalysis.providerCheckedUrl || "",
@@ -1772,10 +1807,17 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     ruleScore: scoring.score,
     totalDeduction: scoring.totalDeduction,
     categoryDeductions: scoring.categoryDeductions,
+    providerDeductions: scoring.providerDeductions,
+    heuristicRawCategoryTotals: scoring.heuristicRawCategoryTotals,
+    heuristicCategoryDeductions: scoring.heuristicCategoryDeductions,
+    heuristicRawTotal: scoring.heuristicRawTotal,
+    heuristicScaledDeduction: scoring.heuristicScaledDeduction,
     verificationState,
     verificationOnlyUnknown,
     concreteRiskSignals,
     interceptionRecommended: providerOverride === true ? true : (scanFinalized && !terminalProviderLimitation ? finalInterceptionRecommended : false),
+    providerWarningReviewRecommended: virusTotalReviewRecommendation.providerWarningReviewRecommended,
+    reviewRecommendedReason: virusTotalReviewRecommendation.reviewRecommendedReason,
     features: finalFeatures,
     deductions: scoring.deductions,
     scoreAudit,
@@ -1877,7 +1919,17 @@ if (providerFlaggedDomain) {
       ruleScore: scoring.score,
       totalDeduction: scoring.totalDeduction,
       categoryDeductions: scoring.categoryDeductions,
+      providerDeductions: scoring.providerDeductions,
+      heuristicRawCategoryTotals: scoring.heuristicRawCategoryTotals,
+      heuristicCategoryDeductions: scoring.heuristicCategoryDeductions,
+      heuristicRawTotal: scoring.heuristicRawTotal,
+      heuristicScaledDeduction: scoring.heuristicScaledDeduction,
       scoreAudit: record.scoreAudit,
+      providerDeductions: record.providerDeductions,
+      heuristicRawCategoryTotals: record.heuristicRawCategoryTotals,
+      heuristicCategoryDeductions: record.heuristicCategoryDeductions,
+      heuristicRawTotal: record.heuristicRawTotal,
+      heuristicScaledDeduction: record.heuristicScaledDeduction,
       classification: record.classification,
       computedClassification: record.computedClassification,
       computedSafetyScore: record.computedSafetyScore,
@@ -3423,7 +3475,6 @@ function getBestStoredComputedClassification(analysis = {}, score = null) {
 function buildScoreAudit({
   scoring = {},
   providerOverride = false,
-  providerOverrideCap = 30,
   providerCapBeforeScore,
   providerCapAfterScore,
   verificationState = "",
@@ -3460,17 +3511,24 @@ function buildScoreAudit({
     triggeredMitigationCreditTotal: sumTriggeredMitigationCredits(deductions),
     ruleDeductionTotal: Number.isFinite(ruleDeductionTotal) ? ruleDeductionTotal : null,
     ruleScore: Number.isFinite(ruleScore) ? ruleScore : null,
+    providerDeductions: scoring.providerDeductions || { gsb: 0, urlhaus: 0, virustotal: 0 },
+    providerDeductionTotal: Number.isFinite(Number(scoring.providerDeductionTotal))
+      ? Number(scoring.providerDeductionTotal)
+      : null,
+    providerAudit: scoring.providerAudit || {},
+    heuristicRawCategoryTotals: scoring.heuristicRawCategoryTotals || {},
+    heuristicCategoryDeductions: scoring.heuristicCategoryDeductions || {},
+    heuristicRawTotal: Number.isFinite(Number(scoring.heuristicRawTotal))
+      ? Number(scoring.heuristicRawTotal)
+      : null,
+    heuristicScaledDeduction: Number.isFinite(Number(scoring.heuristicScaledDeduction))
+      ? Number(scoring.heuristicScaledDeduction)
+      : null,
+    scoreFormula: scoring.scoreFormula || "100 - (D_GSB + D_URLHaus + D_VT + D_H)",
     categoryDeductions: scoring.categoryDeductions || {},
     categoryAudit: scoring.categoryAudit || {},
-    providerOverrideCap: {
-      applied: Boolean(
-        providerOverride &&
-        Number.isFinite(providerBefore) &&
-        Number.isFinite(providerAfter) &&
-        providerAfter < providerBefore
-      ),
-      providerOverride: providerOverride === true,
-      cap: providerOverrideCap,
+    providerFlag: {
+      recorded: providerOverride === true,
       beforeScore: Number.isFinite(providerBefore) ? providerBefore : null,
       afterScore: Number.isFinite(providerAfter) ? providerAfter : null
     },
@@ -3520,7 +3578,6 @@ function buildScoreAudit({
 
 function refreshScoreAuditForProviderResult(analysis = {}, {
   providerOverride = false,
-  providerOverrideCap = 30,
   safetyScore,
   classification
 } = {}) {
@@ -3536,18 +3593,11 @@ function refreshScoreAuditForProviderResult(analysis = {}, {
 
   return {
     ...previousAudit,
-    providerOverrideCap: {
-      ...(previousAudit.providerOverrideCap || {}),
-      applied: Boolean(
-        providerOverride &&
-        previousScore !== null &&
-        refreshedScore !== null &&
-        refreshedScore < previousScore
-      ),
-      providerOverride: providerOverride === true,
-      cap: providerOverrideCap,
-      beforeScore: previousScore !== null ? previousScore : (previousAudit.providerOverrideCap?.beforeScore ?? null),
-      afterScore: refreshedScore !== null ? refreshedScore : (previousAudit.providerOverrideCap?.afterScore ?? null)
+    providerFlag: {
+      ...(previousAudit.providerFlag || {}),
+      recorded: providerOverride === true,
+      beforeScore: previousScore !== null ? previousScore : (previousAudit.providerFlag?.beforeScore ?? null),
+      afterScore: refreshedScore !== null ? refreshedScore : (previousAudit.providerFlag?.afterScore ?? null)
     },
     finalScore: refreshedScore !== null ? refreshedScore : (previousAudit.finalScore ?? null),
     classification: formatScoreAuditClassification(
@@ -3558,17 +3608,15 @@ function refreshScoreAuditForProviderResult(analysis = {}, {
   };
 }
 
-function recomputeStoredFinalScoreFromFeatures(analysis = {}, features = {}, providerOverride = false, providerOverrideCap = 30, providerResults = []) {
+function recomputeStoredFinalScoreFromFeatures(analysis = {}, features = {}, providerOverride = false, providerResults = []) {
   if (!features || typeof features !== "object" || Object.keys(features).length === 0) {
     return null;
   }
 
-  const scoring = calculateSafetyScore(features);
+  const scoring = calculateSafetyScore(features, providerResults);
   const providerCapBeforeScore = scoring.score;
-  const providerCapAfterScore = providerOverride
-    ? Math.min(providerCapBeforeScore, providerOverrideCap)
-    : providerCapBeforeScore;
-  let finalScore = providerCapAfterScore;
+  const providerCapAfterScore = scoring.score;
+  let finalScore = scoring.score;
   const verificationState = String(analysis.verificationState || "").toLowerCase();
   const concreteRiskSignals = Boolean(
     providerOverride ||
@@ -3589,52 +3637,31 @@ function recomputeStoredFinalScoreFromFeatures(analysis = {}, features = {}, pro
   let verificationCapReason = "";
   const verificationCapBeforeScore = finalScore;
 
-  if (!providerOverride && concreteRiskSignals && verificationState === "unverified") {
-    finalScore = Math.min(finalScore, 74);
-    if (finalScore < verificationCapBeforeScore) {
-      verificationCapReason = "unverified endpoint with concrete risk signals";
-    }
-  } else if (!providerOverride && concreteRiskSignals && verificationState === "low-confidence") {
-    finalScore = Math.min(finalScore, 79);
-    if (finalScore < verificationCapBeforeScore) {
-      verificationCapReason = "low-confidence endpoint with concrete risk signals";
-    }
-  }
-
   const verificationCapAfterScore = finalScore;
   const softCapBeforeScore = finalScore;
-  const softCapAfterScore = applySoftUncertaintyCap(finalScore, {
-    features,
-    endpointResult: analysis.endpointResult || {},
-    domain: analysis.domain || analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
-    providerOverride
-  });
+  const softCapAfterScore = finalScore;
   const softUncertaintyCapApplied = Number(softCapAfterScore) !== Number(finalScore);
   finalScore = softCapAfterScore;
 
-  const recovery = !providerOverride
-    ? buildCleanProviderRecoveryState({
-        features,
-        endpointResult: analysis.endpointResult || {},
-        providerResults,
-        visibleUrl: analysis.urlFeatureAnalysis?.displayUrl || analysis.urlFeatureAnalysis?.sourceRawComparableUrl || analysis.analysisUrl || "",
-        providerCheckedUrl: analysis.endpointResult?.effectiveEndpoint || analysis.analysisUrl || "",
-        finalUrl: analysis.endpointResult?.effectiveEndpoint || analysis.analysisUrl || "",
-        finalDomain: analysis.domain || analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
-        baseScore: finalScore
-      })
-    : {
-        recoveryApplied: false,
-        recoveryFloor: null,
-        recoveryReason: "",
-        recoveryBlockedReasons: ["provider override applied"],
-        activeHeuristicGroups: getActiveHeuristicGroups(features),
-        mitigatedHeuristicGroups: getMitigatedHeuristicGroups(features)
-      };
-
-  if (recovery.recoveryApplied === true) {
-    finalScore = Math.max(finalScore, recovery.recoveryFloor || 80);
-  }
+  const recoveryBase = buildCleanProviderRecoveryState({
+    features,
+    endpointResult: analysis.endpointResult || {},
+    providerResults,
+    visibleUrl: analysis.urlFeatureAnalysis?.displayUrl || analysis.urlFeatureAnalysis?.sourceRawComparableUrl || analysis.analysisUrl || "",
+    providerCheckedUrl: analysis.endpointResult?.effectiveEndpoint || analysis.analysisUrl || "",
+    finalUrl: analysis.endpointResult?.effectiveEndpoint || analysis.analysisUrl || "",
+    finalDomain: analysis.domain || analysis.endpointResult?.effectiveDomain || analysis.urlFeatureAnalysis?.finalDomain || "",
+    baseScore: finalScore
+  });
+  const recovery = {
+    ...recoveryBase,
+    recoveryApplied: false,
+    recoveryFloor: null,
+    recoveryReason: recoveryBase.recoveryEligible
+      ? "Clean-provider mitigation was applied inside weighted heuristic scoring."
+      : "",
+    recoveryBlockedReasons: recoveryBase.recoveryEligible ? [] : recoveryBase.recoveryBlockedReasons
+  };
 
   let finalFeatures = softUncertaintyCapApplied
     ? {
@@ -3646,36 +3673,31 @@ function recomputeStoredFinalScoreFromFeatures(analysis = {}, features = {}, pro
         ...features,
         cleanProviderRecoveryApplied: recovery.recoveryApplied === true
       };
-  let finalClassification = providerOverride
-    ? "High Risk"
-    : analysis.verificationOnlyUnknown === true
+  let finalClassification = analysis.verificationOnlyUnknown === true
       ? "Unverified"
       : classifySafetyScore(finalScore);
   const virusTotalWarningState = getVirusTotalWarningState(providerResults);
   const virusTotalWarningPolicy = applyVirusTotalWarningScorePolicy(finalScore, finalClassification, virusTotalWarningState);
-  if (analysis.verificationOnlyUnknown !== true || providerOverride) {
+  if (analysis.verificationOnlyUnknown !== true) {
     finalScore = virusTotalWarningPolicy.finalScore;
-    finalClassification = providerOverride
-      ? "High Risk"
-      : virusTotalWarningPolicy.finalClassification;
+    finalClassification = virusTotalWarningPolicy.finalClassification;
   }
-  if (!providerOverride && virusTotalWarningState.warningSeverity === "suspicious") {
+  if (virusTotalWarningState.warningSeverity === "suspicious") {
     finalFeatures = {
       ...finalFeatures,
       virusTotalProviderWarning: true,
-      virusTotalWarningScoreCap: virusTotalWarningPolicy.providerWarningScoreCap || 79
+      virusTotalWarningScoreCap: null
     };
-  } else if (!providerOverride && virusTotalWarningState.warningSeverity === "caution") {
+  } else if (virusTotalWarningState.warningSeverity === "caution") {
     finalFeatures = {
       ...finalFeatures,
       virusTotalProviderCaution: true,
-      virusTotalWarningScoreCap: virusTotalWarningPolicy.providerWarningScoreCap || 94
+      virusTotalWarningScoreCap: null
     };
   }
   let scoreAudit = buildScoreAudit({
     scoring,
     providerOverride,
-    providerOverrideCap,
     providerCapBeforeScore,
     providerCapAfterScore,
     verificationState,
@@ -4638,22 +4660,42 @@ function isVirusTotalResultDisplayRelevant(provider = {}) {
 
 function shouldRecommendInterceptionForStoredAnalysis(analysis = {}) {
   const score = toFiniteScoreOrNull(analysis.safetyScore);
-  const classification = String(analysis.classification || "").toLowerCase();
+  const classification = String(analysis.classification || analysis.computedClassification || analysis.scoreAudit?.classification || analysis.scoreAudit?.computedClassification || "").toLowerCase();
   const providerResults = normalizeProviderResults(analysis.providerResults || []);
   const gsb = providerResults.find((item) => item.provider === "gsb");
   const urlhaus = providerResults.find((item) => item.provider === "urlhaus");
   const virusTotal = providerResults.find((item) => item.provider === "virustotal");
+  const reviewRecommended = Boolean(
+    analysis.providerWarningReviewRecommended === true ||
+    analysis.scoreAudit?.providerWarningReviewRecommended === true ||
+    (
+      score !== null &&
+      score >= 80 &&
+      classification === "safe" &&
+      !analysis.providerOverride &&
+      !gsb?.flagged &&
+      !urlhaus?.flagged &&
+      (
+        toFiniteScoreOrNull(analysis.providerDeductions?.virustotal) > 0 ||
+        toFiniteScoreOrNull(analysis.scoreAudit?.providerDeductions?.virustotal) > 0 ||
+        Number(analysis.scoreAudit?.virusTotalMaliciousDetections || 0) + Number(analysis.scoreAudit?.virusTotalSuspiciousDetections || 0) > 0
+      )
+    )
+  );
 
   if (analysis.providerOverride === true || gsb?.flagged || urlhaus?.flagged || virusTotal?.flagged) {
+    return true;
+  }
+  if (reviewRecommended) {
     return true;
   }
   if (classification.includes("high risk") || classification.includes("suspicious")) {
     return true;
   }
 
-if (score !== null && score < 80) {
-  return true;
-}
+  if (score !== null && score < 80) {
+    return true;
+  }
   return false;
 }
 
@@ -4714,6 +4756,12 @@ async function persistPostLevelAnalysis(postId, analysis) {
       providerPending: analysis.providerPending,
       providerCompletion: analysis.providerCompletion,
       pendingProviders: analysis.pendingProviders,
+      providerDeductions: analysis.providerDeductions,
+      heuristicRawCategoryTotals: analysis.heuristicRawCategoryTotals,
+      heuristicCategoryDeductions: analysis.heuristicCategoryDeductions,
+      heuristicRawTotal: analysis.heuristicRawTotal,
+      heuristicScaledDeduction: analysis.heuristicScaledDeduction,
+      totalDeduction: analysis.totalDeduction,
       scoreAudit: analysis.scoreAudit,
       classification: analysis.classification,
       analyzedLinkCount: analysis.analyzedLinkCount,
@@ -5999,7 +6047,7 @@ function buildVirusTotalCheckedResult({
       status: "checked",
       httpStatus,
       message: flagged
-        ? "VirusTotal reported strong malicious consensus."
+        ? "VirusTotal reported multiple malicious or suspicious detections."
         : signalLevel === "warning"
           ? vtWarning.warningLabel
           : signalLevel === "caution"
@@ -6396,9 +6444,11 @@ function aggregatePostAnalysisFromLinkSnapshots(storedAnalysis = {}, linkAnalyse
   };
 
   if (providerOverrideChildren.length > 0) {
-    aggregated.classification = selected.classification || "High Risk";
+    const selectedScore = toFiniteScoreOrNull(selected.safetyScore) ?? toFiniteScoreOrNull(selected.computedSafetyScore);
+    const selectedClassification = selected.classification || selected.computedClassification || (selectedScore !== null ? classifySafetyScore(selectedScore) : "Unverified");
+    aggregated.classification = selectedClassification;
     aggregated.safetyScore = selected.safetyScore;
-    aggregated.computedClassification = selected.computedClassification || selected.classification || "High Risk";
+    aggregated.computedClassification = selected.computedClassification || selectedClassification;
     aggregated.computedSafetyScore = selected.computedSafetyScore;
     aggregated.providerOverride = true;
     aggregated.scanFinalized = true;
@@ -6826,22 +6876,17 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
     analysis,
     refreshedFeatures,
     providerOverride,
-    providerPolicy.providerOverrideCap || 30,
     safeProviderResults
   );
   const previousComputedScore = recomputed?.finalScore ?? getBestStoredComputedScore(analysis);
-  let safetyScore = providerOverride
-    ? Math.min(previousComputedScore !== null ? previousComputedScore : (providerPolicy.providerOverrideCap || 30), providerPolicy.providerOverrideCap || 30)
-    : previousComputedScore;
+  let safetyScore = previousComputedScore;
   let recoveredSafetyScore = safetyScore !== null
     ? safetyScore
     : toFiniteScoreOrNull(analysis.scoreAudit?.ruleScore);
-  let classification = providerOverride
-    ? "High Risk"
-    : (recomputed?.finalClassification || getBestStoredComputedClassification(analysis, recoveredSafetyScore));
+  let classification = recomputed?.finalClassification || getBestStoredComputedClassification(analysis, recoveredSafetyScore);
   const virusTotalWarningState = providerPolicy.virusTotalWarningState || getVirusTotalWarningState(safeProviderResults);
   const virusTotalWarningPolicy = applyVirusTotalWarningScorePolicy(safetyScore, classification, virusTotalWarningState);
-  if (!providerOverride && safetyScore !== null) {
+  if (safetyScore !== null) {
     safetyScore = virusTotalWarningPolicy.finalScore;
     recoveredSafetyScore = safetyScore;
     classification = virusTotalWarningPolicy.finalClassification;
@@ -6876,11 +6921,20 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
   const features = recomputed?.features || refreshedFeatures;
   let scoreAudit = recomputed?.scoreAudit || refreshScoreAuditForProviderResult(analysis, {
     providerOverride,
-    providerOverrideCap: providerPolicy.providerOverrideCap || 30,
     safetyScore: recoveredSafetyScore,
     classification
   });
   scoreAudit = applyVirusTotalWarningAuditFields(scoreAudit, virusTotalWarningState, virusTotalWarningPolicy);
+  const virusTotalReviewRecommendation = buildVirusTotalProviderWarningReviewRecommendation({
+    finalScore: recoveredSafetyScore,
+    finalClassification: classification,
+    scoreAudit,
+    providerOverride,
+    providerOverrideSource: providerPolicy.providerOverrideSource,
+    virusTotalWarningState,
+    providerResults: safeProviderResults
+  });
+  scoreAudit = applyVirusTotalWarningAuditFields(scoreAudit, virusTotalWarningState, virusTotalWarningPolicy, virusTotalReviewRecommendation);
   scoreAudit.scanFinalized = scanFinalized;
   scoreAudit.displayedScoreWithheld = (!scanFinalized && !providerOverride) || ((retryBudgetExhausted || terminalProviderLimitation) && !providerOverride);
   scoreAudit.computedSafetyScore = recoveredSafetyScore;
@@ -6905,7 +6959,15 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
     pendingProviders: providerCompletion.pendingProviders,
     providerPending: displayedState === "pending-provider",
     state: displayedState,
+    providerWarningReviewRecommended: virusTotalReviewRecommendation.providerWarningReviewRecommended,
+    reviewRecommendedReason: virusTotalReviewRecommendation.reviewRecommendedReason,
     scoreAudit,
+    providerDeductions: recomputed?.scoring?.providerDeductions || scoreAudit.providerDeductions || analysis.providerDeductions,
+    heuristicRawCategoryTotals: recomputed?.scoring?.heuristicRawCategoryTotals || scoreAudit.heuristicRawCategoryTotals || analysis.heuristicRawCategoryTotals,
+    heuristicCategoryDeductions: recomputed?.scoring?.heuristicCategoryDeductions || scoreAudit.heuristicCategoryDeductions || analysis.heuristicCategoryDeductions,
+    heuristicRawTotal: recomputed?.scoring?.heuristicRawTotal ?? scoreAudit.heuristicRawTotal ?? analysis.heuristicRawTotal,
+    heuristicScaledDeduction: recomputed?.scoring?.heuristicScaledDeduction ?? scoreAudit.heuristicScaledDeduction ?? analysis.heuristicScaledDeduction,
+    totalDeduction: recomputed?.scoring?.totalDeduction ?? scoreAudit.ruleDeductionTotal ?? analysis.totalDeduction,
     concreteRiskSignals: Boolean(recomputed?.concreteRiskSignals || providerOverride),
     interceptionRecommended: providerOverride === true
       ? true
@@ -6917,7 +6979,9 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
             providerOverride,
             classification,
             safetyScore: recoveredSafetyScore,
-            scoreAudit
+            scoreAudit,
+            providerWarningReviewRecommended: virusTotalReviewRecommendation.providerWarningReviewRecommended,
+            reviewRecommendedReason: virusTotalReviewRecommendation.reviewRecommendedReason
           })
         : false),
     lastChecked: Date.now()

@@ -461,7 +461,7 @@ const scoreText = pending
       : "no score";
 
 const statusLabel = providerOverride
-  ? "High Risk"
+  ? (classification || "Provider Flagged")
   : pending
     ? "Scan Pending"
     : terminalIncomplete
@@ -544,6 +544,12 @@ function convertRecordsToCsv(records) {
     "vtMaliciousCount",
     "vtSuspiciousCount",
     "vtAnalysisId",
+    "gsbDeduction",
+    "urlhausDeduction",
+    "vtDeduction",
+    "heuristicRawTotal",
+    "heuristicScaledDeduction",
+    "totalDeduction",
     "redirectCount",
     "usedShortener",
     "suspiciousTld",
@@ -553,6 +559,8 @@ function convertRecordsToCsv(records) {
     "state",
     "verificationState",
     "interceptionRecommended",
+    "providerWarningReviewRecommended",
+    "reviewRecommendedReason",
     "manualVerdict",
     "expectedClassification",
     "isCorrect",
@@ -564,6 +572,8 @@ function convertRecordsToCsv(records) {
     const urlhaus = findProviderResult(record.providerResults, "urlhaus");
     const vt = findProviderResult(record.providerResults, "virustotal");
     const features = record.features || {};
+    const scoreAudit = record.scoreAudit || {};
+    const providerDeductions = record.providerDeductions || scoreAudit.providerDeductions || {};
     const analyzedLinkCount =
       record.analyzedLinkCount ??
       (Array.isArray(record.linkScoreSummary) ? record.linkScoreSummary.length : "");
@@ -601,6 +611,12 @@ function convertRecordsToCsv(records) {
       vt?.details?.maliciousCount ?? "",
       vt?.details?.suspiciousCount ?? "",
       vt?.details?.analysisId ?? "",
+      providerDeductions.gsb ?? "",
+      providerDeductions.urlhaus ?? "",
+      providerDeductions.virustotal ?? "",
+      record.heuristicRawTotal ?? scoreAudit.heuristicRawTotal ?? "",
+      record.heuristicScaledDeduction ?? scoreAudit.heuristicScaledDeduction ?? "",
+      record.totalDeduction ?? scoreAudit.ruleDeductionTotal ?? "",
       features.redirectCount ?? "",
       features.shortenedUrl ?? "",
       features.suspiciousTld ?? "",
@@ -610,6 +626,8 @@ function convertRecordsToCsv(records) {
       record.state || "",
       record.verificationState || "",
       inferInterceptionRecommended(record),
+      record.providerWarningReviewRecommended ?? scoreAudit.providerWarningReviewRecommended ?? "",
+      record.reviewRecommendedReason || scoreAudit.reviewRecommendedReason || scoreAudit.providerWarningReason || "",
       "",
       "",
       "",
@@ -629,13 +647,16 @@ function inferInterceptionRecommended(record = {}) {
   const urlhaus = findProviderResult(record.providerResults, "urlhaus");
   const vt = findProviderResult(record.providerResults, "virustotal");
   const providerFlagged = Array.isArray(record.providerResults) && record.providerResults.some((item) => item?.flagged === true);
+  const scoreAudit = record.scoreAudit || {};
 
   return Boolean(
     record.interceptionRecommended === true ||
     record.providerOverride === true ||
+    record.providerWarningReviewRecommended === true ||
+    scoreAudit.providerWarningReviewRecommended === true ||
     classification === "high risk" ||
     classification === "suspicious" ||
-    (score !== null && Number.isFinite(score) && score < 60) ||
+    (score !== null && Number.isFinite(score) && score < 80) ||
     providerFlagged ||
     gsb?.flagged === true ||
     urlhaus?.flagged === true ||

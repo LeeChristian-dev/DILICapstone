@@ -325,6 +325,15 @@ function compactPersistentRecord(record = {}) {
     features: compactFeatureFlags(features),
     providerResults: compactProviderResults(providerResults),
     providerOverride: Boolean(record.providerOverride),
+    providerWarningReviewRecommended: record.providerWarningReviewRecommended === true,
+    reviewRecommendedReason: clampText(record.reviewRecommendedReason || "", 180),
+    providerDeductions: compactNumericMap(record.providerDeductions || record.scoreAudit?.providerDeductions),
+    heuristicRawCategoryTotals: compactNumericMap(record.heuristicRawCategoryTotals || record.scoreAudit?.heuristicRawCategoryTotals),
+    heuristicCategoryDeductions: compactNumericMap(record.heuristicCategoryDeductions || record.scoreAudit?.heuristicCategoryDeductions),
+    heuristicRawTotal: normalizeScore(record.heuristicRawTotal ?? record.scoreAudit?.heuristicRawTotal),
+    heuristicScaledDeduction: normalizeScore(record.heuristicScaledDeduction ?? record.scoreAudit?.heuristicScaledDeduction),
+    totalDeduction: normalizeScore(record.totalDeduction ?? record.scoreAudit?.ruleDeductionTotal),
+    scoreAudit: compactScoreAudit(record.scoreAudit),
     candidateSource: clampText(record.candidateSource || record.candidateContext?.candidateSource || ""),
     candidateUrlCompleteness: clampText(record.candidateUrlCompleteness || record.candidateContext?.candidateUrlCompleteness || ""),
     candidateIsDomainOnlyFallback: record.candidateIsDomainOnlyFallback === true || record.candidateContext?.candidateIsDomainOnlyFallback === true,
@@ -371,6 +380,12 @@ function compactLinkScoreSummary(summary = []) {
       scanFinalized: item?.scanFinalized === true,
       providerOverride: item?.providerOverride === true,
       providerPending: item?.providerPending === true,
+      providerDeductions: compactNumericMap(item?.providerDeductions || item?.scoreAudit?.providerDeductions),
+      heuristicRawCategoryTotals: compactNumericMap(item?.heuristicRawCategoryTotals || item?.scoreAudit?.heuristicRawCategoryTotals),
+      heuristicCategoryDeductions: compactNumericMap(item?.heuristicCategoryDeductions || item?.scoreAudit?.heuristicCategoryDeductions),
+      heuristicRawTotal: normalizeScore(item?.heuristicRawTotal ?? item?.scoreAudit?.heuristicRawTotal),
+      heuristicScaledDeduction: normalizeScore(item?.heuristicScaledDeduction ?? item?.scoreAudit?.heuristicScaledDeduction),
+      totalDeduction: normalizeScore(item?.totalDeduction ?? item?.scoreAudit?.ruleDeductionTotal),
       providerCompletion: compactProviderCompletion(item?.providerCompletion),
       providerRetryPlan: compactProviderRetryPlan(item?.providerRetryPlan),
       pendingProviders: clampList(item?.pendingProviders || [], 8)
@@ -409,6 +424,13 @@ function compactLinkAnalysisSnapshot(item = {}, fallbackIndex = 1) {
     state: clampText(item.state || "", 60),
     providerOverride: item.providerOverride === true,
     providerPending: item.providerPending === true,
+    providerDeductions: compactNumericMap(item.providerDeductions || item.scoreAudit?.providerDeductions),
+    heuristicRawCategoryTotals: compactNumericMap(item.heuristicRawCategoryTotals || item.scoreAudit?.heuristicRawCategoryTotals),
+    heuristicCategoryDeductions: compactNumericMap(item.heuristicCategoryDeductions || item.scoreAudit?.heuristicCategoryDeductions),
+    heuristicRawTotal: normalizeScore(item.heuristicRawTotal ?? item.scoreAudit?.heuristicRawTotal),
+    heuristicScaledDeduction: normalizeScore(item.heuristicScaledDeduction ?? item.scoreAudit?.heuristicScaledDeduction),
+    totalDeduction: normalizeScore(item.totalDeduction ?? item.scoreAudit?.ruleDeductionTotal),
+    scoreAudit: compactScoreAudit(item.scoreAudit),
     providerResults: compactProviderResults(item.providerResults || []),
     providerCompletion: compactProviderCompletion(item.providerCompletion),
     providerRetryPlan: compactProviderRetryPlan(item.providerRetryPlan),
@@ -543,6 +565,60 @@ function chainToDomains(chain) {
 function normalizeScore(value) {
   const score = Number(value);
   return Number.isFinite(score) ? score : null;
+}
+
+function compactNumericMap(value = {}) {
+  if (!value || typeof value !== "object") {
+    return {};
+  }
+
+  return Object.entries(value).reduce((result, [key, rawValue]) => {
+    const numeric = Number(rawValue);
+    if (Number.isFinite(numeric)) {
+      result[clampText(key, 80)] = numeric;
+    }
+    return result;
+  }, {});
+}
+
+function compactScoreAudit(scoreAudit = {}) {
+  if (!scoreAudit || typeof scoreAudit !== "object") {
+    return null;
+  }
+
+  return {
+    baselineScore: normalizeScore(scoreAudit.baselineScore),
+    scoreFormula: clampText(scoreAudit.scoreFormula || ""),
+    providerDeductions: compactNumericMap(scoreAudit.providerDeductions),
+    providerDeductionTotal: normalizeScore(scoreAudit.providerDeductionTotal),
+    heuristicRawCategoryTotals: compactNumericMap(scoreAudit.heuristicRawCategoryTotals),
+    heuristicCategoryDeductions: compactNumericMap(scoreAudit.heuristicCategoryDeductions),
+    heuristicRawTotal: normalizeScore(scoreAudit.heuristicRawTotal),
+    heuristicScaledDeduction: normalizeScore(scoreAudit.heuristicScaledDeduction),
+    ruleDeductionTotal: normalizeScore(scoreAudit.ruleDeductionTotal),
+    ruleScore: normalizeScore(scoreAudit.ruleScore),
+    categoryDeductions: compactNumericMap(scoreAudit.categoryDeductions),
+    finalScore: normalizeScore(scoreAudit.finalScore),
+    classification: clampText(scoreAudit.classification || "", 60),
+    computedSafetyScore: normalizeScore(scoreAudit.computedSafetyScore),
+    computedClassification: clampText(scoreAudit.computedClassification || "", 60),
+    scanFinalized: scoreAudit.scanFinalized === true,
+    displayedScoreWithheld: scoreAudit.displayedScoreWithheld === true,
+    verificationIncomplete: scoreAudit.verificationIncomplete === true,
+    pendingProviders: clampList(scoreAudit.pendingProviders || [], 8),
+    retryBudgetExhausted: scoreAudit.retryBudgetExhausted === true,
+    activeHeuristicGroups: clampList(scoreAudit.activeHeuristicGroups || [], 8),
+    mitigatedHeuristicGroups: clampList(scoreAudit.mitigatedHeuristicGroups || [], 8),
+    recoveryApplied: scoreAudit.recoveryApplied === true,
+    recoveryBlockedReasons: clampList(scoreAudit.recoveryBlockedReasons || [], 6),
+    providerWarningApplied: scoreAudit.providerWarningApplied === true,
+    providerCautionApplied: scoreAudit.providerCautionApplied === true,
+    providerWarningReviewRecommended: scoreAudit.providerWarningReviewRecommended === true,
+    reviewRecommendedReason: clampText(scoreAudit.reviewRecommendedReason || "", 180),
+    providerWarningReason: clampText(scoreAudit.providerWarningReason || "", 180),
+    virusTotalMaliciousDetections: Number(scoreAudit.virusTotalMaliciousDetections || 0),
+    virusTotalSuspiciousDetections: Number(scoreAudit.virusTotalSuspiciousDetections || 0)
+  };
 }
 
 function clampList(values, limit) {

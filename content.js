@@ -914,6 +914,10 @@ function shouldShowWarningModal(analysis) {
     return true;
   }
 
+  if (isProviderWarningReviewRecommendedAnalysis(analysis)) {
+    return true;
+  }
+
   if (analysis.providerOverride === true || providerFlagged || gsb?.flagged || urlhaus?.flagged || vt?.flagged) {
     return true;
   }
@@ -939,6 +943,78 @@ function shouldShowWarningModal(analysis) {
   }
 
   return false;
+}
+
+function isProviderWarningReviewRecommendedAnalysis(analysis = {}) {
+  const score = toFiniteUiScoreOrNull(
+    analysis.safetyScore ??
+    analysis.computedSafetyScore ??
+    analysis.scoreAudit?.finalScore ??
+    analysis.scoreAudit?.computedSafetyScore
+  );
+  const classification = String(
+    analysis.classification ||
+    analysis.computedClassification ||
+    analysis.scoreAudit?.classification ||
+    analysis.scoreAudit?.computedClassification ||
+    ""
+  ).toLowerCase();
+  const scoreAudit = analysis.scoreAudit && typeof analysis.scoreAudit === "object" ? analysis.scoreAudit : {};
+  const providerDeductions = scoreAudit.providerDeductions || analysis.providerDeductions || {};
+  const gsb = findProviderResult(analysis.providerResults, "gsb");
+  const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
+  const vt = findProviderResult(analysis.providerResults, "virustotal");
+  const vtStats = getVirusTotalDisplayStats(vt);
+  const vtHits = vtStats.maliciousCount + vtStats.suspiciousCount;
+
+  if (
+    analysis.providerWarningReviewRecommended === true ||
+    scoreAudit.providerWarningReviewRecommended === true
+  ) {
+    return true;
+  }
+
+  if (
+    analysis.scanFinalized !== true ||
+    score === null ||
+    score < 80 ||
+    classification !== "safe" ||
+    analysis.providerOverride === true ||
+    gsb?.flagged === true ||
+    urlhaus?.flagged === true ||
+    toFiniteUiScoreOrNull(providerDeductions.gsb) > 0 ||
+    toFiniteUiScoreOrNull(providerDeductions.urlhaus) > 0
+  ) {
+    return false;
+  }
+
+  return (
+    toFiniteUiScoreOrNull(providerDeductions.virustotal) > 0 ||
+    toFiniteUiScoreOrNull(scoreAudit.providerDeductions?.virustotal) > 0 ||
+    Number(scoreAudit.virusTotalMaliciousDetections || 0) + Number(scoreAudit.virusTotalSuspiciousDetections || 0) > 0 ||
+    vtHits > 0
+  );
+}
+
+function getProviderWarningReviewReason(analysis = {}) {
+  return String(
+    analysis.reviewRecommendedReason ||
+    analysis.scoreAudit?.reviewRecommendedReason ||
+    analysis.scoreAudit?.providerWarningReason ||
+    "VirusTotal reported low-count malicious/suspicious detections. The score remains Safe, but DILI recommends reviewing the link before opening it."
+  ).trim();
+}
+
+function buildProviderWarningReviewExplanation(analysis = {}) {
+  const score = toFiniteUiScoreOrNull(
+    analysis.safetyScore ??
+    analysis.computedSafetyScore ??
+    analysis.scoreAudit?.finalScore ??
+    analysis.scoreAudit?.computedSafetyScore
+  );
+  const scoreText = Number.isFinite(score) ? `The final Safety Score is ${score}. ` : "The final Safety Score remains within the Safe band. ";
+
+  return `${scoreText}However, navigation is paused because VirusTotal reported low-count malicious/suspicious detections. This provider signal does not automatically make the link Suspicious or High Risk, but DILI recommends reviewing the destination before opening it.`;
 }
 function resolveModalDestinationUrl(destinationUrl, clickContext, analysis = null) {
   const candidates = [
@@ -1009,7 +1085,12 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
   const gsb = findProviderResult(analysis?.providerResults, "gsb");
   const urlhaus = findProviderResult(analysis?.providerResults, "urlhaus");
   const vt = findProviderResult(analysis?.providerResults, "virustotal");
+    const providerWarningReviewRecommended = isProviderWarningReviewRecommendedAnalysis(analysis);
     const redirectCount = Number(analysis?.redirectAnalysis?.redirectCount ?? features.redirectCount ?? 0);
+
+    if (providerWarningReviewRecommended) {
+      reasons.push("VirusTotal reported low-count malicious/suspicious detections, placing the link at the Safe boundary.");
+    }
 
     if (gsb?.flagged) {
       reasons.push("Google Safe Browsing flagged this destination as unsafe.");
@@ -1019,7 +1100,7 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
       reasons.push("URLhaus flagged this destination as suspicious or malicious.");
     }
 
-    if (vt?.flagged) {
+    if (!providerWarningReviewRecommended && vt?.flagged) {
       reasons.push("VirusTotal reported malicious or suspicious detections for this destination.");
     }
 
@@ -1078,6 +1159,11 @@ return normalizeNavigationCandidate(clickContext?.rawUrl) || "";
     const vt = findProviderResult(analysis?.providerResults, "virustotal");
     const classification = String(analysis?.classification || "").toLowerCase();
     const score = toFiniteUiScoreOrNull(analysis?.safetyScore);
+    const providerWarningReviewRecommended = isProviderWarningReviewRecommendedAnalysis(analysis);
+
+    if (providerWarningReviewRecommended) {
+      return buildProviderWarningReviewExplanation(analysis);
+    }
 
     if (gsb?.flagged || urlhaus?.flagged || vt?.flagged) {
       return "DILI paused navigation because this destination was flagged by a threat-intelligence provider and may expose you to phishing, malware, or other unsafe behavior.";
@@ -1140,9 +1226,11 @@ const navigationDestinationUrl = safeDestinationUrl;
 
 const destinationDomain = safeHostname(safeDestinationUrl) || "unknown-domain";    const scoreText = modalConfig.scoreText || (Number.isFinite(analysis?.safetyScore) ? String(analysis.safetyScore) : "Unavailable");
     const classificationText = modalConfig.classificationText || analysis?.classification || "Unknown";
-    const titleText = modalConfig.title || "Navigation paused for your safety";
-    const explanationText = modalConfig.explanation || buildWarningExplanation(analysis);
-    const kickerText = modalConfig.kicker || "DILI Link Warning";
+    const providerWarningReviewRecommended = isProviderWarningReviewRecommendedAnalysis(analysis);
+    const providerWarningOnly = providerWarningReviewRecommended && String(analysis?.classification || analysis?.computedClassification || "").toLowerCase() === "safe";
+    const titleText = modalConfig.title || (providerWarningOnly ? "Review this link before opening" : "Navigation paused for your safety");
+    const explanationText = modalConfig.explanation || (providerWarningOnly ? buildProviderWarningReviewExplanation(analysis) : buildWarningExplanation(analysis));
+    const kickerText = modalConfig.kicker || (providerWarningOnly ? "Provider Warning" : "DILI Link Warning");
     const reportCopyText =
       modalConfig.reportCopy ||
       "DILI cannot report posts to Facebook automatically. Use Facebook's built-in reporting menu if you want to report this post.";
@@ -5952,7 +6040,7 @@ function renderDetailListItems(items = []) {
 
 function renderDetailListItem(detail) {
   const text = String(detail || "").trim();
-  const scoreMatch = text.match(/^(Score starts at|DILI's rule scoring lowered it to|DILI's rule scoring kept it at|Endpoint-hiding warning signs totaled|A threat-intelligence provider flagged this URL, so DILI capped the final score at|No provider override was applied|Because the endpoint was .+?, DILI capped the score at|DILI applied an uncertainty cap, lowering the score to|Demo\/testing mode lowered the score to|Clean-provider recovery|Clean-provider recovery floor|Clean-provider recovery blocked|Active heuristic groups|Mitigated heuristic groups|Final score|Score calculation|Note|Warning sign applied|Mitigation noted|Mitigation note|Provider override|Navigation decision|Verification state):\s*(.+)$/i);
+  const scoreMatch = text.match(/^(Score starts at|GSB deduction|URLHaus deduction|VirusTotal deduction|Heuristic raw score|Heuristic deduction|Total deduction|DILI's rule scoring lowered it to|DILI's rule scoring kept it at|Endpoint-hiding warning signs totaled|Threat-intelligence deduction|Because the endpoint was .+?, DILI capped the score at|DILI applied an uncertainty cap, lowering the score to|Demo\/testing mode lowered the score to|Clean-provider recovery|Clean-provider recovery blocked|Active heuristic categories|Active heuristic groups|Mitigated heuristic groups|Final score|Score calculation|Note|Warning sign applied|Mitigation noted|Mitigation note|Provider flag|Navigation decision|Verification state):\s*(.+)$/i);
 
   if (scoreMatch) {
     return `
@@ -6009,7 +6097,7 @@ function classifyTechnicalDetailGroup(text) {
   const value = String(text || "");
 
   if (
-    /^(Score starts at|DILI's rule scoring|Endpoint-hiding warning signs totaled|A threat-intelligence provider flagged this URL|No provider override was applied|Because the endpoint was|DILI applied an uncertainty cap|Demo\/testing mode lowered the score|Clean-provider recovery|Clean-provider recovery floor|Clean-provider recovery blocked|Active heuristic groups|Mitigated heuristic groups|Final score|Score calculation|Note: The final score uses|Warning sign applied|Additional warning signs|Mitigation noted|Mitigation note|Provider override|Navigation decision|Verification state):/i.test(value)
+    /^(Score starts at|GSB deduction|URLHaus deduction|VirusTotal deduction|Heuristic raw score|Heuristic deduction|Total deduction|DILI's rule scoring|Endpoint-hiding warning signs totaled|Threat-intelligence deduction|Because the endpoint was|DILI applied an uncertainty cap|Demo\/testing mode lowered the score|Clean-provider recovery|Clean-provider recovery blocked|Active heuristic categories|Active heuristic groups|Mitigated heuristic groups|Final score|Score calculation|Note: The final score uses|Warning sign applied|Additional warning signs|Mitigation noted|Mitigation note|Provider flag|Navigation decision|Verification state):/i.test(value)
   ) {
     return "advanced";
   }
@@ -6062,35 +6150,34 @@ function buildSafetyScoreBreakdownDetails(analysis = {}) {
     const ruleScore = toFiniteUiScoreOrNull(scoreAudit.ruleScore);
     const finalAuditScore = toFiniteUiScoreOrNull(scoreAudit.finalScore);
     const auditClassification = scoreAudit.classification || classification;
+    const providerDeductions = scoreAudit.providerDeductions || analysis.providerDeductions || {};
+    const gsbDeduction = toFiniteUiScoreOrNull(providerDeductions.gsb) ?? 0;
+    const urlhausDeduction = toFiniteUiScoreOrNull(providerDeductions.urlhaus) ?? 0;
+    const vtDeduction = toFiniteUiScoreOrNull(providerDeductions.virustotal) ?? 0;
+    const heuristicRawTotal = toFiniteUiScoreOrNull(scoreAudit.heuristicRawTotal ?? analysis.heuristicRawTotal) ?? 0;
+    const heuristicScaledDeduction = toFiniteUiScoreOrNull(scoreAudit.heuristicScaledDeduction ?? analysis.heuristicScaledDeduction) ?? 0;
+    const totalDeduction = toFiniteUiScoreOrNull(scoreAudit.ruleDeductionTotal ?? analysis.totalDeduction);
 
     details.push(`Score starts at ${Number.isFinite(baselineScore) ? baselineScore : 100}.`);
+    details.push(`GSB deduction: ${gsbDeduction}/30.`);
+    details.push(`URLHaus deduction: ${urlhausDeduction}/30.`);
+    details.push(`VirusTotal deduction: ${vtDeduction}/30.`);
+    details.push(`Heuristic raw score: ${heuristicRawTotal}/30.`);
+    details.push(`Heuristic deduction: ${heuristicScaledDeduction}/10.`);
 
-    if (Number.isFinite(ruleScore)) {
-      if (Number.isFinite(ruleDeductionTotal) && ruleDeductionTotal > 0) {
-        details.push(`DILI's rule scoring lowered it to ${ruleScore}.`);
-      } else {
-        details.push(`DILI's rule scoring kept it at ${ruleScore}.`);
-      }
+    if (totalDeduction !== null) {
+      details.push(`Total deduction: ${totalDeduction}.`);
     }
 
-    const endpointAudit = findScoreAuditCategory(scoreAudit.categoryAudit, "endpoint_resolution");
-    if (
-      endpointAudit &&
-      Number(endpointAudit.positiveDeductions || 0) > Number(endpointAudit.appliedDeduction || 0) &&
-      Number(endpointAudit.appliedDeduction || 0) > 0
-    ) {
-      details.push(
-        `Endpoint-hiding warning signs totaled ${Number(endpointAudit.positiveDeductions || 0)} points, but DILI capped that category at ${Number(endpointAudit.appliedDeduction || 0)}.`
-      );
+    if (Number.isFinite(ruleScore) && totalDeduction !== null) {
+      details.push(`Score calculation: 100 - ${totalDeduction} = ${ruleScore}.`);
     }
 
-    const providerCap = scoreAudit.providerOverrideCap || {};
-    if (providerCap.applied === true) {
-      details.push(
-        `A threat-intelligence provider flagged this URL, so DILI capped the final score at ${providerCap.afterScore}.`
-      );
-    } else {
-      details.push("No provider override was applied.");
+    const heuristicCategories = Object.entries(scoreAudit.heuristicRawCategoryTotals || analysis.heuristicRawCategoryTotals || {})
+      .filter(([, value]) => Number(value) > 0)
+      .map(([category, value]) => `${String(category).replace(/_/g, " ")} ${value}`);
+    if (heuristicCategories.length > 0) {
+      details.push(`Active heuristic categories: ${heuristicCategories.join(", ")}.`);
     }
 
     const verificationCap = scoreAudit.verificationCap || {};
@@ -6108,13 +6195,6 @@ function buildSafetyScoreBreakdownDetails(analysis = {}) {
       details.push(`Demo/testing mode lowered the score to ${demoBias.afterScore}.`);
     }
 
-    if (
-      Number.isFinite(ruleDeductionTotal) &&
-      Number.isFinite(ruleScore)
-    ) {
-      details.push(`Score calculation: 100 - ${ruleDeductionTotal} applied category deduction = ${ruleScore}.`);
-    }
-
     const listedTriggeredDeductionTotal = Number(scoreAudit.listedTriggeredDeductionTotal);
     const triggeredMitigationCreditTotal = Number(scoreAudit.triggeredMitigationCreditTotal);
     const hasCategoryAudit = Object.keys(scoreAudit.categoryAudit || {}).length > 0;
@@ -6128,23 +6208,21 @@ function buildSafetyScoreBreakdownDetails(analysis = {}) {
       rawRulePointsDiffer ||
       (Number.isFinite(triggeredMitigationCreditTotal) && triggeredMitigationCreditTotal > 0)
     ) {
-      details.push("Note: The final score uses the applied category deduction, not a simple sum of every visible rule and mitigation line.");
+      details.push("Note: The final score uses weighted provider deductions plus scaled heuristic deductions, not a simple sum of every visible warning line.");
     }
 
     if (scoreAudit.recoveryApplied === true) {
       details.push(`Clean-provider recovery: applied. ${scoreAudit.recoveryReason || "Clean providers and high-confidence endpoint resolution recovered explainable redirect/tracking warnings."}`);
-      if (Number.isFinite(Number(scoreAudit.recoveryFloor))) {
-        details.push(`Clean-provider recovery floor: ${Number(scoreAudit.recoveryFloor)}.`);
-      }
     } else if (Array.isArray(scoreAudit.recoveryBlockedReasons) && scoreAudit.recoveryBlockedReasons.length > 0) {
       details.push(`Clean-provider recovery blocked: ${scoreAudit.recoveryBlockedReasons.slice(0, 3).join("; ")}.`);
     }
 
     if (scoreAudit.providerWarningApplied === true || scoreAudit.providerCautionApplied === true) {
       details.push(`Provider warning: ${scoreAudit.providerWarningReason || "VirusTotal reported provider warning detections."}`);
-      if (Number.isFinite(Number(scoreAudit.providerWarningScoreCap))) {
-        details.push(`Provider warning score cap: ${Number(scoreAudit.providerWarningScoreCap)}.`);
-      }
+    }
+
+    if (scoreAudit.providerWarningReviewRecommended === true) {
+      details.push(`Provider warning review: ${scoreAudit.reviewRecommendedReason || "VirusTotal reported low-count malicious/suspicious detections. The score remains Safe, but DILI recommends reviewing the link before opening it."}`);
     }
 
     if (Array.isArray(scoreAudit.activeHeuristicGroups) && scoreAudit.activeHeuristicGroups.length > 0) {
@@ -6236,9 +6314,9 @@ function buildSafetyScoreBreakdownDetails(analysis = {}) {
   }
 
   if (analysis.providerOverride === true) {
-    details.push("Provider override: applied. A provider flag forces a stricter final score.");
+    details.push("Provider flag: recorded. Provider detections contribute through weighted deductions.");
   } else {
-    details.push("Provider override: not applied.");
+    details.push("Provider flag: none recorded.");
   }
 
   details.push(
@@ -6345,7 +6423,9 @@ const providerFlagged = Boolean(
             {
               label: displayState.label,
               state: displayState.state,
-              safetyScore: displayState.safetyScore
+              safetyScore: displayState.safetyScore,
+              providerWarningReviewRecommended: analysis.providerWarningReviewRecommended === true,
+              reviewRecommendedReason: analysis.reviewRecommendedReason || analysis.scoreAudit?.reviewRecommendedReason || ""
             },
             displayState.severityLevel || severityLevel
           ),
@@ -6362,6 +6442,7 @@ const providerFlagged = Boolean(
           label: displayState.label,
           state: displayState.state,
           safetyScore: displayState.safetyScore,
+          providerWarningReviewRecommended: analysis.providerWarningReviewRecommended === true,
           interceptionRecommended: providerOverrideDisplay ? true : analysis.interceptionRecommended
         },
         displayState.severityLevel || severityLevel
@@ -6500,29 +6581,7 @@ detailsSummary: buildInlineDetailsSummary(
 
   function normalizeDisplayState(analysis = {}) {
     const score = toFiniteUiScoreOrNull(analysis.safetyScore);
-const providerFlagged = Boolean(
-  analysis.providerOverride === true ||
-  (Array.isArray(analysis.providerResults) && analysis.providerResults.some((provider) => provider?.flagged === true)) ||
-  (Array.isArray(analysis.linkScoreSummary) && analysis.linkScoreSummary.some((item) => item?.providerOverride === true)) ||
-  (Array.isArray(analysis.linkAnalysisSnapshots) && analysis.linkAnalysisSnapshots.some((item) => item?.providerOverride === true))
-);
-    if (providerFlagged) {
-      const providerScore = score !== null
-        ? score
-        : toFiniteUiScoreOrNull(analysis.computedSafetyScore);
-
-      return {
-        classification: "High Risk",
-        label: "High Risk",
-        safetyScore: providerScore,
-        scanFinalized: true,
-        state: "completed",
-        severityLevel: "high-risk",
-        pending: false,
-        terminalIncomplete: false
-      };
-    }
-
+    const providerWarningReviewRecommended = isProviderWarningReviewRecommendedAnalysis(analysis);
     if (isAnalysisPendingForUi(analysis)) {
       return {
         classification: "Scan Pending",
@@ -6562,7 +6621,9 @@ const providerFlagged = Boolean(
 
     return {
       classification: analysis.classification || "Unverified",
-      label: analysis.classification || "Unverified",
+      label: providerWarningReviewRecommended && String(analysis.classification || "").toLowerCase() === "safe"
+        ? "Safe — Review Recommended"
+        : analysis.classification || "Unverified",
       safetyScore: analysis.scanFinalized === true && score !== null ? score : null,
       scanFinalized: analysis.scanFinalized === true,
       state: analysis.state || "monitored",
@@ -6785,6 +6846,7 @@ const providerFlagged = Boolean(
     const score = toFiniteUiScoreOrNull(analysis.safetyScore);
     const classification = String(analysis.classification || "").toLowerCase();
     const providerFlagged = Array.isArray(analysis.providerResults) && analysis.providerResults.some((provider) => provider?.flagged === true);
+    const providerWarningReviewRecommended = isProviderWarningReviewRecommendedAnalysis(analysis);
 
     if (
       severityLevel === "high-risk" ||
@@ -6796,6 +6858,10 @@ const providerFlagged = Boolean(
     }
 
     if (severityLevel === "safe") {
+      if (providerWarningReviewRecommended) {
+        return `DILI classified this link as Safe because the final Safety Score is ${score !== null ? score : 80}. However, navigation is paused because VirusTotal reported low-count malicious/suspicious detections. This provider signal does not automatically make the link Suspicious or High Risk, but DILI recommends reviewing the destination before opening it.`;
+      }
+
       if (isMessagingOrCommunityInviteDomain(finalDomain)) {
         return "DILI verified the URL reputation, but it cannot assess messages, members, claims, or future content inside this platform.";
       }
@@ -7184,7 +7250,7 @@ function getVirusTotalDisplayWarning(provider = {}) {
       maliciousCount,
       suspiciousCount,
       severity: "high",
-      text: "VirusTotal reported strong malicious consensus."
+      text: "VirusTotal reported multiple malicious or suspicious detections; DILI applies the weighted VirusTotal deduction."
     };
   }
 
@@ -7235,6 +7301,7 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
   const gsb = findProviderResult(analysis.providerResults, "gsb");
   const urlhaus = findProviderResult(analysis.providerResults, "urlhaus");
   const vt = findProviderResult(analysis.providerResults, "virustotal");
+  const providerWarningReviewRecommended = isProviderWarningReviewRecommendedAnalysis(analysis);
 
   if (gsb?.flagged) {
     reasons.push("Google Safe Browsing flagged this destination as unsafe.");
@@ -7244,7 +7311,9 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
     reasons.push("URLhaus flagged this destination as suspicious or malicious.");
   }
 
-  if (vt?.flagged) {
+  if (providerWarningReviewRecommended) {
+    reasons.push("VirusTotal reported low-count malicious/suspicious detections, placing the link at the Safe boundary.");
+  } else if (vt?.flagged) {
     reasons.push("VirusTotal reported malicious or suspicious detections for this destination.");
   } else {
     const vtWarning = getVirusTotalDisplayWarning(vt);
@@ -7333,6 +7402,10 @@ function buildEndUserRiskReasons(analysis = {}, severityLevel = "unverified") {
     reasons.push("Provider checks completed clean.");
     reasons.push("The resolved endpoint was verified with high confidence.");
     reasons.push("Heuristic warnings were limited to explainable redirect/tracking behavior.");
+  }
+
+  if (analysis.scoreAudit?.providerWarningReviewRecommended === true || analysis.providerWarningReviewRecommended === true) {
+    reasons.push(getProviderWarningReviewReason(analysis));
   }
 
   if (reasons.length === 0) {
@@ -7617,6 +7690,9 @@ function buildEndUserVerificationNotes(analysis = {}) {
 }
   function buildMainRiskReasons(analysis = {}) {
     const reasons = [];
+    if (isProviderWarningReviewRecommendedAnalysis(analysis)) {
+      reasons.push(getProviderWarningReviewReason(analysis));
+    }
     for (const item of analysis.deductions || []) {
       if (!item?.triggered || Number(item.deduction || 0) <= 0 || !item.label) {
         continue;
@@ -8422,6 +8498,9 @@ function buildTechnicalDetails(analysis = {}) {
 
     switch (severityLevel) {
       case "safe":
+        if (isProviderWarningReviewRecommendedAnalysis(viewModel)) {
+          return "Safe with provider warning. DILI paused navigation because VirusTotal reported low-count malicious/suspicious detections.";
+        }
         return "No major warning signs were detected for this destination.";
       case "caution":
         return "This link has warning signs and should be reviewed before opening.";
@@ -8472,9 +8551,11 @@ function buildTechnicalDetails(analysis = {}) {
   function buildInlineActionHint(viewModel = {}, severityLevel = normalizeInlineSeverityLevel(viewModel)) {
     const score = toFiniteUiScoreOrNull(viewModel.safetyScore);
     const label = String(viewModel.label || viewModel.classification || "").toLowerCase();
+    const providerWarningReviewRecommended = isProviderWarningReviewRecommendedAnalysis(viewModel);
 
     if (
       viewModel.interceptionRecommended === true ||
+      providerWarningReviewRecommended ||
       label.includes("high risk") ||
       label.includes("suspicious") ||
       severityLevel === "suspicious" ||
