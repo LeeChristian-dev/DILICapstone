@@ -1531,7 +1531,7 @@ proceedButton?.addEventListener("click", () => {
       checkedUrl: provider.checkedUrl || "",
       checkedAt: provider.checkedAt || "",
       durationMs: Number.isFinite(Number(provider.durationMs)) ? Number(provider.durationMs) : null,
-      resultSummary: provider.resultSummary || getProviderOutcomeSummary(provider)
+      resultSummary: getProviderOutcomeSummary(provider) || provider.resultSummary
     };
   }
 
@@ -2315,32 +2315,94 @@ function isManualRescanCooldownBypassActive() {
   return Date.now() < Number(manualRescanBypassUntil || 0);
 }
 
-function startAnalyzingTimeout(postId, post, requestId) {
+function hasScheduledProviderRetryForPost(postId) {
+  if (!postId) {
+    return false;
+  }
+
+  if (pendingVirusTotalRefreshByPostId.has(postId)) {
+    return true;
+  }
+
+  const cachedPanel = cachedPanelByPostId.get(postId);
+  return Boolean(cachedPanel && hasRetryablePendingProviderState(postId, cachedPanel));
+}
+
+function isAnalysisInFlightStale(postId, inFlight = {}) {
+  const startedAt = Number(inFlight?.startedAt || 0);
+  if (!postId || !Number.isFinite(startedAt) || startedAt <= 0) {
+    return false;
+  }
+
+  return Date.now() - startedAt >= ANALYZING_TIMEOUT_MS && !hasScheduledProviderRetryForPost(postId);
+}
+
+function clearAnalyzingLifecycleState(postId) {
+  clearAnalyzingTimeout(postId);
+  clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+  clearPendingCountdownTimer(postId);
+  latestRequestByPostId.delete(postId);
+  analysisInFlightByPostId.delete(postId);
+}
+
+function buildAnalyzingTimeoutViewModel(analysis = null) {
+  return buildVerificationIncompleteViewModel({
+    summaryLine: "DILI could not complete this scan in time. You may restart the scan.",
+    reason: "Background analysis timed out.",
+    technicalDetail: "Content-side analyzing timeout fired before the background response returned.",
+    analysis
+  });
+}
+
+function ensureAnalyzingTimeoutForPost(post, postId, context = "unknown") {
   if (!postId || !(post instanceof Element)) {
     return;
   }
 
-  clearAnalyzingTimeout(postId);
+  if (analyzingTimeoutByPostId.has(postId)) {
+    return;
+  }
+
+  console.debug("[DILI][terminal-state] analyzing timeout attached", {
+    postId,
+    context
+  });
+
   analyzingTimeoutByPostId.set(postId, window.setTimeout(() => {
     const inFlight = analysisInFlightByPostId.get(postId);
-    if (!inFlight || inFlight.requestId !== requestId) {
+    const currentPost = getTopLevelPanelOwner(post);
+
+    console.debug("[DILI][terminal-state] analyzing timeout fired", {
+      postId,
+      context,
+      requestId: inFlight?.requestId || ""
+    });
+
+    analyzingTimeoutByPostId.delete(postId);
+
+    if (!(currentPost instanceof Element) || !currentPost.isConnected) {
+      clearAnalyzingLifecycleState(postId);
       return;
     }
 
-    console.debug("[DILI][scan-lifecycle] Full scan timed out.", {
+    if (inFlight && !isAnalysisInFlightStale(postId, inFlight)) {
+      ensureAnalyzingTimeoutForPost(currentPost, postId, `${context}:extended`);
+      return;
+    }
+
+    console.debug("[DILI][terminal-state] stale analyzing panel terminalized", {
       postId,
-      requestId
+      context,
+      requestId: inFlight?.requestId || ""
     });
 
-    latestRequestByPostId.delete(postId);
-    analysisInFlightByPostId.delete(postId);
-    analyzingTimeoutByPostId.delete(postId);
-    renderBadge(post, buildVerificationIncompleteViewModel({
-      summaryLine: "DILI could not complete this scan in time. You may restart the scan.",
-      reason: "Background analysis timed out.",
-      technicalDetail: "Content-side analyzing timeout fired before the background response returned."
-    }));
+    clearAnalyzingLifecycleState(postId);
+    renderBadge(currentPost, buildAnalyzingTimeoutViewModel());
   }, ANALYZING_TIMEOUT_MS));
+}
+
+function startAnalyzingTimeout(postId, post, requestId) {
+  ensureAnalyzingTimeoutForPost(post, postId, requestId ? `scan-start:${requestId}` : "scan-start");
 }
 
 function clearAnalyzingTimeout(postId) {
@@ -2480,16 +2542,37 @@ function ensurePanelHasTerminalOrRetryableState(post, viewModel = {}) {
     return viewModel;
   }
 
-  if (isViewModelAnalyzing(viewModel) && !analysisInFlightByPostId.has(postId)) {
-    console.debug("[DILI][terminal-state] Converting analyzing to verification incomplete.", {
-      postId
-    });
-    return buildVerificationIncompleteViewModel({
-      summaryLine: "DILI could not complete this scan in time. You may restart the scan.",
-      reason: "Analyzing state had no active background request.",
-      technicalDetail: "No in-flight analysis was registered for this post.",
-      analysis
-    });
+  if (isViewModelAnalyzing(viewModel)) {
+    const inFlight = analysisInFlightByPostId.get(postId);
+
+    if (!inFlight) {
+      console.debug("[DILI][terminal-state] Converting analyzing to verification incomplete.", {
+        postId
+      });
+      return buildVerificationIncompleteViewModel({
+        summaryLine: "DILI could not complete this scan in time. You may restart the scan.",
+        reason: "Analyzing state had no active background request.",
+        technicalDetail: "No in-flight analysis was registered for this post.",
+        analysis
+      });
+    }
+
+    if (isAnalysisInFlightStale(postId, inFlight)) {
+      console.debug("[DILI][terminal-state] stale in-flight scan converted to verification incomplete", {
+        postId,
+        requestId: inFlight.requestId || ""
+      });
+      clearAnalyzingLifecycleState(postId);
+      return buildVerificationIncompleteViewModel({
+        summaryLine: "DILI could not complete this scan in time.",
+        reason: "DILI could not complete this scan in time.",
+        technicalDetail: "The in-flight analysis marker exceeded the content-side timeout.",
+        analysis
+      });
+    }
+
+    ensureAnalyzingTimeoutForPost(owningPost, postId, "terminal-state-normalize");
+    return viewModel;
   }
 
   if (isViewModelPendingProvider(viewModel) && !hasRetryablePendingProviderState(postId, viewModel)) {
@@ -2559,12 +2642,32 @@ function shouldSkipFullAnalysisForExistingLifecycle({
     inFlight.linkFingerprint === linkFingerprint &&
     inFlight.postTextHash === postTextHash
   ) {
+    if (isAnalysisInFlightStale(postId, inFlight)) {
+      console.debug("[DILI][terminal-state] stale in-flight scan converted to verification incomplete", {
+        postId,
+        signature,
+        linkFingerprint,
+        requestId: inFlight.requestId || ""
+      });
+      clearAnalyzingLifecycleState(postId);
+      if (post instanceof Element) {
+        renderBadge(post, buildVerificationIncompleteViewModel({
+          summaryLine: "DILI could not complete this scan in time.",
+          reason: "DILI could not complete this scan in time.",
+          technicalDetail: "The in-flight analysis marker exceeded the content-side timeout."
+        }));
+      }
+      return true;
+    }
+
     const cachedPanel = cachedPanelByPostId.get(postId);
     if (post instanceof Element && cachedPanel) {
       renderBadge(post, cachedPanel);
+    } else if (post instanceof Element) {
+      ensureAnalyzingTimeoutForPost(post, postId, "in-flight-skip");
     }
 
-    console.debug("[DILI][scan-lifecycle] Full analysis skipped because already in flight.", {
+    console.debug("[DILI][scan-lifecycle] full scan skipped because already in flight", {
       postId,
       signature,
       linkFingerprint,
@@ -4870,10 +4973,10 @@ function renderBadge(post, viewModel) {
   }
 
   const renderedPostId = getStablePostId(owningPost);
+  viewModel = ensurePanelHasTerminalOrRetryableState(owningPost, viewModel);
   if (viewModel.suppressPendingRefreshSchedule !== true) {
     schedulePendingVirusTotalPanelRefresh(owningPost, viewModel);
   }
-  viewModel = ensurePanelHasTerminalOrRetryableState(owningPost, viewModel);
 
   const severityLevel = normalizeInlineSeverityLevel(viewModel);
   const severityClass = sanitizeClassToken(severityLevel);
@@ -4930,7 +5033,7 @@ function renderBadge(post, viewModel) {
         event.stopImmediatePropagation();
       }
 
-      console.debug("[DILI][scan-lifecycle] Restart scan clicked.", {
+      console.debug("[DILI][scan-lifecycle] restart scan clicked", {
         postId: renderedPostId,
         state: viewModel.state || ""
       });
@@ -4949,6 +5052,9 @@ function renderBadge(post, viewModel) {
     delete cachedViewModel.suppressPendingRefreshSchedule;
     cachedPanelByPostId.set(renderedPostId, cachedViewModel);
     rememberRecentlyRenderedPanel(renderedPostId, owningPost, viewModel);
+    if (isViewModelAnalyzing(viewModel)) {
+      ensureAnalyzingTimeoutForPost(owningPost, renderedPostId, "post-render");
+    }
     scanStatus.renderedPanels += 1;
     scanStatus.visiblePanels = document.querySelectorAll(".dili-panel[data-dili-owned='true']").length;
     scanStatus.lastRenderedDomain = viewModel.finalDomain || viewModel.domain || "";
@@ -7025,30 +7131,48 @@ function getFirstFiniteProviderCount(...values) {
 }
 
 function getVirusTotalDisplayStats(provider = {}) {
-  const details = provider?.details || {};
+  const safeProvider = provider && typeof provider === "object" ? provider : {};
+  const details = safeProvider.details && typeof safeProvider.details === "object"
+    ? safeProvider.details
+    : {};
   const stats =
     details.last_analysis_stats ||
     details.lastAnalysisStats ||
-    provider.last_analysis_stats ||
-    provider.lastAnalysisStats ||
-    provider.stats ||
+    safeProvider.last_analysis_stats ||
+    safeProvider.lastAnalysisStats ||
+    safeProvider.stats ||
     {};
 
   return {
     maliciousCount: getFirstFiniteProviderCount(
       details.maliciousCount,
       details.malicious,
-      provider.maliciousCount,
-      provider.malicious,
+      safeProvider.maliciousCount,
+      safeProvider.malicious,
       stats.malicious
     ),
     suspiciousCount: getFirstFiniteProviderCount(
       details.suspiciousCount,
       details.suspicious,
-      provider.suspiciousCount,
-      provider.suspicious,
+      safeProvider.suspiciousCount,
+      safeProvider.suspicious,
       stats.suspicious
-    )
+    ),
+    harmlessCount: getFirstFiniteProviderCount(
+      details.harmlessCount,
+      details.harmless,
+      safeProvider.harmlessCount,
+      safeProvider.harmless,
+      stats.harmless
+    ),
+    undetectedCount: getFirstFiniteProviderCount(
+      details.undetectedCount,
+      details.undetected,
+      safeProvider.undetectedCount,
+      safeProvider.undetected,
+      stats.undetected
+    ),
+    status: String(details.status || safeProvider.status || "")
   };
 }
 
@@ -7237,30 +7361,34 @@ function isMessagingOrCommunityInviteDomain(domain) {
 }
 
 function getProviderOutcomeSummary(provider = {}) {
-  const providerName = String(provider.provider || "").toLowerCase();
-  const status = String(provider.details?.status || "").toLowerCase();
-  const reason = String(provider.details?.reason || "").toLowerCase();
+  const safeProvider = provider && typeof provider === "object" ? provider : {};
+  const details = safeProvider.details && typeof safeProvider.details === "object"
+    ? safeProvider.details
+    : {};
+  const providerName = String(safeProvider.provider || "").toLowerCase();
+  const status = String(details.status || "").toLowerCase();
+  const reason = String(details.reason || "").toLowerCase();
 
   if (status === "skipped" && reason === "unsupported_protocol") {
     return "Provider skipped because the destination uses a non-web protocol.";
   }
 
   if (providerName === "virustotal") {
-    const vtWarning = getVirusTotalDisplayWarning(provider);
-    if (!provider.configured || status === "not-configured") {
-      return "VirusTotal not configured.";
+    const vtWarning = getVirusTotalDisplayWarning(safeProvider);
+    if (!safeProvider.configured || status === "not-configured") {
+      return "VirusTotal check did not complete.";
     }
     if (status === "pending") {
-      return "VirusTotal scan submitted; result pending.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "rate-limited") {
-      return "VirusTotal rate limit reached.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "timeout") {
-      return "VirusTotal verification timed out.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "error" || status === "parse-error") {
-      return "VirusTotal request failed.";
+      return "VirusTotal check did not complete.";
     }
     if (vtWarning.maliciousCount > 0) {
       return `VirusTotal reported ${vtWarning.maliciousCount} malicious detection${vtWarning.maliciousCount === 1 ? "" : "s"}.`;
@@ -7268,45 +7396,64 @@ function getProviderOutcomeSummary(provider = {}) {
     if (vtWarning.suspiciousCount > 0) {
       return `VirusTotal reported ${vtWarning.suspiciousCount} suspicious detection${vtWarning.suspiciousCount === 1 ? "" : "s"}.`;
     }
-    return provider.flagged
+    if (status !== "checked" && status !== "completed") {
+      return "VirusTotal check did not complete.";
+    }
+    return safeProvider.flagged
       ? "VirusTotal reported malicious/suspicious detections."
       : "VirusTotal reported no malicious or suspicious detections.";
   }
 
-  if (providerName === "urlhaus" && status === "error") {
-    return "Lookup unavailable after retry.";
+  if (providerName === "gsb" && (!safeProvider.configured || status === "not-configured")) {
+    return "Google Safe Browsing check did not complete.";
   }
 
-  if (providerName !== "urlhaus" && (!provider.configured || status === "not-configured")) {
-    return "Provider not configured.";
+  if (providerName === "urlhaus" && status === "not-configured") {
+    return "URLhaus check did not complete.";
   }
 
   if (status === "timeout") {
-    return "Verification timed out.";
+    return providerName === "gsb"
+      ? "Google Safe Browsing check did not complete."
+      : providerName === "urlhaus"
+        ? "URLhaus check did not complete."
+        : "Provider check did not complete.";
   }
 
   if (status === "error" || status === "rate-limited" || status === "parse-error") {
-    return "Request failed.";
+    return providerName === "gsb"
+      ? "Google Safe Browsing check did not complete."
+      : providerName === "urlhaus"
+        ? "URLhaus check did not complete."
+        : "Provider check did not complete.";
   }
 
-  if (!provider.checked || status === "skipped" || status === "not-configured") {
-    return "Provider not configured.";
+  if (!safeProvider.checked || status === "skipped" || status === "not-configured") {
+    return providerName === "gsb"
+      ? "Google Safe Browsing check did not complete."
+      : providerName === "urlhaus"
+        ? "URLhaus check did not complete."
+        : "Provider check did not complete.";
   }
 
   if (providerName === "gsb") {
-    return provider.flagged ? "Unsafe URL reported." : "No unsafe matches reported.";
+    return safeProvider.flagged ? "Unsafe URL reported." : "Google Safe Browsing did not flag the checked URL candidate(s).";
   }
 
   if (providerName === "urlhaus") {
-    return provider.flagged ? "Known malware record found." : "No known malware record found.";
+    return safeProvider.flagged ? "Known malware record found." : "URLhaus found no known malware record for the checked URL candidate(s).";
   }
 
-  return provider.flagged ? "Provider reported a match." : "No provider match reported.";
+  return safeProvider.flagged ? "Provider reported a match." : "No provider match reported.";
 }
 
 function getProviderAuditStatus(provider = {}) {
-  const providerName = String(provider.provider || "").toLowerCase();
-  const status = String(provider.details?.status || "").toLowerCase();
+  const safeProvider = provider && typeof provider === "object" ? provider : {};
+  const details = safeProvider.details && typeof safeProvider.details === "object"
+    ? safeProvider.details
+    : {};
+  const providerName = String(safeProvider.provider || "").toLowerCase();
+  const status = String(details.status || "").toLowerCase();
 
   if (status === "timeout") {
     return "timeout";
@@ -7325,10 +7472,10 @@ function getProviderAuditStatus(provider = {}) {
   }
 
   if (
-    (providerName !== "urlhaus" && !provider.configured) ||
+    (providerName !== "urlhaus" && !safeProvider.configured) ||
     status === "not-configured" ||
     status === "skipped" ||
-    !provider.checked
+    !safeProvider.checked
   ) {
     return "skipped";
   }
@@ -7830,7 +7977,7 @@ function buildTechnicalDetails(analysis = {}) {
 
     const label = providerLabels[providerName] || provider.provider || "Provider";
     const auditStatus = getProviderAuditStatus(provider);
-    const outcomeSummary = provider.resultSummary || getProviderOutcomeSummary(provider);
+    const outcomeSummary = getProviderOutcomeSummary(provider) || provider.resultSummary;
     const durationMs = Number(provider.durationMs);
 
     pushUniqueTechnicalDetail(details, `${label} checked URL: ${provider.checkedUrl}.`);

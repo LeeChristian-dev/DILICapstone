@@ -4518,7 +4518,7 @@ for (const provider of normalizeProviderResults(providerResults)) {
 
   const label = providerLabels[provider.provider] || provider.provider || "Provider";
   const auditStatus = getProviderAuditStatus(provider);
-  const outcomeSummary = provider.resultSummary || getProviderOutcomeSummary(provider);
+  const outcomeSummary = getProviderOutcomeSummary(provider) || provider.resultSummary;
   const durationMs = Number(provider.durationMs);
 
   details.push(`${label} checked URL: ${provider.checkedUrl}.`);
@@ -5270,6 +5270,9 @@ async function lookupUrlhausCandidateSet(candidateUrls = []) {
   }
 
   const baseResult = lastResult || firstResult || createProviderErrorResult("urlhaus", candidates[0] || "", new Error("URLhaus candidate lookup did not run."));
+  const completedClean = baseResult?.checked === true &&
+    String(baseResult?.details?.status || "").toLowerCase() === "checked" &&
+    baseResult?.flagged !== true;
   return withProviderOutcomeSummary({
     ...baseResult,
     checkedUrl: checkedUrls[checkedUrls.length - 1] || baseResult.checkedUrl || "",
@@ -5278,7 +5281,9 @@ async function lookupUrlhausCandidateSet(candidateUrls = []) {
       ...(baseResult.details || {}),
       checkedUrls,
       candidateCount: checkedUrls.length,
-      message: "No known malware record found for the checked URL candidates."
+      message: completedClean
+        ? "URLhaus found no known malware record for the checked URL candidate(s)."
+        : "URLhaus check did not complete."
     }
   });
 }
@@ -5312,6 +5317,9 @@ async function lookupGoogleSafeBrowsingCandidateSet(candidateUrls = []) {
   }
 
   const baseResult = lastResult || firstResult || createProviderErrorResult("gsb", candidates[0] || "", new Error("Google Safe Browsing candidate lookup did not run."));
+  const completedClean = baseResult?.checked === true &&
+    String(baseResult?.details?.status || "").toLowerCase() === "checked" &&
+    baseResult?.flagged !== true;
   return withProviderOutcomeSummary({
     ...baseResult,
     checkedUrl: checkedUrls[checkedUrls.length - 1] || baseResult.checkedUrl || "",
@@ -5320,7 +5328,9 @@ async function lookupGoogleSafeBrowsingCandidateSet(candidateUrls = []) {
       ...(baseResult.details || {}),
       checkedUrls,
       candidateCount: checkedUrls.length,
-      message: "Google Safe Browsing found no unsafe matches for the checked URL candidates."
+      message: completedClean
+        ? "Google Safe Browsing did not flag the checked URL candidate(s)."
+        : "Google Safe Browsing check did not complete."
     }
   });
 }
@@ -7819,19 +7829,19 @@ function getProviderOutcomeSummary(result = {}) {
   if (provider === "virustotal") {
     const vtWarning = getVirusTotalWarningState(result);
     if (!result.configured || status === "not-configured") {
-      return "VirusTotal not configured.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "pending") {
-      return "VirusTotal scan submitted; result pending.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "rate-limited") {
-      return "VirusTotal rate limit reached.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "timeout") {
-      return "VirusTotal verification timed out.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "error" || status === "parse-error") {
-      return "VirusTotal request failed.";
+      return "VirusTotal check did not complete.";
     }
     if (vtWarning.maliciousCount > 0) {
       return `VirusTotal reported ${vtWarning.maliciousCount} malicious detection${vtWarning.maliciousCount === 1 ? "" : "s"}.`;
@@ -7839,37 +7849,52 @@ function getProviderOutcomeSummary(result = {}) {
     if (vtWarning.suspiciousCount > 0) {
       return `VirusTotal reported ${vtWarning.suspiciousCount} suspicious detection${vtWarning.suspiciousCount === 1 ? "" : "s"}.`;
     }
+    if (status !== "checked" && status !== "completed") {
+      return "VirusTotal check did not complete.";
+    }
     return result.flagged
       ? "VirusTotal reported malicious/suspicious detections."
       : "VirusTotal reported no malicious or suspicious detections.";
   }
 
-  if (provider === "urlhaus" && status === "error") {
-    return "Lookup unavailable after retry.";
+  if (provider === "gsb" && (!result.configured || status === "not-configured")) {
+    return "Google Safe Browsing check did not complete.";
   }
 
-  if (provider !== "urlhaus" && (!result.configured || status === "not-configured")) {
-    return "Provider not configured.";
+  if (provider === "urlhaus" && status === "not-configured") {
+    return "URLhaus check did not complete.";
   }
 
   if (status === "timeout") {
-    return "Verification timed out.";
+    return provider === "gsb"
+      ? "Google Safe Browsing check did not complete."
+      : provider === "urlhaus"
+        ? "URLhaus check did not complete."
+        : "Provider check did not complete.";
   }
 
   if (status === "error" || status === "rate-limited" || status === "parse-error") {
-    return "Request failed.";
+    return provider === "gsb"
+      ? "Google Safe Browsing check did not complete."
+      : provider === "urlhaus"
+        ? "URLhaus check did not complete."
+        : "Provider check did not complete.";
   }
 
   if (!result.checked || status === "skipped" || status === "not-configured") {
-    return "Provider not configured.";
+    return provider === "gsb"
+      ? "Google Safe Browsing check did not complete."
+      : provider === "urlhaus"
+        ? "URLhaus check did not complete."
+        : "Provider check did not complete.";
   }
 
   if (provider === "gsb") {
-    return result.flagged ? "Unsafe URL reported." : "No unsafe matches reported.";
+    return result.flagged ? "Unsafe URL reported." : "Google Safe Browsing did not flag the checked URL candidate(s).";
   }
 
   if (provider === "urlhaus") {
-    return result.flagged ? "Known malware record found." : "No known malware record found.";
+    return result.flagged ? "Known malware record found." : "URLhaus found no known malware record for the checked URL candidate(s).";
   }
 
   return result.flagged ? "Provider reported a match." : "No provider match reported.";

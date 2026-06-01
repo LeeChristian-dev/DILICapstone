@@ -313,12 +313,12 @@ function renderTabContext(activeTab, summary) {
   }
 
   if (tabSupported) {
-    tabContextText.textContent = "Facebook tab — DILI can scan posts on this page.";
+    tabContextText.textContent = "Facebook tab - DILI can scan posts on this page.";
     tabContext.classList.add("context-ok");
     return;
   }
 
-  tabContextText.textContent = "Not a Facebook URL — DILI only runs on *.facebook.com.";
+  tabContextText.textContent = "Not a Facebook URL - DILI only runs on *.facebook.com.";
   tabContext.classList.add("context-warn");
 }
 
@@ -395,7 +395,7 @@ function renderProviderChips(providerSummary) {
     labelSpan.textContent = `${key === "virustotal" ? "VT Config" : (entry.label || key)}:`;
 
     const textSpan = document.createElement("span");
-    textSpan.textContent = String(entry.text || "—");
+    textSpan.textContent = String(entry.text || "-");
 
     if (key === "virustotal") {
       chip.title = "Provider is configured or available. Individual URL scans may still be pending.";
@@ -428,7 +428,7 @@ function renderRecentActivity(recentActivity) {
   for (const item of recentActivity) {
     const li = document.createElement("li");
     const title = document.createElement("span");
-const domain = item.domain || "—";
+const domain = item.domain || "-";
 const classification = String(item.classification || "").trim();
 const state = String(item.state || "").toLowerCase();
 const providerOverride = item.providerOverride === true;
@@ -468,13 +468,13 @@ const statusLabel = providerOverride
       ? "Verification Incomplete"
       : classification || "Unverified";
 
-title.textContent = `${domain} · ${statusLabel} · ${scoreText}`;
+title.textContent = `${domain} - ${statusLabel} - ${scoreText}`;
 
     const meta = document.createElement("span");
     meta.className = "recent-meta";
-    meta.textContent = `${formatTimestamp(item.timestamp)} · ${String(item.postId || "").slice(0, 24)}${
-      String(item.postId || "").length > 24 ? "…" : ""
-    } · ${item.state || "—"}`;
+    meta.textContent = `${formatTimestamp(item.timestamp)} - ${String(item.postId || "").slice(0, 24)}${
+      String(item.postId || "").length > 24 ? "..." : ""
+    } - ${item.state || "-"}`;
 
     li.appendChild(title);
     li.appendChild(meta);
@@ -585,19 +585,19 @@ function convertRecordsToCsv(records) {
       gsb?.checkedUrl ?? "",
       gsb?.checkedAt ?? "",
       gsb?.durationMs ?? "",
-      gsb?.resultSummary || getProviderOutcomeSummary(gsb),
+      getProviderOutcomeSummary(gsb) || gsb?.resultSummary,
       urlhaus?.details?.authKeyConfigured ?? urlhaus?.details?.authConfigured ?? urlhaus?.configured ?? "",
       urlhaus?.flagged ?? "",
       urlhaus?.checkedUrl ?? "",
       urlhaus?.checkedAt ?? "",
       urlhaus?.durationMs ?? "",
-      urlhaus?.resultSummary || getProviderOutcomeSummary(urlhaus),
+      getProviderOutcomeSummary(urlhaus) || urlhaus?.resultSummary,
       vt?.details?.status ?? "",
       vt?.configured ?? "",
       vt?.flagged ?? "",
       vt?.checkedUrl ?? "",
       vt?.checkedAt ?? "",
-      vt?.resultSummary || getProviderOutcomeSummary(vt),
+      getProviderOutcomeSummary(vt) || vt?.resultSummary,
       vt?.details?.maliciousCount ?? "",
       vt?.details?.suspiciousCount ?? "",
       vt?.details?.analysisId ?? "",
@@ -719,19 +719,19 @@ function getProviderOutcomeSummary(provider = {}) {
   if (providerName === "virustotal") {
     const vtStats = getVirusTotalProviderStats(provider);
     if (!provider.configured || status === "not-configured") {
-      return "VirusTotal not configured.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "pending") {
-      return "VirusTotal scan submitted; result pending.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "rate-limited") {
-      return "VirusTotal rate limit reached.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "timeout") {
-      return "VirusTotal verification timed out.";
+      return "VirusTotal check did not complete.";
     }
     if (status === "error" || status === "parse-error") {
-      return "VirusTotal request failed.";
+      return "VirusTotal check did not complete.";
     }
     if (vtStats.maliciousCount > 0) {
       return `VirusTotal reported ${vtStats.maliciousCount} malicious detection${vtStats.maliciousCount === 1 ? "" : "s"}.`;
@@ -739,37 +739,52 @@ function getProviderOutcomeSummary(provider = {}) {
     if (vtStats.suspiciousCount > 0) {
       return `VirusTotal reported ${vtStats.suspiciousCount} suspicious detection${vtStats.suspiciousCount === 1 ? "" : "s"}.`;
     }
+    if (status !== "checked" && status !== "completed") {
+      return "VirusTotal check did not complete.";
+    }
     return provider.flagged
       ? "VirusTotal reported malicious/suspicious detections."
       : "VirusTotal reported no malicious or suspicious detections.";
   }
 
-  if (providerName === "urlhaus" && status === "error") {
-    return "Lookup unavailable after retry.";
+  if (providerName === "gsb" && (!provider.configured || status === "not-configured")) {
+    return "Google Safe Browsing check did not complete.";
   }
 
-  if (providerName !== "urlhaus" && (!provider.configured || status === "not-configured")) {
-    return "Provider not configured.";
+  if (providerName === "urlhaus" && status === "not-configured") {
+    return "URLhaus check did not complete.";
   }
 
   if (status === "timeout") {
-    return "Verification timed out.";
+    return providerName === "gsb"
+      ? "Google Safe Browsing check did not complete."
+      : providerName === "urlhaus"
+        ? "URLhaus check did not complete."
+        : "Provider check did not complete.";
   }
 
   if (status === "error" || status === "rate-limited" || status === "parse-error") {
-    return "Request failed.";
+    return providerName === "gsb"
+      ? "Google Safe Browsing check did not complete."
+      : providerName === "urlhaus"
+        ? "URLhaus check did not complete."
+        : "Provider check did not complete.";
   }
 
   if (!provider.checked || status === "skipped" || status === "not-configured") {
-    return "Provider not configured.";
+    return providerName === "gsb"
+      ? "Google Safe Browsing check did not complete."
+      : providerName === "urlhaus"
+        ? "URLhaus check did not complete."
+        : "Provider check did not complete.";
   }
 
   if (providerName === "gsb") {
-    return provider.flagged ? "Unsafe URL reported." : "No unsafe matches reported.";
+    return provider.flagged ? "Unsafe URL reported." : "Google Safe Browsing did not flag the checked URL candidate(s).";
   }
 
   if (providerName === "urlhaus") {
-    return provider.flagged ? "Known malware record found." : "No known malware record found.";
+    return provider.flagged ? "Known malware record found." : "URLhaus found no known malware record for the checked URL candidate(s).";
   }
 
   return provider.flagged ? "Provider reported a match." : "No provider match reported.";

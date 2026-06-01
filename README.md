@@ -4,9 +4,9 @@ DILI is a Manifest V3 Chrome extension for Facebook link monitoring. It fingerpr
 
 ## Release documentation
 
-- **Branch `beta-2.3.0`:** [Release notes and capstone appendix](docs/RELEASE_NOTES-beta-2.3.0.md) — feature list, changelog-style summary, setup, limitations, and security notes.
-- **Process-flow coverage (capstone):** [Process-flow appendix & rubric](docs/PROCESS_FLOW_APPENDIX-beta-2.3.0.md) — stage-by-stage mapping to the DILI flow diagram, weighted **~87%** alignment, PDF export notes.
-- **Detailed branch report:** [Detailed report — `beta-2.3.0`](docs/DETAILED_REPORT-beta-2.3.0.md) — architecture, data flow, modules, persistence, UX, limitations, and next steps.
+- **Branch `beta-2.3.0`:** [Release notes and capstone appendix](docs/RELEASE_NOTES-beta-2.3.0.md) - feature list, changelog-style summary, setup, limitations, and security notes.
+- **Process-flow coverage (capstone):** [Process-flow appendix & rubric](docs/PROCESS_FLOW_APPENDIX-beta-2.3.0.md) - stage-by-stage mapping to the DILI flow diagram, weighted **~87%** alignment, PDF export notes.
+- **Detailed branch report:** [Detailed report - `beta-2.3.0`](docs/DETAILED_REPORT-beta-2.3.0.md) - architecture, data flow, modules, persistence, UX, limitations, and next steps.
 
 ## What Is New In This Revision
 
@@ -22,10 +22,10 @@ DILI is a Manifest V3 Chrome extension for Facebook link monitoring. It fingerpr
 
 DILI displays endpoint stages as:
 
-- Visible post URL/text — the visible URL or link text shown in the Facebook post.
-- Facebook click wrapper URL — the full `l.facebook.com` wrapper when Facebook exposes one.
-- Unwrapped URL — the URL obtained after removing known wrappers when possible.
-- Full endpoint URL — the final destination DILI uses for provider checks and Safety Score analysis.
+- Visible post URL/text - the visible URL or link text shown in the Facebook post.
+- Facebook click wrapper URL - the full `l.facebook.com` wrapper when Facebook exposes one.
+- Unwrapped URL - the URL obtained after removing known wrappers when possible.
+- Full endpoint URL - the final destination DILI uses for provider checks and Safety Score analysis.
 
 This clarifies that shortened links are resolved to their final endpoint before provider checks whenever resolution succeeds.
 
@@ -107,9 +107,9 @@ DILI computes a **Safety Score** using a subtractive model:
 
 ### Safety Score Classifications
 
-- `80-100`: **Safe** — no major warning signs detected
-- `50-79`: **Suspicious** — warning signs detected; navigation pause/interception recommended
-- `0-49`: **High Risk** — strong warning signs or provider flag; navigation pause/interception recommended
+- `80-100`: **Safe** - no major warning signs detected
+- `50-79`: **Suspicious** - warning signs detected; navigation pause/interception recommended
+- `0-49`: **High Risk** - strong warning signs or provider flag; navigation pause/interception recommended
 - `Unverified`: DILI could not fully verify the destination
 
 **Evidence-weighted scoring:** DILI treats provider-confirmed detections as primary evidence and local heuristics as supporting evidence. Google Safe Browsing and URLhaus flags can immediately produce a High Risk result without waiting for VirusTotal. VirusTotal is treated as a multi-engine corroboration provider: strong malicious consensus can force High Risk, while single weak detections are warning/caution evidence rather than automatic maliciousness.
@@ -158,8 +158,8 @@ Advanced audit output separates active deductions, mitigations, provider overrid
 
 DILI separates redirect evidence into two views:
 
-- **Full observed redirect trace** — every redirect stage DILI could observe through wrapper parameters and allowed network probing.
-- **Risk-relevant redirect chain** — the simplified chain used for scoring and user-facing risk explanation.
+- **Full observed redirect trace** - every redirect stage DILI could observe through wrapper parameters and allowed network probing.
+- **Risk-relevant redirect chain** - the simplified chain used for scoring and user-facing risk explanation.
 
 Some redirects may still be invisible when a service uses JavaScript redirects, meta refresh, anti-bot behavior, or browser-only navigation. In those cases, DILI reports the endpoint it could verify and the observed trace it could collect.
 
