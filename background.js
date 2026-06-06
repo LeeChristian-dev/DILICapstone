@@ -326,6 +326,36 @@ function isStoredLinkAnalysisTerminalIncomplete(analysis = {}) {
   );
 }
 
+function shouldNormalizeAsVerificationIncomplete(analysis = {}) {
+  const state = String(analysis.state || "").toLowerCase();
+  const classification = String(analysis.classification || "").toLowerCase();
+  const retryStatus = String(analysis.providerRetryPlan?.status || "").toLowerCase();
+  const retryBudgetExhausted = Boolean(
+    analysis.scoreAudit?.retryBudgetExhausted === true ||
+    retryStatus === "exhausted" ||
+    retryStatus === "failed"
+  );
+  const scoreMissing = toFiniteScoreOrNull(analysis.safetyScore) === null;
+  const finalized = analysis.scanFinalized === true;
+  const hasProviderPending = Boolean(
+    analysis.providerPending === true ||
+    analysis.providerCompletion?.hasPendingProvider === true ||
+    (Array.isArray(analysis.pendingProviders) && analysis.pendingProviders.length > 0)
+  );
+
+  return Boolean(
+    state === "verification-incomplete" ||
+    state === "completed-limited" ||
+    retryBudgetExhausted ||
+    (
+      classification === "unverified" &&
+      finalized &&
+      scoreMissing &&
+      !hasProviderPending
+    )
+  );
+}
+
 function normalizeTerminalIncompleteAnalysis(analysis = {}, reason = "Verification did not complete.") {
   if (!analysis || typeof analysis !== "object" || analysis.providerOverride === true) {
     return analysis;
@@ -538,6 +568,14 @@ function normalizeBackgroundTerminalState(analysis = {}) {
 
   if (classification === "unverified" && analysis.scanFinalized === false) {
     return normalizeTerminalIncompleteAnalysis(analysis, "Unverified result was not finalized by provider verification.");
+  }
+
+  if (shouldNormalizeAsVerificationIncomplete(analysis)) {
+    return normalizeTerminalIncompleteAnalysis(
+      analysis,
+      analysis.scoreAudit?.terminalIncompleteReason ||
+        "Provider verification could not be completed. Restart the scan to try again."
+    );
   }
 
   return {
@@ -6574,18 +6612,10 @@ async function refreshVirusTotalResultForPost(message = {}) {
   }
 
   if (hasLegacyPendingChildWithoutRefreshMetadata(storedAnalysis)) {
-    const legacyAnalysis = {
-      ...storedAnalysis,
-      classification: "Scan Pending",
-      safetyScore: null,
-      scanFinalized: false,
-      state: "pending-provider",
-      interceptionRecommended: false,
-      limitations: [
-        ...(storedAnalysis.limitations || []),
-        "Pending child-link refresh metadata was unavailable for this older analysis record; a manual rescan may be needed."
-      ].slice(0, 8)
-    };
+    const legacyAnalysis = normalizeTerminalIncompleteAnalysis(
+      storedAnalysis,
+      "Pending child-link refresh metadata was unavailable for this older analysis record; restart the scan to try again."
+    );
     const persistedLegacyAnalysis = await persistPostLevelAnalysis(postId, legacyAnalysis);
     return {
       type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
@@ -6598,8 +6628,14 @@ async function refreshVirusTotalResultForPost(message = {}) {
   const refreshTarget = selectPendingProviderRefreshTarget(storedAnalysis, message)
     || (!Array.isArray(storedAnalysis.linkAnalysisSnapshots) || storedAnalysis.linkAnalysisSnapshots.length === 0 ? storedAnalysis : null);
   if (!refreshTarget) {
+    const finalizedMissingTarget = normalizeTerminalIncompleteAnalysis(
+      storedAnalysis,
+      "Pending provider refresh target was unavailable. Restart the scan to try again."
+    );
+    const persistedMissingTarget = await persistPostLevelAnalysis(postId, finalizedMissingTarget);
     return {
       type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
+      analysis: persistedMissingTarget,
       refreshed: false,
       reason: "missing-pending-provider-target"
     };
@@ -6630,8 +6666,14 @@ async function refreshVirusTotalResultForPost(message = {}) {
     "";
 
   if (!providerCheckedUrl) {
+    const missingCheckedUrlAnalysis = normalizeTerminalIncompleteAnalysis(
+      storedAnalysis,
+      "Pending provider checked URL was unavailable. Restart the scan to try again."
+    );
+    const persistedMissingCheckedUrl = await persistPostLevelAnalysis(postId, missingCheckedUrlAnalysis);
     return {
       type: MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT,
+      analysis: persistedMissingCheckedUrl,
       refreshed: false,
       reason: "missing-provider-checked-url"
     };
@@ -6737,9 +6779,15 @@ async function finalizePendingProviderStateForPost(message = {}) {
   const childTarget = selectPendingProviderRefreshTarget(storedAnalysis, message)
     || (!Array.isArray(storedAnalysis.linkAnalysisSnapshots) || storedAnalysis.linkAnalysisSnapshots.length === 0 ? storedAnalysis : null);
   if (!childTarget) {
+    const finalizedMissingTarget = normalizeTerminalIncompleteAnalysis(
+      storedAnalysis,
+      "Pending provider refresh target was unavailable. Restart the scan to try again."
+    );
+    const persisted = await persistPostLevelAnalysis(postId, finalizedMissingTarget);
     return {
       type: MESSAGE_TYPES.FINALIZE_PENDING_PROVIDER_STATE,
-      finalized: false,
+      analysis: persisted,
+      finalized: true,
       reason: "missing-pending-provider-target"
     };
   }
@@ -6900,7 +6948,7 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
 
   if ((retryBudgetExhausted || terminalProviderLimitation) && !providerOverride) {
     displayedScore = null;
-    displayedClassification = "Unverified";
+    displayedClassification = "Verification Incomplete";
     displayedState = "verification-incomplete";
   }
 
@@ -6941,6 +6989,11 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
   scoreAudit.computedClassification = classification;
   scoreAudit.retryBudgetExhausted = retryBudgetExhausted;
   scoreAudit.verificationIncomplete = terminalProviderLimitation || retryBudgetExhausted;
+  if (retryBudgetExhausted || terminalProviderLimitation) {
+    scoreAudit.terminalIncompleteReason = retryBudgetExhausted
+      ? "VirusTotal did not return a completed result within the retry window."
+      : "One or more provider checks ended in a terminal limited state.";
+  }
   scoreAudit.pendingProviders = providerCompletion.pendingProviders;
   scoreAudit.providerOverrideSource = providerPolicy.providerOverrideSource;
   scoreAudit.providerOverrideReason = providerPolicy.providerOverrideReason;
@@ -7011,9 +7064,11 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
           ...item,
           safetyScore: null,
           computedSafetyScore: recoveredSafetyScore,
-          classification: "Unverified",
+          classification: "Verification Incomplete",
           computedClassification: classification,
           scanFinalized: true,
+          state: "verification-incomplete",
+          providerPending: false,
           providerCompletion: {
             ...(providerCompletion || {}),
             hasPendingProvider: false,
@@ -7023,7 +7078,7 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
           pendingProviders: []
         };
       });
-      refreshedAnalysis.classification = "Unverified";
+      refreshedAnalysis.classification = "Verification Incomplete";
       refreshedAnalysis.safetyScore = null;
       refreshedAnalysis.scanFinalized = true;
       refreshedAnalysis.state = "verification-incomplete";
@@ -7079,6 +7134,15 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
     },
     providerResults: safeProviderResults
   });
+
+  if ((retryBudgetExhausted || terminalProviderLimitation) && !providerOverride) {
+    return normalizeTerminalIncompleteAnalysis(
+      refreshedAnalysis,
+      retryBudgetExhausted
+        ? "VirusTotal did not return a completed result within the retry window."
+        : "One or more provider checks ended in a terminal limited state."
+    );
+  }
 
   return normalizeBackgroundTerminalState(refreshedAnalysis);
 }

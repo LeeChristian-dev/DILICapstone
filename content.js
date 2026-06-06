@@ -172,9 +172,13 @@ const UNSAFE_PANEL_ANCESTOR_SELECTOR =
   const pendingVirusTotalRefreshAttemptsByPostId = new Map();
   const pendingCountdownTimerByPostId = new Map();
   const analyzingTimeoutByPostId = new Map();
+  const panelHardTimeoutByPostId = new Map();
   const manualRestartPostIds = new Set();
+  const restartInFlightByPostId = new Set();
   const VIRUSTOTAL_PANEL_REFRESH_DELAYS_MS = [30000, 60000, 120000];
   const ANALYZING_TIMEOUT_MS = 20 * 1000;
+  const ANALYZING_PANEL_HARD_LIMIT_MS = 30 * 1000;
+  const PENDING_PROVIDER_PANEL_HARD_LIMIT_MS = 4 * 60 * 1000;
   const COMPLETED_PANEL_RENDER_COOLDOWN_MS = 30 * 1000;
   let manualRescanBypassUntil = 0;
 const NO_LINK_PANEL_REMOVAL_CONFIRMATION_COUNT = 3;
@@ -2242,6 +2246,7 @@ async function processPost(post) {
     );
   } catch (error) {
     clearAnalyzingTimeout(postId);
+    clearPanelHardTimeout(postId);
     renderBadge(owningPost, {
       label: "Verification Incomplete",
       safetyScore: null,
@@ -2276,6 +2281,7 @@ async function processPost(post) {
     return;
   }
   clearAnalyzingTimeout(postId);
+  clearPanelHardTimeout(postId);
 
   const backgroundRoundTripMs = elapsedMs(backgroundStartedAt);
   scanStatus.perfLastBackgroundRoundTripMs = backgroundRoundTripMs;
@@ -2343,8 +2349,16 @@ async function processPost(post) {
       timestamp: Date.now()
     };
 
+    renderBadge(owningPost, buildVerificationIncompleteViewModel({
+      summaryLine: "DILI could not complete this scan because the post changed during analysis.",
+      reason: `Analysis response was discarded as stale: ${staleReason}.`,
+      technicalDetail: `Stale response reason: ${staleReason}.`
+    }));
     analysisInFlightByPostId.delete(postId);
+    latestRequestByPostId.delete(postId);
     manualRestartPostIds.delete(postId);
+    clearAnalyzingTimeout(postId);
+    clearPanelHardTimeout(postId);
     return;
   }
 
@@ -2427,6 +2441,7 @@ function isAnalysisInFlightStale(postId, inFlight = {}) {
 
 function clearAnalyzingLifecycleState(postId) {
   clearAnalyzingTimeout(postId);
+  clearPanelHardTimeout(postId);
   clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
   clearPendingCountdownTimer(postId);
   latestRequestByPostId.delete(postId);
@@ -2615,10 +2630,21 @@ function hasRetryablePendingProviderState(postId, viewModel = {}) {
     return false;
   }
 
-  return Boolean(
-    (refreshTarget || pendingProviders.length > 0 || hasActualPendingProvider(analysis)) &&
-    (hasScheduledTimer || hasKnownNextRetry)
+  const hasPendingEvidence = Boolean(
+    refreshTarget ||
+    pendingProviders.length > 0 ||
+    hasActualPendingProvider(analysis)
   );
+
+  if (!hasPendingEvidence) {
+    return false;
+  }
+
+  if (hasScheduledTimer || hasKnownNextRetry) {
+    return true;
+  }
+
+  return ["", "pending", "scheduled", "sending", "waiting-response"].includes(retryStatus);
 }
 
 function ensurePanelHasTerminalOrRetryableState(post, viewModel = {}) {
@@ -2627,6 +2653,14 @@ function ensurePanelHasTerminalOrRetryableState(post, viewModel = {}) {
   const analysis = viewModel.analysis || {};
 
   if (!postId) {
+    return viewModel;
+  }
+
+  if (
+    viewModel.restartInProgress === true ||
+    analysis.restartInProgress === true ||
+    String(viewModel.label || analysis.classification || "").toLowerCase() === "restarting scan"
+  ) {
     return viewModel;
   }
 
@@ -4866,13 +4900,21 @@ function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
     pendingCountdownTimerByPostId.clear();
   }
 
-  function clearAllAnalyzingTimeouts() {
-    for (const timer of analyzingTimeoutByPostId.values()) {
-      window.clearTimeout(timer);
-    }
-
-    analyzingTimeoutByPostId.clear();
+function clearAllAnalyzingTimeouts() {
+  for (const timer of analyzingTimeoutByPostId.values()) {
+    window.clearTimeout(timer);
   }
+
+  analyzingTimeoutByPostId.clear();
+}
+
+function clearAllPanelHardTimeouts() {
+  for (const timer of panelHardTimeoutByPostId.values()) {
+    window.clearTimeout(timer);
+  }
+
+  panelHardTimeoutByPostId.clear();
+}
 
     function resetOwnedUiArtifacts() {
     removeAllOwnedPanels();
@@ -4882,9 +4924,11 @@ function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
     recentlyRenderedPanelByPostId.clear();
     analysisInFlightByPostId.clear();
     manualRestartPostIds.clear();
+    restartInFlightByPostId.clear();
     clearAllPendingVirusTotalPanelRefreshes();
     clearAllPendingCountdownTimers();
     clearAllAnalyzingTimeouts();
+    clearAllPanelHardTimeouts();
     postSignatureCache = new WeakMap(); 
 }
 
@@ -4896,9 +4940,11 @@ function shouldDelayNoLinkPanelRemoval(post, postId, reason) {
     latestRequestByPostId.clear();
 analysisInFlightByPostId.clear();
 manualRestartPostIds.clear();
+restartInFlightByPostId.clear();
 recentlyRenderedPanelByPostId.clear();
 clearAllPendingVirusTotalPanelRefreshes();
 clearAllAnalyzingTimeouts();
+clearAllPanelHardTimeouts();
 noLinkRescanCountsByPostId.clear();
 
     if (flushTimer !== null) {
@@ -5062,6 +5108,12 @@ function renderBadge(post, viewModel) {
 
   const renderedPostId = getStablePostId(owningPost);
   viewModel = ensurePanelHasTerminalOrRetryableState(owningPost, viewModel);
+  if (viewModel.state === "analyzing" || viewModel.state === "pending-provider") {
+    schedulePanelHardTimeout(owningPost, renderedPostId, viewModel);
+  } else {
+    clearPanelHardTimeout(renderedPostId);
+  }
+
   if (viewModel.suppressPendingRefreshSchedule !== true) {
     schedulePendingVirusTotalPanelRefresh(owningPost, viewModel);
   }
@@ -5079,7 +5131,7 @@ function renderBadge(post, viewModel) {
     const compactSummary = panelAriaLabel;
     const detailItems = renderDetailListItems(viewModel.details || []);
     const countdownLine = viewModel.state === "pending-provider"
-      ? buildPendingCountdownLine(viewModel.analysis || {})
+      ? (buildPendingCountdownLine(viewModel.analysis || {}) || "Provider check in progress...")
       : "";
     const restartAvailable = shouldShowRestartScanButton(viewModel);
 
@@ -5130,8 +5182,8 @@ function renderBadge(post, viewModel) {
       });
     });
 
-    if (viewModel.state === "pending-provider" && viewModel.analysis?.providerRetryPlan?.nextRetryAt) {
-      startPendingCountdownTimer(renderedPostId, owningPost, viewModel.analysis);
+    if (viewModel.state === "pending-provider") {
+      startPendingCountdownTimer(renderedPostId, owningPost, viewModel.analysis || {});
     } else {
       clearPendingCountdownTimer(renderedPostId);
     }
@@ -5206,6 +5258,15 @@ function rememberRecentlyRenderedPanel(postId, post, viewModel = {}) {
 
 function shouldShowRestartScanButton(viewModel = {}) {
   const analysis = viewModel.analysis || {};
+  if (
+    viewModel.restartInProgress === true ||
+    analysis.restartInProgress === true ||
+    String(viewModel.state || "").toLowerCase() === "analyzing" ||
+    String(viewModel.label || "").toLowerCase() === "restarting scan"
+  ) {
+    return false;
+  }
+
   if (analysis.providerOverride === true || viewModel.providerOverride === true) {
     return false;
   }
@@ -5214,17 +5275,24 @@ function shouldShowRestartScanButton(viewModel = {}) {
   const label = String(viewModel.label || analysis.classification || "").toLowerCase();
   const retryStatus = String(analysis.providerRetryPlan?.status || "").toLowerCase();
   const retryReason = String(analysis.scoreAudit?.retryBudgetExhausted || analysis.providerResults?.find?.((item) => item?.provider === "virustotal")?.details?.reason || "").toLowerCase();
+  const score = toFiniteUiScoreOrNull(viewModel.safetyScore ?? analysis.safetyScore);
+  const scanFinalized = viewModel.scanFinalized === true || analysis.scanFinalized === true;
 
   return Boolean(
     viewModel.restartAvailable === true ||
+    analysis.restartable === true ||
     state === "verification-incomplete" ||
     state === "completed-limited" ||
+    analysis.scoreAudit?.verificationIncomplete === true ||
+    analysis.scoreAudit?.retryBudgetExhausted === true ||
     retryStatus === "exhausted" ||
+    retryStatus === "failed" ||
     retryReason === "retry_budget_exhausted" ||
     label.includes("verification incomplete") ||
     (
       label.includes("unverified") &&
-      toFiniteUiScoreOrNull(viewModel.safetyScore ?? analysis.safetyScore) === null
+      score === null &&
+      scanFinalized
     )
   );
 }
@@ -5236,8 +5304,55 @@ async function restartScanForPost(post, reason = "manual-post-restart") {
   }
 
   const postId = getStablePostId(owningPost);
+  if (restartInFlightByPostId.has(postId)) {
+    console.debug("[DILI][scan-lifecycle] Restart ignored because one is already in flight.", { postId });
+    return;
+  }
+
+  restartInFlightByPostId.add(postId);
+
+  try {
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "manual-restart-started",
+      postId,
+      timestamp: Date.now()
+    };
+
+    renderBadge(owningPost, {
+      label: "Restarting Scan",
+      safetyScore: null,
+      state: "analyzing",
+      severityLevel: "unverified",
+      summaryLine: "DILI is starting a fresh scan for this post.",
+      detailsSummary: "Scan details",
+      actionHint: "Please wait while DILI clears stale state and sends a new scan request.",
+      restartAvailable: false,
+      restartInProgress: true,
+      details: [
+        "Manual restart requested.",
+        "DILI is clearing stale verification state before rescanning this post."
+      ]
+    });
+
   const postTextSnapshot = await buildVisiblePostTextSnapshot(owningPost);
   const linkInfo = extractRelevantLinks(owningPost, postId, { suppressDiagnostics: true });
+  if (!linkInfo) {
+    renderBadge(owningPost, {
+      label: "Verification Incomplete",
+      safetyScore: null,
+      state: "verification-incomplete",
+      severityLevel: "unverified",
+      summaryLine: "DILI could not restart the scan because no external link was detected in this post.",
+      detailsSummary: "Scan details",
+      actionHint: "Expand the post, scroll it fully into view, or reload Facebook, then try again.",
+      restartAvailable: true,
+      details: [
+        "Restart scan was requested, but DILI could not extract a usable external link from the current post DOM."
+      ]
+    });
+    return;
+  }
+
   const postSignature = buildPostSignature(linkInfo);
   const linkFingerprint = linkInfo?.linkFingerprint || "";
 
@@ -5251,19 +5366,6 @@ async function restartScanForPost(post, reason = "manual-post-restart") {
   completedAnalysisSessionCache.delete(postId);
   selectedPostLinkCache.delete(postId);
   postSignatureCache.delete(owningPost);
-  manualRestartPostIds.add(postId);
-
-  renderBadge(owningPost, {
-    label: "Verification Incomplete",
-    safetyScore: null,
-    state: "verification-incomplete",
-    severityLevel: "unverified",
-    summaryLine: "Restarting scan for this post.",
-    detailsSummary: "Scan details",
-    actionHint: "DILI is preparing one fresh scan for this post.",
-    restartAvailable: true,
-    details: ["Manual post-level restart requested."]
-  });
 
   const response = await sendRuntimeMessage({
     type: MESSAGE_TYPES.CLEAR_POST_ANALYSIS_STATE,
@@ -5275,7 +5377,23 @@ async function restartScanForPost(post, reason = "manual-post-restart") {
   });
 
   if (shouldAbortForRuntimeInvalidation(response)) {
-    manualRestartPostIds.delete(postId);
+    return;
+  }
+
+  if (!response || response.ok === false) {
+    renderBadge(owningPost, {
+      label: "Verification Incomplete",
+      safetyScore: null,
+      state: "verification-incomplete",
+      severityLevel: "unverified",
+      summaryLine: "DILI could not restart the scan because stale state could not be cleared.",
+      detailsSummary: "Scan details",
+      actionHint: "Reload Facebook, then try Restart scan again.",
+      restartAvailable: true,
+      details: [
+        response?.error || response?.reason || "State clearing failed before a fresh scan request was sent."
+      ]
+    });
     return;
   }
 
@@ -5285,10 +5403,43 @@ async function restartScanForPost(post, reason = "manual-post-restart") {
     reason
   });
 
-  try {
-    await processPost(owningPost);
+  scanStatus.lastAnalysisPipelineState = {
+    stage: "manual-restart-state-cleared",
+    postId,
+    timestamp: Date.now()
+  };
+
+  const beforeRequestsSent = Number(scanStatus.analysisRequestsSent || 0);
+  manualRestartPostIds.add(postId);
+  await processPost(owningPost);
+  const afterRequestsSent = Number(scanStatus.analysisRequestsSent || 0);
+
+  if (afterRequestsSent <= beforeRequestsSent) {
+    const lastPipelineStage = scanStatus.lastAnalysisPipelineState?.stage || "unknown";
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "manual-restart-no-request-sent",
+      postId,
+      timestamp: Date.now()
+    };
+
+    renderBadge(owningPost, {
+      label: "Verification Incomplete",
+      safetyScore: null,
+      state: "verification-incomplete",
+      severityLevel: "unverified",
+      summaryLine: "DILI could not send a fresh scan request for this post.",
+      detailsSummary: "Scan details",
+      actionHint: "Try expanding the post, scrolling it into view, or using Rescan Now from the extension popup.",
+      restartAvailable: true,
+      details: [
+        "Restart scan cleared stale state, but processPost() did not send a fresh ANALYZE_LINK or REANALYZE_LINK request.",
+        `Last pipeline stage: ${lastPipelineStage}`
+      ]
+    });
+  }
   } finally {
     manualRestartPostIds.delete(postId);
+    restartInFlightByPostId.delete(postId);
   }
 }
 
@@ -5531,7 +5682,7 @@ function buildPendingCountdownLine(analysis = {}) {
 
   const retryAt = Number(retryPlan.nextRetryAt);
   if (!Number.isFinite(retryAt) || retryAt <= 0) {
-    return "";
+    return "Provider check in progress...";
   }
 
   const remainingMs = retryAt - Date.now();
@@ -5565,7 +5716,14 @@ function startPendingCountdownTimer(postId, post, analysis = {}) {
     const currentAnalysis = cachedPanelByPostId.get(postId)?.analysis || analysis;
     const normalized = normalizeProviderDisplayAnalysis(currentAnalysis);
 
-    if (normalized?.scanFinalized === true || !hasActualPendingProvider(normalized)) {
+    const retryPlan = normalized?.providerRetryPlan || {};
+    const status = String(retryPlan.status || "").toLowerCase();
+
+    if (
+      normalized?.scanFinalized === true ||
+      !hasActualPendingProvider(normalized) ||
+      ["completed", "finalized", "exhausted"].includes(status)
+    ) {
       clearPendingCountdownTimer(postId);
       return;
     }
@@ -5576,17 +5734,104 @@ function startPendingCountdownTimer(postId, post, analysis = {}) {
       countdown.textContent = line;
     }
 
-    const retryPlan = normalized?.providerRetryPlan || {};
-    const status = String(retryPlan.status || "").toLowerCase();
-    if (analysis?.scanFinalized === true || ["completed", "finalized", "exhausted"].includes(status)) {
-      clearPendingCountdownTimer(postId);
-      return;
-    }
-
     pendingCountdownTimerByPostId.set(postId, window.setTimeout(tick, 1000));
   };
 
   tick();
+}
+
+function clearPanelHardTimeout(postId) {
+  const timer = panelHardTimeoutByPostId.get(postId);
+  if (timer) {
+    window.clearTimeout(timer);
+  }
+
+  panelHardTimeoutByPostId.delete(postId);
+}
+
+function schedulePanelHardTimeout(post, postId, viewModel = {}) {
+  if (!postId || !(post instanceof Element)) {
+    return;
+  }
+
+  clearPanelHardTimeout(postId);
+
+  const state = String(viewModel.state || viewModel.analysis?.state || "").toLowerCase();
+  const label = String(viewModel.label || viewModel.analysis?.classification || "").toLowerCase();
+  const isAnalyzingPanel = Boolean(
+    state === "analyzing" ||
+    label === "analyzing" ||
+    label === "restarting scan"
+  );
+  const isPendingProviderPanel = Boolean(
+    state === "pending-provider" ||
+    label === "scan pending" ||
+    viewModel.analysis?.providerPending === true
+  );
+
+  if (!isAnalyzingPanel && !isPendingProviderPanel) {
+    return;
+  }
+
+  const limitMs = isPendingProviderPanel
+    ? PENDING_PROVIDER_PANEL_HARD_LIMIT_MS
+    : ANALYZING_PANEL_HARD_LIMIT_MS;
+
+  panelHardTimeoutByPostId.set(postId, window.setTimeout(() => {
+    const currentPost = getTopLevelPanelOwner(post);
+
+    panelHardTimeoutByPostId.delete(postId);
+
+    if (!(currentPost instanceof Element) || !currentPost.isConnected) {
+      clearAnalyzingLifecycleState(postId);
+      return;
+    }
+
+    const currentPanel = cachedPanelByPostId.get(postId) || viewModel;
+    const currentState = String(currentPanel.state || currentPanel.analysis?.state || "").toLowerCase();
+    const currentLabel = String(currentPanel.label || currentPanel.analysis?.classification || "").toLowerCase();
+    const stillTemporary = Boolean(
+      currentState === "analyzing" ||
+      currentState === "pending-provider" ||
+      currentLabel === "analyzing" ||
+      currentLabel === "scan pending" ||
+      currentLabel === "restarting scan"
+    );
+
+    if (!stillTemporary) {
+      return;
+    }
+
+    console.debug("[DILI][terminal-state] Temporary panel exceeded hard limit; converting to Verification Incomplete.", {
+      postId,
+      state: currentState,
+      label: currentLabel,
+      limitMs
+    });
+
+    scanStatus.lastAnalysisPipelineState = {
+      stage: "temporary-panel-hard-timeout",
+      postId,
+      previousState: currentState,
+      previousLabel: currentLabel,
+      timestamp: Date.now()
+    };
+
+    clearAnalyzingLifecycleState(postId);
+    clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+    clearPendingCountdownTimer(postId);
+    cachedPanelByPostId.delete(postId);
+    recentlyRenderedPanelByPostId.delete(postId);
+
+    renderBadge(currentPost, buildVerificationIncompleteViewModel({
+      summaryLine: "DILI could not complete this scan within the allowed time. You may restart the scan.",
+      reason: isPendingProviderPanel
+        ? "Provider verification exceeded the maximum waiting time."
+        : "Analyzing exceeded the maximum waiting time.",
+      technicalDetail: `Temporary panel hard limit reached after ${Math.round(limitMs / 1000)} seconds.`,
+      analysis: currentPanel.analysis || null
+    }));
+  }, limitMs));
 }
 
 function markPendingProviderRefreshStatus(post, status, extra = {}) {
@@ -5715,7 +5960,19 @@ async function refreshPendingVirusTotalPanel(entry = {}) {
 
   clearPendingVirusTotalPanelRefresh(postId);
 
-  if (!response?.analysis || response.refreshed === false) {
+  if (response?.analysis && response.refreshed === false) {
+    const finalizedViewModel = mapAnalysisToViewModel(response.analysis);
+    cachedPanelByPostId.set(postId, finalizedViewModel);
+    renderBadge(post, {
+      ...finalizedViewModel,
+      suppressPendingRefreshSchedule: true
+    });
+    clearPendingVirusTotalPanelRefresh(postId, { clearAttempts: true });
+    clearPendingCountdownTimer(postId);
+    return;
+  }
+
+  if (!response?.analysis) {
     await handlePendingProviderRefreshFailure(
       post,
       entry,
@@ -6582,19 +6839,6 @@ detailsSummary: buildInlineDetailsSummary(
   function normalizeDisplayState(analysis = {}) {
     const score = toFiniteUiScoreOrNull(analysis.safetyScore);
     const providerWarningReviewRecommended = isProviderWarningReviewRecommendedAnalysis(analysis);
-    if (isAnalysisPendingForUi(analysis)) {
-      return {
-        classification: "Scan Pending",
-        label: "Scan Pending",
-        safetyScore: null,
-        scanFinalized: false,
-        state: "pending-provider",
-        severityLevel: "pending",
-        pending: true,
-        terminalIncomplete: false
-      };
-    }
-
     const state = String(analysis.state || "").toLowerCase();
     const terminalIncomplete = Boolean(
       state === "verification-incomplete" ||
@@ -6608,14 +6852,27 @@ detailsSummary: buildInlineDetailsSummary(
 
     if (terminalIncomplete) {
       return {
-        classification: "Unverified",
+        classification: "Verification Incomplete",
         label: "Verification Incomplete",
         safetyScore: null,
         scanFinalized: true,
-        state: state || "verification-incomplete",
+        state: "verification-incomplete",
         severityLevel: "unverified",
         pending: false,
         terminalIncomplete: true
+      };
+    }
+
+    if (isAnalysisPendingForUi(analysis)) {
+      return {
+        classification: "Scan Pending",
+        label: "Scan Pending",
+        safetyScore: null,
+        scanFinalized: false,
+        state: "pending-provider",
+        severityLevel: "pending",
+        pending: true,
+        terminalIncomplete: false
       };
     }
 
@@ -6793,10 +7050,12 @@ detailsSummary: buildInlineDetailsSummary(
     if (terminalIncomplete) {
       return {
         ...analysis,
-        classification: "Unverified",
+        classification: "Verification Incomplete",
         safetyScore: null,
         scanFinalized: true,
-        state: analysis.state || "verification-incomplete",
+        state: "verification-incomplete",
+        providerPending: false,
+        restartable: true,
         providerCompletion: {
           ...(analysis.providerCompletion || {}),
           hasPendingProvider: false,
@@ -8439,13 +8698,24 @@ function buildTechnicalDetails(analysis = {}) {
   }
 
   function isTerminalIncompleteDisplayState(viewModel = {}) {
-    const stateText = String(viewModel.state || "").toLowerCase();
-    const labelText = String(viewModel.label || viewModel.classification || "").toLowerCase();
-    const summaryText = String(viewModel.summaryLine || viewModel.resultLine || "").toLowerCase();
+    const analysis = viewModel.analysis && typeof viewModel.analysis === "object"
+      ? viewModel.analysis
+      : viewModel;
+    const stateText = String(viewModel.state || analysis.state || "").toLowerCase();
+    const labelText = String(viewModel.label || analysis.label || viewModel.classification || analysis.classification || "").toLowerCase();
+    const summaryText = String(viewModel.summaryLine || analysis.summaryLine || viewModel.resultLine || analysis.resultLine || "").toLowerCase();
+    const retryStatus = String(analysis.providerRetryPlan?.status || "").toLowerCase();
+    const scoreMissing = toFiniteUiScoreOrNull(viewModel.safetyScore ?? analysis.safetyScore) === null;
 
     return (
       stateText === "verification-incomplete" ||
       stateText === "completed-limited" ||
+      (viewModel.restartAvailable === true && scoreMissing) ||
+      analysis.restartable === true ||
+      analysis.scoreAudit?.verificationIncomplete === true ||
+      analysis.scoreAudit?.retryBudgetExhausted === true ||
+      retryStatus === "exhausted" ||
+      retryStatus === "failed" ||
       labelText.includes("verification incomplete") ||
       labelText.includes("retry budget exhausted") ||
       summaryText.includes("retry limit") ||
