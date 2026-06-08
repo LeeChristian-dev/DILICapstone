@@ -550,6 +550,11 @@ function convertRecordsToCsv(records) {
     "heuristicRawTotal",
     "heuristicScaledDeduction",
     "totalDeduction",
+    "panel_rendering_ms",
+    "endpoint_resolution_ms",
+    "redirect_analysis_ms",
+    "provider_verification_ms",
+    "full_analysis_cycle_ms",
     "redirectCount",
     "usedShortener",
     "suspiciousTld",
@@ -572,6 +577,7 @@ function convertRecordsToCsv(records) {
     const urlhaus = findProviderResult(record.providerResults, "urlhaus");
     const vt = findProviderResult(record.providerResults, "virustotal");
     const features = record.features || {};
+    const performanceTiming = record.performanceTiming || {};
     const scoreAudit = record.scoreAudit || {};
     const providerDeductions = record.providerDeductions || scoreAudit.providerDeductions || {};
     const analyzedLinkCount =
@@ -617,6 +623,11 @@ function convertRecordsToCsv(records) {
       record.heuristicRawTotal ?? scoreAudit.heuristicRawTotal ?? "",
       record.heuristicScaledDeduction ?? scoreAudit.heuristicScaledDeduction ?? "",
       record.totalDeduction ?? scoreAudit.ruleDeductionTotal ?? "",
+      csvTimingValue(performanceTiming.panelRenderingMs),
+      csvTimingValue(performanceTiming.endpointResolutionMs),
+      csvTimingValue(performanceTiming.redirectAnalysisMs),
+      csvTimingValue(performanceTiming.providerVerificationMs),
+      csvTimingValue(performanceTiming.fullAnalysisCycleMs),
       features.redirectCount ?? "",
       features.shortenedUrl ?? "",
       features.suspiciousTld ?? "",
@@ -638,6 +649,11 @@ function convertRecordsToCsv(records) {
   return [headers, ...rows]
     .map((row) => row.map(csvEscape).join(","))
     .join("\n");
+}
+
+function csvTimingValue(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.round(numeric) : "";
 }
 
 function inferInterceptionRecommended(record = {}) {

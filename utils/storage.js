@@ -124,9 +124,14 @@ export async function appendAnalysisRecord(record) {
     .find((item) => isDuplicateAnalysisRecord(item, compactRecord));
 
   if (duplicate) {
+    const previousSeenCount = Number(duplicate.seenCount || 1);
+    Object.assign(duplicate, {
+      ...compactRecord,
+      firstSeenAt: duplicate.firstSeenAt || compactRecord.firstSeenAt || compactRecord.timestamp || Date.now()
+    });
     duplicate.lastChecked = compactRecord.lastChecked || compactRecord.timestamp || Date.now();
     duplicate.timestamp = duplicate.timestamp || compactRecord.timestamp || Date.now();
-    duplicate.seenCount = Number(duplicate.seenCount || 1) + 1;
+    duplicate.seenCount = previousSeenCount + 1;
   } else {
     logs.push({
       seenCount: 1,
@@ -353,6 +358,7 @@ function compactPersistentRecord(record = {}) {
     linkInsertedAfterBaseline: record.linkInsertedAfterBaseline === true,
     postIntegrityEvent: clampText(record.postIntegrityEvent || ""),
     detectedAt: Number(record.detectedAt || 0),
+    performanceTiming: compactPerformanceTiming(record.performanceTiming),
     seenCount: Number(record.seenCount || 1),
     firstSeenAt: Number(record.firstSeenAt || record.timestamp || Date.now()),
     lastChecked: Number(record.lastChecked || record.timestamp || Date.now()),
@@ -436,7 +442,42 @@ function compactLinkAnalysisSnapshot(item = {}, fallbackIndex = 1) {
     providerRetryPlan: compactProviderRetryPlan(item.providerRetryPlan),
     pendingProviders: clampList(item.pendingProviders || [], 8),
     verificationState: clampText(item.verificationState || "", 80),
+    performanceTiming: compactPerformanceTiming(item.performanceTiming),
     limitations: clampList(item.limitations || [], 8)
+  };
+}
+
+function compactPerformanceTiming(timing = {}) {
+  if (!timing || typeof timing !== "object") {
+    return null;
+  }
+
+  const normalizeTimestamp = (value) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : null;
+  };
+  const normalizeDuration = (value) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric >= 0 ? Math.round(numeric) : null;
+  };
+
+  return {
+    detectedAt: normalizeTimestamp(timing.detectedAt),
+    analysisStartedAt: normalizeTimestamp(timing.analysisStartedAt),
+    endpointResolutionStartedAt: normalizeTimestamp(timing.endpointResolutionStartedAt),
+    endpointResolutionCompletedAt: normalizeTimestamp(timing.endpointResolutionCompletedAt),
+    redirectAnalysisStartedAt: normalizeTimestamp(timing.redirectAnalysisStartedAt),
+    redirectAnalysisCompletedAt: normalizeTimestamp(timing.redirectAnalysisCompletedAt),
+    providerVerificationStartedAt: normalizeTimestamp(timing.providerVerificationStartedAt),
+    providerVerificationCompletedAt: normalizeTimestamp(timing.providerVerificationCompletedAt),
+    panelRenderStartedAt: normalizeTimestamp(timing.panelRenderStartedAt),
+    panelRenderedAt: normalizeTimestamp(timing.panelRenderedAt),
+    analysisCompletedAt: normalizeTimestamp(timing.analysisCompletedAt),
+    panelRenderingMs: normalizeDuration(timing.panelRenderingMs),
+    endpointResolutionMs: normalizeDuration(timing.endpointResolutionMs),
+    redirectAnalysisMs: normalizeDuration(timing.redirectAnalysisMs),
+    providerVerificationMs: normalizeDuration(timing.providerVerificationMs),
+    fullAnalysisCycleMs: normalizeDuration(timing.fullAnalysisCycleMs)
   };
 }
 

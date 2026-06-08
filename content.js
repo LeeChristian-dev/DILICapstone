@@ -16,6 +16,7 @@
     REFRESH_VIRUSTOTAL_RESULT: "DILI_REFRESH_VIRUSTOTAL_RESULT",
     FINALIZE_PENDING_PROVIDER_STATE: "DILI_FINALIZE_PENDING_PROVIDER_STATE",
     CLEAR_POST_ANALYSIS_STATE: "DILI_CLEAR_POST_ANALYSIS_STATE",
+    UPDATE_PERFORMANCE_TIMING: "DILI_UPDATE_PERFORMANCE_TIMING",
     GET_POST_STATE: "DILI_GET_POST_STATE",
     SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
     GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
@@ -155,8 +156,15 @@ const DILI_UI_SELECTOR =
 const OUTBOUND_CLICK_TARGET_SELECTOR =
   'a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]';
 
-const UNSAFE_PANEL_ANCESTOR_SELECTOR =
+  const UNSAFE_PANEL_ANCESTOR_SELECTOR =
   'a[href], [data-lynx-uri], [data-url], [role="link"], [role="button"]';
+  const NO_LINK_BASELINE_STATES = new Set([
+    "no_link",
+    "observed_no_link_unstable",
+    "observed_no_link",
+    "provisional_no_link",
+    "truncated_unexpanded"
+  ]);
   const pendingPosts = new Set();
   const postIdCache = new WeakMap();
   let postSignatureCache = new WeakMap();
@@ -166,6 +174,7 @@ const UNSAFE_PANEL_ANCESTOR_SELECTOR =
   const analysisInFlightByPostId = new Map();
   const cachedPanelByPostId = new Map();
   const noLinkRescanCountsByPostId = new Map();
+  const postDetectedAtByPostId = new Map();
   const recentlyRenderedPanelByPostId = new Map();
   const completedAnalysisSessionCache = new Map();
   const pendingVirusTotalRefreshByPostId = new Map();
@@ -1942,7 +1951,11 @@ return candidates;
       return;
     }
 
-    pendingPosts.add(owningPost);
+  pendingPosts.add(owningPost);
+    const postId = getStablePostId(owningPost);
+    if (postId && !postDetectedAtByPostId.has(postId)) {
+      postDetectedAtByPostId.set(postId, Date.now());
+    }
     scanStatus.queuedPosts = pendingPosts.size;
   }
 
@@ -2133,11 +2146,22 @@ async function processPost(post) {
 
   const baseline = currentState?.baseline || null;
 
+  const priorNoLinkBaselineDetected = hasExplicitNoLinkBaselineMarker(baseline);
   const hasPriorBaseline = Boolean(
     baseline?.urlHash ||
-    baseline?.baselineState === "no_link" ||
+    priorNoLinkBaselineDetected ||
     baseline?.hadLinkAtBaseline === false
   );
+  const baselineContext = buildBaselineContextForReanalysis(baseline, postIdentity);
+
+  if (priorNoLinkBaselineDetected) {
+    console.debug("[DILI][post-integrity] Prior no-link baseline detected for reanalysis.", {
+      postId,
+      baselineState: baselineContext.previousBaselineState,
+      baselineConfidence: baselineContext.baselineConfidence,
+      postIdentityStable: postIdentity.stable
+    });
+  }
   const linkFingerprint = linkInfo.linkFingerprint;
   const manualRestartRequested = manualRestartPostIds.has(postId);
 
@@ -2221,6 +2245,8 @@ async function processPost(post) {
   startAnalyzingTimeout(postId, owningPost, requestId);
 
   const backgroundStartedAt = nowMs();
+  const detectedAt = Number(postDetectedAtByPostId.get(postId) || Date.now());
+  const analysisStartedAt = Date.now();
 
   let response = null;
   try {
@@ -2235,8 +2261,14 @@ async function processPost(post) {
         normalizedVisiblePostText: postTextSnapshot.normalizedVisiblePostText,
         candidateContext: {
           ...linkInfo.candidateContext,
-          postIdentityStable: postIdentity.stable
+          postIdentityStable: postIdentity.stable,
+          identitySource: postIdentity.reason || ""
         },
+        performanceTiming: {
+          detectedAt,
+          analysisStartedAt
+        },
+        ...baselineContext,
         requestId,
         postSignature: signature,
         linkFingerprint
@@ -2389,8 +2421,23 @@ async function processPost(post) {
   };
 
   const renderStartedAt = nowMs();
+  const panelRenderStartedAt = Date.now();
 
-  renderBadge(owningPost, mapAnalysisToViewModel(response.analysis));
+  const analysisWithRenderStart = {
+    ...response.analysis,
+    performanceTiming: mergeContentPerformanceTiming(response.analysis?.performanceTiming, {
+      detectedAt,
+      analysisStartedAt,
+      panelRenderStartedAt
+    })
+  };
+
+  renderBadge(owningPost, mapAnalysisToViewModel(analysisWithRenderStart));
+  const panelRenderedAt = Date.now();
+  const renderedPerformanceTiming = mergeContentPerformanceTiming(analysisWithRenderStart.performanceTiming, {
+    panelRenderedAt
+  });
+  notifyPerformanceTimingRendered(postId, renderedPerformanceTiming);
   rememberAnalysisForLinkInfo(postId, linkInfo, response.analysis);
   analysisInFlightByPostId.delete(postId);
   manualRestartPostIds.delete(postId);
@@ -4921,6 +4968,7 @@ function clearAllPanelHardTimeouts() {
     closeWarningModal({ restoreFocus: false });
     removeOwnedWarningOverlays();
     cachedPanelByPostId.clear();
+    postDetectedAtByPostId.clear();
     recentlyRenderedPanelByPostId.clear();
     analysisInFlightByPostId.clear();
     manualRestartPostIds.clear();
@@ -4942,6 +4990,7 @@ analysisInFlightByPostId.clear();
 manualRestartPostIds.clear();
 restartInFlightByPostId.clear();
 recentlyRenderedPanelByPostId.clear();
+postDetectedAtByPostId.clear();
 clearAllPendingVirusTotalPanelRefreshes();
 clearAllAnalyzingTimeouts();
 clearAllPanelHardTimeouts();
@@ -5441,6 +5490,152 @@ async function restartScanForPost(post, reason = "manual-post-restart") {
     manualRestartPostIds.delete(postId);
     restartInFlightByPostId.delete(postId);
   }
+}
+
+function hasExplicitNoLinkBaselineMarker(baseline = null) {
+  if (!baseline || typeof baseline !== "object") {
+    return false;
+  }
+
+  const baselineState = String(baseline.baselineState || "").toLowerCase();
+  const features = baseline.features && typeof baseline.features === "object" ? baseline.features : {};
+
+  return Boolean(
+    NO_LINK_BASELINE_STATES.has(baselineState) ||
+    baseline.hadLinkAtBaseline === false ||
+    features.noLinkBaseline === true ||
+    features.baselineHadNoLink === true ||
+    features.confirmedNoLinkBaseline === true ||
+    features.provisionalNoLinkBaseline === true
+  );
+}
+
+function getBaselineConfidence(baseline = null) {
+  if (!baseline || typeof baseline !== "object") {
+    return "unknown";
+  }
+
+  const explicit = String(baseline.baselineConfidence || baseline.postIntegrityConfidence || "").toLowerCase();
+  if (["stable", "unstable", "provisional", "unknown"].includes(explicit)) {
+    return explicit;
+  }
+
+  const baselineState = String(baseline.baselineState || "").toLowerCase();
+  if (baselineState === "no_link" && baseline.postIdentityStable === true) {
+    return "stable";
+  }
+
+  if (baselineState === "observed_no_link_unstable") {
+    return "unstable";
+  }
+
+  if (baselineState === "observed_no_link" || baselineState === "provisional_no_link" || baselineState === "truncated_unexpanded") {
+    return "provisional";
+  }
+
+  return baseline.postIdentityStable === true ? "stable" : "unknown";
+}
+
+function buildBaselineContextForReanalysis(baseline = null, postIdentity = {}) {
+  const safeBaseline = baseline && typeof baseline === "object" ? baseline : {};
+  const baselineCandidateContext = safeBaseline.candidateContext && typeof safeBaseline.candidateContext === "object"
+    ? safeBaseline.candidateContext
+    : {};
+
+  return {
+    previousBaselineState: safeBaseline.baselineState || "",
+    hadLinkAtBaseline: safeBaseline.hadLinkAtBaseline === undefined ? null : safeBaseline.hadLinkAtBaseline,
+    previousUrlHash: safeBaseline.urlHash || "",
+    previousNormalizedUrl:
+      safeBaseline.normalizedUrl ||
+      safeBaseline.analysisUrl ||
+      baselineCandidateContext.selectedNormalizedTarget ||
+      "",
+    previousProviderCheckedUrl: safeBaseline.providerCheckedUrl || safeBaseline.urlFeatureAnalysis?.providerCheckedUrl || "",
+    previousLinkFingerprint: safeBaseline.linkFingerprint || baselineCandidateContext.linkFingerprint || "",
+    baselinePostTextHash: safeBaseline.postTextHash || safeBaseline.currentPostTextHash || "",
+    baselinePostSignature: safeBaseline.postSignature || baselineCandidateContext.signature || "",
+    baselineCreatedAt: safeBaseline.baselineFirstSeenAt || safeBaseline.firstSeenAt || safeBaseline.detectedAt || "",
+    baselineConfidence: getBaselineConfidence(safeBaseline),
+    postIdentityStable: postIdentity?.stable === true,
+    identitySource: postIdentity?.reason || ""
+  };
+}
+
+function toTimingTimestamp(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : null;
+}
+
+function timingDuration(start, end) {
+  const startedAt = toTimingTimestamp(start);
+  const completedAt = toTimingTimestamp(end);
+
+  if (startedAt === null || completedAt === null || completedAt < startedAt) {
+    return null;
+  }
+
+  return completedAt - startedAt;
+}
+
+function mergeContentPerformanceTiming(...timings) {
+  const merged = {};
+
+  for (const timing of timings) {
+    if (!timing || typeof timing !== "object") {
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(timing)) {
+      if (value !== null && value !== undefined && value !== "") {
+        merged[key] = value;
+      }
+    }
+  }
+
+  const normalized = {
+    detectedAt: toTimingTimestamp(merged.detectedAt),
+    analysisStartedAt: toTimingTimestamp(merged.analysisStartedAt),
+    endpointResolutionStartedAt: toTimingTimestamp(merged.endpointResolutionStartedAt),
+    endpointResolutionCompletedAt: toTimingTimestamp(merged.endpointResolutionCompletedAt),
+    redirectAnalysisStartedAt: toTimingTimestamp(merged.redirectAnalysisStartedAt),
+    redirectAnalysisCompletedAt: toTimingTimestamp(merged.redirectAnalysisCompletedAt),
+    providerVerificationStartedAt: toTimingTimestamp(merged.providerVerificationStartedAt),
+    providerVerificationCompletedAt: toTimingTimestamp(merged.providerVerificationCompletedAt),
+    panelRenderStartedAt: toTimingTimestamp(merged.panelRenderStartedAt),
+    panelRenderedAt: toTimingTimestamp(merged.panelRenderedAt),
+    analysisCompletedAt: toTimingTimestamp(merged.analysisCompletedAt)
+  };
+
+  normalized.panelRenderingMs = timingDuration(normalized.panelRenderStartedAt, normalized.panelRenderedAt);
+  normalized.endpointResolutionMs = timingDuration(normalized.endpointResolutionStartedAt, normalized.endpointResolutionCompletedAt);
+  normalized.redirectAnalysisMs = timingDuration(normalized.redirectAnalysisStartedAt, normalized.redirectAnalysisCompletedAt);
+  normalized.providerVerificationMs = timingDuration(normalized.providerVerificationStartedAt, normalized.providerVerificationCompletedAt);
+  normalized.fullAnalysisCycleMs = timingDuration(
+    normalized.detectedAt || normalized.analysisStartedAt,
+    normalized.panelRenderedAt || normalized.analysisCompletedAt
+  );
+
+  return normalized;
+}
+
+function notifyPerformanceTimingRendered(postId, performanceTiming) {
+  if (!postId || scanRuntimeState.extensionContextInvalidated) {
+    return;
+  }
+
+  sendRuntimeMessage({
+    type: MESSAGE_TYPES.UPDATE_PERFORMANCE_TIMING,
+    postId,
+    performanceTiming
+  }).catch((error) => {
+    if (isRuntimeInvalidationError(error)) {
+      invalidateRuntimeContext(error);
+      return;
+    }
+
+    console.debug("[DILI] Performance timing update failed", error);
+  });
 }
 
 function schedulePendingVirusTotalPanelRefresh(post, viewModel = {}) {

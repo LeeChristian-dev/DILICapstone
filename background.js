@@ -33,6 +33,7 @@ const MESSAGE_TYPES = {
   REFRESH_VIRUSTOTAL_RESULT: "DILI_REFRESH_VIRUSTOTAL_RESULT",
   FINALIZE_PENDING_PROVIDER_STATE: "DILI_FINALIZE_PENDING_PROVIDER_STATE",
   CLEAR_POST_ANALYSIS_STATE: "DILI_CLEAR_POST_ANALYSIS_STATE",
+  UPDATE_PERFORMANCE_TIMING: "DILI_UPDATE_PERFORMANCE_TIMING",
   GET_POST_STATE: "DILI_GET_POST_STATE",
   SET_NO_LINK_STATE: "DILI_SET_NO_LINK_STATE",
   GET_SCAN_STATE: "DILI_GET_SCAN_STATE",
@@ -67,6 +68,13 @@ const SESSION_TTL_MS = 30 * 60 * 1000;
 const POST_INTEGRITY_MIN_BASELINE_AGE_MS = 15 * 1000;
 const POST_INTEGRITY_MIN_NO_LINK_BASELINE_AGE_MS = 60 * 1000;
 const POST_INTEGRITY_PROVISIONAL_BASELINE_AGE_MS = 60 * 1000;
+const POST_INTEGRITY_NO_LINK_BASELINE_STATES = new Set([
+  "no_link",
+  "observed_no_link_unstable",
+  "observed_no_link",
+  "provisional_no_link",
+  "truncated_unexpanded"
+]);
 const URL_ANALYSIS_CACHE_TTL_MS = 10 * 60 * 1000;
 const PROVIDER_RESULT_CACHE_TTL_MS = 10 * 60 * 1000;
 const PROVIDER_ERROR_CACHE_TTL_MS = 60 * 1000;
@@ -131,6 +139,10 @@ async function handleMessage(message) {
           candidateContext: message.candidateContext,
           postTextHash: message.postTextHash,
           normalizedVisiblePostText: message.normalizedVisiblePostText,
+          postSignature: message.postSignature,
+          linkFingerprint: message.linkFingerprint,
+          performanceTiming: message.performanceTiming,
+          baselineContext: buildBaselineContextFromMessage(message),
           isReanalysis: false
         })
       };
@@ -146,9 +158,16 @@ async function handleMessage(message) {
           candidateContext: message.candidateContext,
           postTextHash: message.postTextHash,
           normalizedVisiblePostText: message.normalizedVisiblePostText,
+          postSignature: message.postSignature,
+          linkFingerprint: message.linkFingerprint,
+          performanceTiming: message.performanceTiming,
+          baselineContext: buildBaselineContextFromMessage(message),
           isReanalysis: true
         })
       };
+
+    case MESSAGE_TYPES.UPDATE_PERFORMANCE_TIMING:
+      return updatePerformanceTimingForPost(message);
 
     case MESSAGE_TYPES.REFRESH_VIRUSTOTAL_RESULT:
       return refreshVirusTotalResultForPost(message);
@@ -292,6 +311,162 @@ async function setNoLinkState(message) {
     normalizedVisiblePostText,
     postId: message.postId
   });
+}
+
+function buildBaselineContextFromMessage(message = {}) {
+  return {
+    previousBaselineState: String(message.previousBaselineState || "").trim(),
+    hadLinkAtBaseline: message.hadLinkAtBaseline === undefined ? null : message.hadLinkAtBaseline,
+    previousUrlHash: String(message.previousUrlHash || "").trim(),
+    previousNormalizedUrl: String(message.previousNormalizedUrl || "").trim(),
+    previousProviderCheckedUrl: String(message.previousProviderCheckedUrl || "").trim(),
+    previousLinkFingerprint: String(message.previousLinkFingerprint || "").trim(),
+    baselinePostTextHash: String(message.baselinePostTextHash || "").trim(),
+    baselinePostSignature: String(message.baselinePostSignature || "").trim(),
+    baselineCreatedAt: Number(message.baselineCreatedAt || 0) || null,
+    baselineConfidence: normalizeBaselineConfidence(message.baselineConfidence),
+    postIdentityStable: message.postIdentityStable === true,
+    identitySource: String(message.identitySource || message.candidateContext?.identitySource || "").trim()
+  };
+}
+
+function normalizeBaselineConfidence(value) {
+  const normalized = String(value || "").toLowerCase().trim();
+  return ["stable", "unstable", "provisional", "unknown"].includes(normalized)
+    ? normalized
+    : "unknown";
+}
+
+function mergeBaselineContext(existingBaseline = null, baselineContext = {}) {
+  const baseline = existingBaseline && typeof existingBaseline === "object" ? existingBaseline : {};
+  const context = baselineContext && typeof baselineContext === "object" ? baselineContext : {};
+  const candidateContext = baseline.candidateContext && typeof baseline.candidateContext === "object"
+    ? baseline.candidateContext
+    : {};
+
+  return {
+    ...baseline,
+    baselineState: baseline.baselineState || context.previousBaselineState || "",
+    hadLinkAtBaseline: baseline.hadLinkAtBaseline === undefined || baseline.hadLinkAtBaseline === null
+      ? context.hadLinkAtBaseline
+      : baseline.hadLinkAtBaseline,
+    urlHash: baseline.urlHash || context.previousUrlHash || "",
+    normalizedUrl: baseline.normalizedUrl || context.previousNormalizedUrl || "",
+    analysisUrl: baseline.analysisUrl || context.previousNormalizedUrl || "",
+    providerCheckedUrl: baseline.providerCheckedUrl || context.previousProviderCheckedUrl || "",
+    linkFingerprint: baseline.linkFingerprint || context.previousLinkFingerprint || "",
+    postTextHash: baseline.postTextHash || context.baselinePostTextHash || "",
+    postSignature: baseline.postSignature || context.baselinePostSignature || candidateContext.signature || "",
+    baselineFirstSeenAt: baseline.baselineFirstSeenAt || baseline.firstSeenAt || context.baselineCreatedAt || 0,
+    firstSeenAt: baseline.firstSeenAt || baseline.baselineFirstSeenAt || context.baselineCreatedAt || 0,
+    baselineConfidence: normalizeBaselineConfidence(baseline.baselineConfidence || context.baselineConfidence),
+    identitySource: baseline.identitySource || context.identitySource || "",
+    postIdentityStable: baseline.postIdentityStable === true || context.baselineConfidence === "stable"
+  };
+}
+
+function toTimingTimestamp(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : null;
+}
+
+function durationBetween(start, end) {
+  const startedAt = toTimingTimestamp(start);
+  const completedAt = toTimingTimestamp(end);
+
+  if (startedAt === null || completedAt === null || completedAt < startedAt) {
+    return null;
+  }
+
+  return completedAt - startedAt;
+}
+
+function normalizePerformanceTiming(timing = {}) {
+  const safeTiming = timing && typeof timing === "object" ? timing : {};
+  const normalized = {
+    detectedAt: toTimingTimestamp(safeTiming.detectedAt),
+    analysisStartedAt: toTimingTimestamp(safeTiming.analysisStartedAt),
+    endpointResolutionStartedAt: toTimingTimestamp(safeTiming.endpointResolutionStartedAt),
+    endpointResolutionCompletedAt: toTimingTimestamp(safeTiming.endpointResolutionCompletedAt),
+    redirectAnalysisStartedAt: toTimingTimestamp(safeTiming.redirectAnalysisStartedAt),
+    redirectAnalysisCompletedAt: toTimingTimestamp(safeTiming.redirectAnalysisCompletedAt),
+    providerVerificationStartedAt: toTimingTimestamp(safeTiming.providerVerificationStartedAt),
+    providerVerificationCompletedAt: toTimingTimestamp(safeTiming.providerVerificationCompletedAt),
+    panelRenderStartedAt: toTimingTimestamp(safeTiming.panelRenderStartedAt),
+    panelRenderedAt: toTimingTimestamp(safeTiming.panelRenderedAt),
+    analysisCompletedAt: toTimingTimestamp(safeTiming.analysisCompletedAt)
+  };
+
+  normalized.panelRenderingMs = durationBetween(normalized.panelRenderStartedAt, normalized.panelRenderedAt);
+  normalized.endpointResolutionMs = durationBetween(normalized.endpointResolutionStartedAt, normalized.endpointResolutionCompletedAt);
+  normalized.redirectAnalysisMs = durationBetween(normalized.redirectAnalysisStartedAt, normalized.redirectAnalysisCompletedAt);
+  normalized.providerVerificationMs = durationBetween(normalized.providerVerificationStartedAt, normalized.providerVerificationCompletedAt);
+  normalized.fullAnalysisCycleMs = durationBetween(
+    normalized.detectedAt || normalized.analysisStartedAt,
+    normalized.panelRenderedAt || normalized.analysisCompletedAt
+  );
+
+  return normalized;
+}
+
+function mergePerformanceTiming(...timings) {
+  const merged = {};
+
+  for (const timing of timings) {
+    if (!timing || typeof timing !== "object") {
+      continue;
+    }
+
+    const normalized = normalizePerformanceTiming(timing);
+    for (const [key, value] of Object.entries(normalized)) {
+      if (value !== null && value !== undefined && value !== "") {
+        merged[key] = value;
+      }
+    }
+  }
+
+  return normalizePerformanceTiming(merged);
+}
+
+async function updatePerformanceTimingForPost(message = {}) {
+  const postId = String(message.postId || "").trim();
+  if (!postId) {
+    return {
+      type: MESSAGE_TYPES.UPDATE_PERFORMANCE_TIMING,
+      updated: false,
+      reason: "missing-post-id"
+    };
+  }
+
+  const storedAnalysis = await getBaseline(postId);
+  if (!storedAnalysis) {
+    return {
+      type: MESSAGE_TYPES.UPDATE_PERFORMANCE_TIMING,
+      updated: false,
+      reason: "missing-stored-analysis"
+    };
+  }
+
+  const performanceTiming = mergePerformanceTiming(storedAnalysis.performanceTiming, message.performanceTiming);
+  const updatedAnalysis = {
+    ...storedAnalysis,
+    performanceTiming,
+    lastChecked: Date.now()
+  };
+
+  await updatePostAnalysis(postId, updatedAnalysis);
+  await appendAnalysisRecord({
+    ...updatedAnalysis,
+    timestamp: storedAnalysis.timestamp || updatedAnalysis.lastChecked,
+    postId,
+    performanceTiming
+  });
+
+  return {
+    type: MESSAGE_TYPES.UPDATE_PERFORMANCE_TIMING,
+    updated: true,
+    performanceTiming
+  };
 }
 function isAnalysisPendingLike(analysis = {}) {
   const classification = String(analysis.classification || "").toLowerCase();
@@ -988,7 +1163,7 @@ function buildTimedOutRedirectAnalysis(rawUrl = "", endpointResult = {}) {
 
 
 
-async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candidateContext, postTextHash, normalizedVisiblePostText, isReanalysis }) {
+async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candidateContext, postTextHash, normalizedVisiblePostText, postSignature, linkFingerprint, performanceTiming, baselineContext, isReanalysis }) {
   const linkInputs = Array.isArray(links) && links.length > 0
     ? links.slice(0, 8)
     : [{
@@ -1009,6 +1184,10 @@ async function performLinkAnalysis({ postId, rawUrl, links, displayedText, candi
         candidateContext: link.candidateContext || candidateContext,
         postTextHash,
         normalizedVisiblePostText,
+        postSignature,
+        linkFingerprint,
+        performanceTiming,
+        baselineContext,
         isReanalysis,
         persist: false
       });
@@ -1180,6 +1359,7 @@ function buildStoredLinkAnalysisSnapshot(analysis = {}, index = 0) {
     endpointResult: cloneValue(analysis.endpointResult || {}),
     redirectAnalysis: cloneValue(analysis.redirectAnalysis || {}),
     urlFeatureAnalysis: cloneValue(analysis.urlFeatureAnalysis || {}),
+    performanceTiming: cloneValue(analysis.performanceTiming || {}),
     scoreAudit: cloneValue(analysis.scoreAudit || {}),
     verificationState: analysis.verificationState || "",
     verificationOnlyUnknown: analysis.verificationOnlyUnknown === true,
@@ -1323,8 +1503,10 @@ function isPendingProviderRefreshTarget(candidate = {}) {
   );
 }
 
-async function performSingleLinkAnalysis({ postId, rawUrl, displayedText, candidateContext, postTextHash, normalizedVisiblePostText, isReanalysis, persist = true }) {
+async function performSingleLinkAnalysis({ postId, rawUrl, displayedText, candidateContext, postTextHash, normalizedVisiblePostText, postSignature, linkFingerprint, performanceTiming = {}, baselineContext = {}, isReanalysis, persist = true }) {
   const totalStartedAt = nowMs();
+  const backgroundAnalysisStartedAt = Date.now();
+  const incomingPerformanceTiming = normalizePerformanceTiming(performanceTiming);
 
   if (!(await getScanEnabledState())) {
     throw new Error("Scanning is currently disabled.");
@@ -1333,11 +1515,13 @@ async function performSingleLinkAnalysis({ postId, rawUrl, displayedText, candid
   await ensureActiveSession("analysis");
 
 const endpointStartedAt = nowMs();
+const endpointResolutionStartedAt = Date.now();
 const endpointResult = await withAnalysisTimeout(
   resolveEndpoint(rawUrl),
   10000,
   () => buildTimedOutEndpointResult(rawUrl)
 );
+const endpointResolutionCompletedAt = Date.now();
 const endpointMs = elapsedMs(endpointStartedAt);
 performanceStats.lastEndpointMs = endpointMs;
 recordMaxPerformanceStat("maxEndpointMs", endpointMs);
@@ -1366,6 +1550,12 @@ recordMaxPerformanceStat("maxEndpointMs", endpointMs);
         fullRedirectDomains: endpointResult.fullRedirectDomains || [],
         notes: endpointResult.warnings
       },
+      performanceTiming: mergePerformanceTiming(incomingPerformanceTiming, {
+        analysisStartedAt: incomingPerformanceTiming.analysisStartedAt || backgroundAnalysisStartedAt,
+        endpointResolutionStartedAt,
+        endpointResolutionCompletedAt,
+        analysisCompletedAt: Date.now()
+      }),
       state: "internal-facebook",
       analysisMode: "internal-facebook-ignored",
       reusedClassification: false
@@ -1377,12 +1567,13 @@ recordMaxPerformanceStat("maxEndpointMs", endpointMs);
   });
   const normalizedUrl = urlFeatures.normalizedUrl;
   const existingBaseline = await getBaseline(postId);
+  const integrityBaseline = mergeBaselineContext(existingBaseline, baselineContext);
   const previousBaselineUrl =
-    existingBaseline?.analysisUrl ||
-    existingBaseline?.normalizedUrl ||
-    existingBaseline?.rawUrl ||
+    integrityBaseline?.analysisUrl ||
+    integrityBaseline?.normalizedUrl ||
+    integrityBaseline?.rawUrl ||
     "";
-  const compatibleBaseline = getCompatibleBaseline(existingBaseline);
+  const compatibleBaseline = getCompatibleBaseline(integrityBaseline);
 
   if (existingBaseline && !compatibleBaseline) {
     logDebug(`Legacy baseline detected for ${postId}; integrity comparison skipped for this scan.`);
@@ -1426,8 +1617,8 @@ performanceStats.lastCacheHit = Boolean(reusableUrlAnalysis.cacheHit);
   const gsbResult = getNormalizedProviderResult(providerResults, "gsb");
   const urlhausResult = getNormalizedProviderResult(providerResults, "urlhaus");
   const virusTotalResult = getNormalizedProviderResult(providerResults, "virustotal");
-  const detectedAt = Date.now();
-  const baselineFirstSeenAt = Number(existingBaseline?.baselineFirstSeenAt || existingBaseline?.firstSeenAt || detectedAt);
+  const detectedAt = incomingPerformanceTiming.detectedAt || Date.now();
+  const baselineFirstSeenAt = Number(integrityBaseline?.baselineFirstSeenAt || integrityBaseline?.firstSeenAt || detectedAt);
 const currentPostTextHash = String(postTextHash || "");
 const normalizedCurrentPostText = String(normalizedVisiblePostText || "")
   .replace(/\s+/g, " ")
@@ -1435,10 +1626,10 @@ const normalizedCurrentPostText = String(normalizedVisiblePostText || "")
 
 const previousBaselineState =
   compatibleBaseline?.baselineState ||
-  existingBaseline?.baselineState ||
+  integrityBaseline?.baselineState ||
   "";
 
-  const previousPostTextHash = String(existingBaseline?.postTextHash || existingBaseline?.currentPostTextHash || "");
+  const previousPostTextHash = String(integrityBaseline?.postTextHash || integrityBaseline?.currentPostTextHash || "");
 const postTextChangedSinceBaseline = Boolean(
   isReanalysis &&
   previousPostTextHash &&
@@ -1453,8 +1644,8 @@ const currentHasUsableLinkCandidate = Boolean(
   normalizedUrl
 );
 const baselineFirstSeenTime = Number(
-  existingBaseline?.baselineFirstSeenAt ||
-  existingBaseline?.firstSeenAt ||
+  integrityBaseline?.baselineFirstSeenAt ||
+  integrityBaseline?.firstSeenAt ||
   0
 );
 const baselineAgeMs = baselineFirstSeenTime > 0
@@ -1464,30 +1655,23 @@ const stableIdentityMatch = Boolean(
   compatibleBaseline?.postIdentityStable === true &&
   normalizedCandidateContext.postIdentityStable === true
 );
+const baselineHadExplicitNoLink = hasNoLinkBaselineMarker(compatibleBaseline || integrityBaseline);
 const confirmedNoLinkBaseline = Boolean(
   previousBaselineState === "no_link" &&
-  existingBaseline?.hadLinkAtBaseline === false &&
+  (integrityBaseline?.hadLinkAtBaseline === false || baselineHadExplicitNoLink) &&
   compatibleBaseline?.postIdentityStable === true
 );
 const provisionalNoLinkBaseline = Boolean(
-  previousBaselineState === "observed_no_link_unstable" ||
-  previousBaselineState === "truncated_unexpanded" ||
-  compatibleBaseline?.postIdentityStable !== true
+  baselineHadExplicitNoLink &&
+  (
+    previousBaselineState !== "no_link" ||
+    compatibleBaseline?.postIdentityStable !== true
+  )
 );
 const matureConfirmedNoLinkBaseline = Boolean(
   confirmedNoLinkBaseline &&
   baselineAgeMs >= POST_INTEGRITY_MIN_NO_LINK_BASELINE_AGE_MS
 );
-const canUseNoLinkInjectionBaseline = Boolean(
-  isReanalysis &&
-  matureConfirmedNoLinkBaseline &&
-  stableIdentityMatch &&
-  currentHasUsableLinkCandidate &&
-  normalizedCandidateContext.candidateMode === "single" &&
-  postTextChangedSinceBaseline
-);
-
-  const linkInsertedAfterBaseline = Boolean(canUseNoLinkInjectionBaseline);
   const canUseExistingLinkIntegrityBaseline = Boolean(
     isReanalysis &&
     stableIdentityMatch &&
@@ -1499,28 +1683,65 @@ const canUseNoLinkInjectionBaseline = Boolean(
     normalizedCandidateContext.candidateIsDomainOnlyFallback !== true &&
     normalizedCandidateContext.candidateUrlCompleteness !== "domain-only-fallback"
   );
-  const existingLinkIntegrityMismatch = Boolean(
-    canUseExistingLinkIntegrityBaseline &&
-    !linkInsertedAfterBaseline &&
-    hasCompatibleIntegrityMismatch(compatibleBaseline, {
+  const destinationChange = getCompatibleIntegrityDestinationChange(compatibleBaseline, {
+    currentHash,
+    analysisUrl,
+    normalizedUrl,
+    candidateContext: normalizedCandidateContext
+  });
+  const postIntegrityDecision = classifyPostIntegrityEvent({
+    baseline: compatibleBaseline || integrityBaseline,
+    current: {
+      isReanalysis,
+      baselineAgeMs,
+      currentHasUsableLinkCandidate,
       currentHash,
       analysisUrl,
       normalizedUrl,
-      candidateContext: normalizedCandidateContext
-    })
+      postTextChangedSinceBaseline
+    },
+    identity: {
+      stableIdentityMatch,
+      currentPostIdentityStable: normalizedCandidateContext.postIdentityStable === true
+    },
+    candidate: {
+      candidateContext: normalizedCandidateContext,
+      canUseExistingLinkIntegrityBaseline,
+      destinationChange
+    }
+  });
+  logPostIntegrityDecision(postId, postIntegrityDecision);
+
+  const linkInsertedAfterBaseline = Boolean(
+    postIntegrityDecision.eventType === "link-inserted-after-stable-no-link" &&
+    postIntegrityDecision.deductionEligible
+  );
+  const existingLinkIntegrityMismatch = Boolean(
+    postIntegrityDecision.deductionEligible &&
+    (
+      postIntegrityDecision.eventType === "link-destination-changed" ||
+      postIntegrityDecision.eventType === "link-url-changed-same-domain"
+    )
   );
   const postContextFeatures = {
     domainPreviouslyFlagged,
     textMismatch: textComparison.mismatch,
     postTextChangedSinceBaseline,
-    baselineHadNoLink: confirmedNoLinkBaseline,
+    baselineHadNoLink: confirmedNoLinkBaseline || baselineHadExplicitNoLink,
     confirmedNoLinkBaseline,
     provisionalNoLinkBaseline,
     matureConfirmedNoLinkBaseline,
     baselineAgeMs,
     currentHasUsableLinkCandidate,
     linkInsertedAfterBaseline,
-    integrityHashMismatch: Boolean(linkInsertedAfterBaseline || existingLinkIntegrityMismatch)
+    integrityHashMismatch: Boolean(linkInsertedAfterBaseline || existingLinkIntegrityMismatch),
+    linkInsertedAfterUnstableBaseline: postIntegrityDecision.eventType === "link-inserted-after-unstable-no-link",
+    limitedPostIntegrityEvidence: postIntegrityDecision.confidence === "limited",
+    sameDomainLinkChanged: postIntegrityDecision.eventType === "link-url-changed-same-domain",
+    postIntegrityAuditOnly: postIntegrityDecision.auditOnly === true,
+    postIntegrityConfidence: postIntegrityDecision.confidence,
+    postIntegrityReason: postIntegrityDecision.reason,
+    trackingOnlyPostIntegrityChange: postIntegrityDecision.eventType === "none" && destinationChange.trackingOnly === true
   };
   const enrichedUrlFeatures = {
     ...reusableUrlAnalysis.urlFeatureAnalysis,
@@ -1763,6 +1984,13 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     providerResults
   });
   scoreAudit = applyVirusTotalWarningAuditFields(scoreAudit, virusTotalWarningState, virusTotalWarningPolicy, virusTotalReviewRecommendation);
+  scoreAudit.postIntegrityAudit = {
+    eventType: postIntegrityDecision.eventType,
+    confidence: postIntegrityDecision.confidence,
+    deductionEligible: postIntegrityDecision.deductionEligible,
+    auditOnly: postIntegrityDecision.auditOnly,
+    reason: postIntegrityDecision.reason
+  };
   scoreAudit.scanFinalized = scanFinalized;
   scoreAudit.displayedScoreWithheld = (!scanFinalized && !providerOverride) || terminalProviderLimitation;
   scoreAudit.computedSafetyScore = finalScore;
@@ -1803,6 +2031,18 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
       rawUrl ||
       ""
   };
+  const analysisCompletedAt = Date.now();
+  const analysisPerformanceTiming = mergePerformanceTiming(
+    incomingPerformanceTiming,
+    reusableUrlAnalysis.performanceTiming,
+    {
+      detectedAt,
+      analysisStartedAt: incomingPerformanceTiming.analysisStartedAt || backgroundAnalysisStartedAt,
+      endpointResolutionStartedAt,
+      endpointResolutionCompletedAt,
+      analysisCompletedAt
+    }
+  );
   const nextState = finalFeatures.integrityHashMismatch ? "changed" : "monitored";
   let record = {
     postId,
@@ -1811,6 +2051,8 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     analysisUrl,
     rawUrl,
     urlHash: currentHash,
+    postSignature: postSignature || normalizedCandidateContext.signature || "",
+    linkFingerprint: linkFingerprint || "",
     postTextHash: currentPostTextHash,
     normalizedVisiblePostText: normalizedCurrentPostText,
     previousBaselineUrl,
@@ -1824,10 +2066,15 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
     baselineAgeMs,
     baselineFirstSeenAt,
     detectedAt,
-    hadLinkAtBaseline: Boolean(existingBaseline?.hadLinkAtBaseline === true || existingBaseline?.baselineState === "link"),
+    performanceTiming: analysisPerformanceTiming,
+    hadLinkAtBaseline: Boolean(integrityBaseline?.hadLinkAtBaseline === true || integrityBaseline?.baselineState === "link"),
     linkInsertedAfterBaseline,
-    postIntegrityEvent: linkInsertedAfterBaseline ? "link_inserted_after_no_link_baseline" : "",
-    baselineState: compatibleBaseline?.baselineState || existingBaseline?.baselineState || "",
+    postIntegrityEvent: postIntegrityDecision.eventType !== "none" ? postIntegrityDecision.eventType : "",
+    postIntegrityConfidence: postIntegrityDecision.confidence,
+    postIntegrityAuditOnly: postIntegrityDecision.auditOnly === true,
+    postIntegrityDeductionEligible: postIntegrityDecision.deductionEligible === true,
+    postIntegrityReason: postIntegrityDecision.reason,
+    baselineState: compatibleBaseline?.baselineState || integrityBaseline?.baselineState || "",
     candidateMode: normalizedCandidateContext.candidateMode,
     dominantDomain: normalizedCandidateContext.dominantDomain,
     candidateDomainCount: normalizedCandidateContext.candidateDomainCount,
@@ -1869,7 +2116,11 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
       redirectAnalysis,
       urlFeatureAnalysis: finalUrlFeatureAnalysis,
       analysis: {
-        postIntegrityEvent: linkInsertedAfterBaseline ? "link_inserted_after_no_link_baseline" : "",
+        postIntegrityEvent: postIntegrityDecision.eventType !== "none" ? postIntegrityDecision.eventType : "",
+        postIntegrityConfidence: postIntegrityDecision.confidence,
+        postIntegrityAuditOnly: postIntegrityDecision.auditOnly === true,
+        postIntegrityDeductionEligible: postIntegrityDecision.deductionEligible === true,
+        postIntegrityReason: postIntegrityDecision.reason,
         linkInsertedAfterBaseline,
         postTextChangedSinceBaseline,
         baselineHadNoLink: confirmedNoLinkBaseline,
@@ -1917,7 +2168,9 @@ performanceStats.lastScoringMs = elapsedMs(scoringStartedAt);
   if (!record.postIdentityStable) {
     record.limitations = [
       ...(record.limitations || []),
-      "Post integrity comparison skipped because no stable Facebook post identity was available."
+      postIntegrityDecision.confidence === "limited"
+        ? "A prior no-link or different-link state was observed, but the post identity was not stable enough for a full post-integrity deduction."
+        : "Post integrity comparison skipped because no stable Facebook post identity was available."
     ].slice(0, 8);
   }
 
@@ -1976,6 +2229,7 @@ if (providerFlaggedDomain) {
       pendingProviders: record.pendingProviders,
       providerRetryPlan: record.providerRetryPlan,
       verificationState: record.verificationState,
+      performanceTiming: record.performanceTiming,
       verificationOnlyUnknown,
       concreteRiskSignals,
       interceptionRecommended: record.interceptionRecommended,
@@ -2108,36 +2362,22 @@ function getCompatibleBaseline(existingBaseline) {
 }
 
 function hasCompatibleIntegrityMismatch(existingBaseline, currentAnalysis) {
+  return getCompatibleIntegrityDestinationChange(existingBaseline, currentAnalysis).changed === true;
+}
+
+function getCompatibleIntegrityDestinationChange(existingBaseline, currentAnalysis) {
   if (!existingBaseline?.urlHash) {
-    return false;
+    return {
+      changed: false,
+      sameDomain: false,
+      trackingOnly: false,
+      reason: "No prior URL hash was available."
+    };
   }
 
   const baselineCandidateContext = buildCandidateContext(existingBaseline.candidateContext || existingBaseline, existingBaseline);
   const currentCandidateContext = buildCandidateContext(currentAnalysis.candidateContext, currentAnalysis);
-
-  if (!isStableSingleTargetCandidateMode(baselineCandidateContext) || !isStableSingleTargetCandidateMode(currentCandidateContext)) {
-    return hasMeaningfulCandidateDestinationChange(baselineCandidateContext, currentCandidateContext);
-  }
-
-  if (
-    baselineCandidateContext.selectedNormalizedTarget &&
-    currentCandidateContext.selectedNormalizedTarget &&
-    baselineCandidateContext.selectedNormalizedTarget === currentCandidateContext.selectedNormalizedTarget
-  ) {
-    return false;
-  }
-
-  const baselineTarget = buildStableUrlHashInput({
-    analysisUrl: existingBaseline.analysisUrl,
-    normalizedUrl: existingBaseline.normalizedUrl
-  });
-  const currentTarget = buildStableUrlHashInput(currentAnalysis);
-
-  if (baselineTarget && currentTarget && baselineTarget === currentTarget) {
-    return false;
-  }
-
-  return existingBaseline.urlHash !== currentAnalysis.currentHash;
+  return hasMeaningfulCandidateDestinationChange(baselineCandidateContext, currentCandidateContext, existingBaseline, currentAnalysis);
 }
 
 function buildCandidateContext(candidateContext = {}, fallback = {}) {
@@ -2166,12 +2406,14 @@ function buildCandidateContext(candidateContext = {}, fallback = {}) {
   const rawHref = String(candidateContext.rawHref || fallback.rawHref || "").trim();
   const facebookWrapperUrl = String(candidateContext.facebookWrapperUrl || fallback.facebookWrapperUrl || "").trim();
   const unwrappedCandidateUrl = String(candidateContext.unwrappedCandidateUrl || fallback.unwrappedCandidateUrl || "").trim();
+  const signature = String(candidateContext.signature || fallback.postSignature || fallback.signature || "").trim();
 
   return {
     candidateMode,
     dominantDomain,
     candidateDomainCount,
     selectedNormalizedTarget,
+    signature,
     postIdentityStable: candidateContext.postIdentityStable === true || fallback.postIdentityStable === true,
     displayText,
     visibleText,
@@ -2213,17 +2455,47 @@ function isStableSingleTargetCandidateMode(candidateContext) {
   return candidateContext?.candidateMode === "single";
 }
 
-function hasMeaningfulCandidateDestinationChange(baselineCandidateContext, currentCandidateContext) {
+function hasMeaningfulCandidateDestinationChange(baselineCandidateContext, currentCandidateContext, baseline = {}, current = {}) {
   if (!baselineCandidateContext || !currentCandidateContext) {
-    return false;
+    return {
+      changed: false,
+      sameDomain: false,
+      trackingOnly: false,
+      reason: "Missing candidate context."
+    };
+  }
+
+  const baselineTarget = getCandidateComparisonTarget(baselineCandidateContext, baseline);
+  const currentTarget = getCandidateComparisonTarget(currentCandidateContext, current);
+  const baselineDomain = baselineCandidateContext.dominantDomain || getRegistrableDomain(safeHostname(baselineTarget));
+  const currentDomain = currentCandidateContext.dominantDomain || getRegistrableDomain(safeHostname(currentTarget));
+  const normalizedBaselineTarget = normalizePostIntegrityUrlForComparison(baselineTarget, { stripTracking: true });
+  const normalizedCurrentTarget = normalizePostIntegrityUrlForComparison(currentTarget, { stripTracking: true });
+  const rawBaselineTarget = normalizePostIntegrityUrlForComparison(baselineTarget, { stripTracking: false });
+  const rawCurrentTarget = normalizePostIntegrityUrlForComparison(currentTarget, { stripTracking: false });
+
+  if (normalizedBaselineTarget && normalizedCurrentTarget && normalizedBaselineTarget === normalizedCurrentTarget) {
+    return {
+      changed: false,
+      sameDomain: baselineDomain && currentDomain ? baselineDomain === currentDomain : false,
+      trackingOnly: rawBaselineTarget && rawCurrentTarget && rawBaselineTarget !== rawCurrentTarget,
+      reason: rawBaselineTarget && rawCurrentTarget && rawBaselineTarget !== rawCurrentTarget
+        ? "Only tracking parameters changed, so no post-integrity deduction was applied."
+        : "The normalized destination did not change."
+    };
   }
 
   if (
-    baselineCandidateContext.dominantDomain &&
-    currentCandidateContext.dominantDomain &&
-    baselineCandidateContext.dominantDomain === currentCandidateContext.dominantDomain
+    baselineDomain &&
+    currentDomain &&
+    baselineDomain === currentDomain
   ) {
-    return false;
+    return {
+      changed: Boolean(normalizedBaselineTarget && normalizedCurrentTarget && normalizedBaselineTarget !== normalizedCurrentTarget),
+      sameDomain: true,
+      trackingOnly: false,
+      reason: "The link URL changed within the same domain. DILI recorded this as a limited post-integrity warning."
+    };
   }
 
   if (
@@ -2231,14 +2503,248 @@ function hasMeaningfulCandidateDestinationChange(baselineCandidateContext, curre
     currentCandidateContext.selectedNormalizedTarget &&
     baselineCandidateContext.selectedNormalizedTarget === currentCandidateContext.selectedNormalizedTarget
   ) {
+    return {
+      changed: false,
+      sameDomain: false,
+      trackingOnly: false,
+      reason: "The selected destination did not change."
+    };
+  }
+
+  return {
+    changed: Boolean(
+      baselineDomain &&
+      currentDomain &&
+      baselineDomain !== currentDomain
+    ),
+    sameDomain: false,
+    trackingOnly: false,
+    reason: "The link destination changed after the stored baseline."
+  };
+}
+
+function getCandidateComparisonTarget(candidateContext = {}, fallback = {}) {
+  return (
+    candidateContext.selectedNormalizedTarget ||
+    candidateContext.unwrappedCandidateUrl ||
+    candidateContext.rawHref ||
+    fallback.analysisUrl ||
+    fallback.normalizedUrl ||
+    fallback.rawUrl ||
+    ""
+  );
+}
+
+function normalizePostIntegrityUrlForComparison(rawUrl, options = {}) {
+  if (!rawUrl) {
+    return "";
+  }
+
+  try {
+    return normalizeUrl(rawUrl, { stripTracking: options.stripTracking !== false });
+  } catch {
+    return String(rawUrl || "").trim();
+  }
+}
+
+function hasNoLinkBaselineMarker(baseline = {}) {
+  if (!baseline || typeof baseline !== "object") {
     return false;
   }
 
+  const baselineState = String(baseline.baselineState || "").toLowerCase();
+  const features = baseline.features && typeof baseline.features === "object" ? baseline.features : {};
+
   return Boolean(
-    baselineCandidateContext.dominantDomain &&
-    currentCandidateContext.dominantDomain &&
-    baselineCandidateContext.dominantDomain !== currentCandidateContext.dominantDomain
+    POST_INTEGRITY_NO_LINK_BASELINE_STATES.has(baselineState) ||
+    baseline.hadLinkAtBaseline === false ||
+    features.noLinkBaseline === true ||
+    features.baselineHadNoLink === true ||
+    features.confirmedNoLinkBaseline === true ||
+    features.provisionalNoLinkBaseline === true
   );
+}
+
+function getBaselineIntegrityConfidence(baseline = {}) {
+  const explicit = normalizeBaselineConfidence(baseline.baselineConfidence || baseline.postIntegrityConfidence);
+  if (explicit !== "unknown") {
+    return explicit;
+  }
+
+  const baselineState = String(baseline.baselineState || "").toLowerCase();
+  if (baselineState === "no_link" && baseline.postIdentityStable === true) {
+    return "stable";
+  }
+
+  if (baselineState === "observed_no_link_unstable") {
+    return "unstable";
+  }
+
+  if (baselineState === "observed_no_link" || baselineState === "provisional_no_link" || baselineState === "truncated_unexpanded") {
+    return "provisional";
+  }
+
+  return baseline.postIdentityStable === true ? "stable" : "unknown";
+}
+
+function classifyPostIntegrityEvent({ baseline = {}, current = {}, identity = {}, candidate = {} } = {}) {
+  const noLinkBaseline = hasNoLinkBaselineMarker(baseline);
+  const baselineState = String(baseline.baselineState || "").toLowerCase();
+  const baselineConfidence = getBaselineIntegrityConfidence(baseline);
+  const baselineAgeMs = Number(current.baselineAgeMs || 0);
+  const currentHasLink = current.currentHasUsableLinkCandidate === true;
+  const stableIdentityMatch = identity.stableIdentityMatch === true;
+  const candidateContext = candidate.candidateContext || {};
+  const singleCandidate = candidateContext.candidateMode === "single";
+  const usableFullCandidate = Boolean(
+    candidateContext.candidateIsDomainOnlyFallback !== true &&
+    candidateContext.candidateUrlCompleteness !== "domain-only-fallback"
+  );
+
+  if (!current.isReanalysis) {
+    return {
+      eventType: "none",
+      confidence: "none",
+      deductionEligible: false,
+      auditOnly: false,
+      reason: "No previous baseline was being reanalyzed."
+    };
+  }
+
+  if (noLinkBaseline && currentHasLink) {
+    if (
+      baselineState === "truncated_unexpanded" ||
+      baselineAgeMs < POST_INTEGRITY_PROVISIONAL_BASELINE_AGE_MS ||
+      baselineConfidence === "provisional"
+    ) {
+      return {
+        eventType: "provisional-lazy-load",
+        confidence: "limited",
+        deductionEligible: false,
+        auditOnly: true,
+        reason: "A provisional no-link baseline later exposed a link, likely due to Facebook lazy-loading. Post-integrity scoring was not applied."
+      };
+    }
+
+    if (
+      baselineConfidence === "stable" &&
+      stableIdentityMatch &&
+      singleCandidate &&
+      baselineAgeMs >= POST_INTEGRITY_MIN_NO_LINK_BASELINE_AGE_MS
+    ) {
+      return {
+        eventType: "link-inserted-after-stable-no-link",
+        confidence: "high",
+        deductionEligible: true,
+        auditOnly: false,
+        reason: "A link appeared after the original no-link baseline. DILI treated this as a post-integrity warning, not direct proof of maliciousness."
+      };
+    }
+
+    return {
+      eventType: "link-inserted-after-unstable-no-link",
+      confidence: "limited",
+      deductionEligible: false,
+      auditOnly: true,
+      reason: "A link appeared after a prior no-link observation, but the post identity was not stable enough for a full post-integrity deduction."
+    };
+  }
+
+  if (candidate.destinationChange?.trackingOnly) {
+    return {
+      eventType: "none",
+      confidence: "none",
+      deductionEligible: false,
+      auditOnly: true,
+      reason: "Only tracking parameters changed, so no post-integrity deduction was applied."
+    };
+  }
+
+  if (candidate.destinationChange?.changed) {
+    const stableEligible = Boolean(
+      candidate.canUseExistingLinkIntegrityBaseline &&
+      stableIdentityMatch &&
+      singleCandidate &&
+      usableFullCandidate &&
+      baselineAgeMs >= POST_INTEGRITY_MIN_BASELINE_AGE_MS
+    );
+
+    if (!stableEligible) {
+      return {
+        eventType: candidate.destinationChange.sameDomain ? "link-url-changed-same-domain" : "link-destination-changed",
+        confidence: "limited",
+        deductionEligible: false,
+        auditOnly: true,
+        reason: "A prior no-link or different-link state was observed, but the post identity was not stable enough for a full post-integrity deduction."
+      };
+    }
+
+    if (candidate.destinationChange.sameDomain) {
+      return {
+        eventType: "link-url-changed-same-domain",
+        confidence: "limited",
+        deductionEligible: true,
+        auditOnly: false,
+        reason: "The link URL changed within the same domain. DILI recorded this as a limited post-integrity warning."
+      };
+    }
+
+    return {
+      eventType: "link-destination-changed",
+      confidence: "high",
+      deductionEligible: true,
+      auditOnly: false,
+      reason: "The link destination changed after the stored baseline."
+    };
+  }
+
+  if (current.postTextChangedSinceBaseline) {
+    return {
+      eventType: "text-only-change",
+      confidence: "limited",
+      deductionEligible: false,
+      auditOnly: true,
+      reason: "Post text changed, but the link destination did not materially change."
+    };
+  }
+
+  return {
+    eventType: "none",
+    confidence: "none",
+    deductionEligible: false,
+    auditOnly: false,
+    reason: "No post-integrity event was detected."
+  };
+}
+
+function logPostIntegrityDecision(postId, decision = {}) {
+  const eventType = String(decision.eventType || "none");
+  const reason = decision.reason || "";
+  const context = { postId, eventType, confidence: decision.confidence, deductionEligible: decision.deductionEligible, reason };
+
+  if (eventType === "link-inserted-after-stable-no-link") {
+    logDebug(`[post-integrity] stable no-link to link insertion detected ${JSON.stringify(context)}`);
+  } else if (eventType === "link-inserted-after-unstable-no-link") {
+    logDebug(`[post-integrity] unstable no-link to link insertion recorded as limited evidence ${JSON.stringify(context)}`);
+  } else if (eventType === "link-destination-changed") {
+    logDebug(`[post-integrity] link destination changed ${JSON.stringify(context)}`);
+  } else if (eventType === "link-url-changed-same-domain") {
+    logDebug(`[post-integrity] same-domain URL change detected ${JSON.stringify(context)}`);
+  } else if (decision.auditOnly) {
+    logDebug(`[post-integrity] post-integrity audit-only evidence recorded ${JSON.stringify(context)}`);
+  }
+
+  if (decision.deductionEligible) {
+    logDebug(`[post-integrity] post-integrity deduction applied ${JSON.stringify(context)}`);
+  }
+
+  if (eventType === "none" && /tracking parameters/i.test(reason)) {
+    logDebug(`[post-integrity] tracking-only URL change ignored ${JSON.stringify(context)}`);
+  }
+
+  if (decision.confidence === "limited" && !decision.deductionEligible && /identity/i.test(reason)) {
+    logDebug(`[post-integrity] post-integrity skipped due to unstable identity ${JSON.stringify(context)}`);
+  }
 }
 
 function buildStableUrlHashInput({ analysisUrl, normalizedUrl }) {
@@ -2279,6 +2785,10 @@ performanceStats.lastProviderMs = 0;
 performanceStats.lastCacheHit = true;
     return {
       ...normalizeReusableUrlAnalysis(refreshedEntry),
+      performanceTiming: normalizePerformanceTiming({
+        providerVerificationStartedAt: null,
+        providerVerificationCompletedAt: null
+      }),
       cacheHit: true,
       cacheKey
     };
@@ -2288,6 +2798,7 @@ performanceStats.lastCacheHit = true;
   logDebug(`URL analysis cache miss: ${cacheMissKey}`);
 
   const safeEndpointResult = endpointResult || {};
+  const redirectAnalysisStartedAt = endpointResult?.resolutionTimedOut ? null : Date.now();
   const redirectFallback = endpointResult?.resolutionTimedOut
     ? null
     : await withAnalysisTimeout(
@@ -2295,6 +2806,7 @@ performanceStats.lastCacheHit = true;
         8000,
         () => buildTimedOutRedirectAnalysis(rawUrl, safeEndpointResult)
       );
+  const redirectAnalysisCompletedAt = redirectAnalysisStartedAt === null ? null : Date.now();
   const safeRedirectAnalysis = normalizeRedirectAnalysis(
     redirectAnalysis ||
     endpointResult?.redirectAnalysis ||
@@ -2311,6 +2823,7 @@ performanceStats.lastCacheHit = true;
     rawUrl: analysisUrl
   });
 const providerStartedAt = nowMs();
+const providerVerificationStartedAt = Date.now();
 const providerUrlCandidates = buildProviderUrlCandidates({
   rawUrl,
   endpointResult: safeEndpointResult,
@@ -2321,6 +2834,7 @@ const providerUrlCandidates = buildProviderUrlCandidates({
 const providerResults = normalizeProviderResults(await runThreatIntelligenceChecks(providerCheckedUrl, {
   providerUrlCandidates
 }));
+const providerVerificationCompletedAt = Date.now();
 const providerMs = elapsedMs(providerStartedAt);
 performanceStats.lastProviderMs = providerMs;
 recordMaxPerformanceStat("maxProviderMs", providerMs);
@@ -2375,6 +2889,12 @@ recordMaxPerformanceStat("maxProviderMs", providerMs);
 
   return {
     ...cacheEntry,
+    performanceTiming: normalizePerformanceTiming({
+      redirectAnalysisStartedAt,
+      redirectAnalysisCompletedAt,
+      providerVerificationStartedAt,
+      providerVerificationCompletedAt
+    }),
     cacheHit: false,
     cacheKey: normalizeCacheKey(analysisUrl) || analysisUrl
   };
@@ -4511,11 +5031,27 @@ if (riskRelevantDisplayChain.length > 0) {
   }
 
   if (analysis?.linkInsertedAfterBaseline || analysis?.features?.linkInsertedAfterBaseline) {
-    details.push("A link was inserted after a stored no-link baseline.");
+    details.push("A link appeared after the original no-link baseline. DILI treated this as a post-integrity warning, not direct proof of maliciousness.");
+  }
+
+  if (analysis?.features?.linkInsertedAfterUnstableBaseline) {
+    details.push("A link appeared after a prior no-link observation, but the post identity was not stable enough for a full post-integrity deduction.");
   }
 
   if (analysis?.features?.integrityHashMismatch && !analysis?.features?.linkInsertedAfterBaseline) {
-    details.push("The post hyperlink changed after the original link baseline was stored.");
+    details.push("The post hyperlink changed after the original link baseline was stored. DILI treated this as contextual warning evidence, not direct proof of maliciousness.");
+  }
+
+  if (analysis?.features?.sameDomainLinkChanged) {
+    details.push("The link URL changed within the same domain. DILI recorded this as a limited post-integrity warning.");
+  }
+
+  if (analysis?.features?.trackingOnlyPostIntegrityChange) {
+    details.push("Only tracking parameters changed, so no post-integrity deduction was applied.");
+  }
+
+  if (analysis?.features?.limitedPostIntegrityEvidence || analysis?.features?.postIntegrityAuditOnly) {
+    details.push(analysis?.features?.postIntegrityReason || "A prior no-link or different-link state was observed, but the post identity was not stable enough for a full post-integrity deduction.");
   }
 
   if (analysis?.previousBaselineUrl && analysis?.features?.integrityHashMismatch) {
@@ -4782,6 +5318,7 @@ async function persistPostLevelAnalysis(postId, analysis) {
       currentPostTextHash: analysis.currentPostTextHash,
       baselineFirstSeenAt: analysis.baselineFirstSeenAt,
       detectedAt: analysis.detectedAt,
+      performanceTiming: analysis.performanceTiming,
       hadLinkAtBaseline: analysis.hadLinkAtBaseline,
       linkInsertedAfterBaseline: analysis.linkInsertedAfterBaseline,
       postIntegrityEvent: analysis.postIntegrityEvent,
@@ -7000,6 +7537,9 @@ function buildVirusTotalRefreshedAnalysis(analysis = {}, providerResults = []) {
   scoreAudit.virusTotalSignalLevel = providerPolicy.virusTotalSignalLevel;
   const refreshedAnalysis = {
     ...analysis,
+    performanceTiming: mergePerformanceTiming(analysis.performanceTiming, {
+      analysisCompletedAt: Date.now()
+    }),
     providerResults: safeProviderResults,
     features,
     providerOverride,
